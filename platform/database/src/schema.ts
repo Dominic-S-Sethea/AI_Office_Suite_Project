@@ -113,10 +113,10 @@ CREATE TABLE IF NOT EXISTS migration_batches (
 );
 
 GRANT USAGE ON SCHEMA public TO app_runtime;
-GRANT SELECT, INSERT, UPDATE ON organizations, users, memberships, workspaces, documents, document_versions, idempotency_keys TO app_runtime;
-GRANT SELECT, INSERT ON audit_logs TO app_runtime;
+GRANT SELECT, INSERT, UPDATE ON organizations, users, memberships, workspaces, documents, idempotency_keys TO app_runtime;
+GRANT SELECT, INSERT ON document_versions, audit_logs TO app_runtime;
 REVOKE UPDATE, DELETE ON audit_logs FROM app_runtime;
-REVOKE DELETE ON document_versions FROM app_runtime;
+REVOKE UPDATE, DELETE ON document_versions FROM app_runtime;
 
 ALTER TABLE workspaces ENABLE ROW LEVEL SECURITY;
 ALTER TABLE workspaces FORCE ROW LEVEL SECURITY;

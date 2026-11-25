@@ -1,8 +1,16 @@
 import { createHash, randomUUID } from "node:crypto";
-import type { ActorContext, AuditEvent, StudioDocument } from "@ai-office-suite/shared-contracts";
-import { assertCanPerform, assertTenantWorkspaceAccess } from "@ai-office-suite/authorization";
+import type {
+  ActorContext,
+  AuditEvent,
+  DocumentVersion,
+  StudioDocument,
+  WorkspaceRole,
+} from "@ai-office-suite/shared-contracts";
+import { assertCanPerform, assertTenantWorkspaceAccess, isWorkspaceRole } from "@ai-office-suite/authorization";
 import type { PgDatabaseAdapter, PgQueryExecutor } from "./adapter.ts";
 import { withTenantTransaction } from "./schema.ts";
+
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 export class DatabaseConflictError extends Error {
   readonly statusCode: number;
@@ -13,6 +21,16 @@ export class DatabaseConflictError extends Error {
     this.name = "DatabaseConflictError";
     this.statusCode = statusCode;
     this.code = code;
+  }
+}
+
+function parseSnapshot(raw: StudioDocument | string): StudioDocument {
+  return typeof raw === "string" ? (JSON.parse(raw) as StudioDocument) : raw;
+}
+
+function assertValidDocumentUuid(documentId: string): void {
+  if (!UUID_PATTERN.test(documentId)) {
+    throw new DatabaseConflictError(404, "DOCUMENT_NOT_FOUND", `Document '${documentId}' not found.`);
   }
 }
 
@@ -47,9 +65,21 @@ export class PostgreSqlDocumentRepository {
     );
   }
 
-  async createDocument(actor: ActorContext, doc: StudioDocument): Promise<StudioDocument> {
+  async recordAudit(actor: ActorContext, event: Omit<AuditEvent, "auditId" | "createdAt">): Promise<void> {
+    assertTenantWorkspaceAccess(actor, event.tenantId, event.workspaceId);
+    await withTenantTransaction(this.db, actor.tenantId, async (tx) => {
+      await this.insertAuditTx(tx, event);
+    });
+  }
+
+  async createDocument(
+    actor: ActorContext,
+    doc: StudioDocument,
+    auditOpts?: { source?: AuditEvent["source"]; action?: string; summary?: string },
+  ): Promise<StudioDocument> {
     assertCanPerform(actor, "document", "create");
     assertTenantWorkspaceAccess(actor, doc.tenantId, doc.workspaceId);
+    assertValidDocumentUuid(doc.documentId);
 
     const contentSha = createHash("sha256").update(JSON.stringify(doc)).digest("hex");
     return withTenantTransaction(this.db, actor.tenantId, async (tx) => {
@@ -92,11 +122,11 @@ export class PostgreSqlDocumentRepository {
         documentId: doc.documentId,
         actorId: actor.userId,
         actorRole: actor.role,
-        source: "manual",
-        action: "document.create",
+        source: auditOpts?.source ?? "manual",
+        action: auditOpts?.action ?? "document.create",
         outcome: "success",
         revisionAfter: 1,
-        summary: `Created PostgreSQL document '${doc.title}'`,
+        summary: auditOpts?.summary ?? `Created PostgreSQL document '${doc.title}'`,
       });
 
       return structuredClone(doc);
@@ -106,7 +136,7 @@ export class PostgreSqlDocumentRepository {
   async listDocuments(actor: ActorContext): Promise<StudioDocument[]> {
     assertCanPerform(actor, "document", "read");
     return withTenantTransaction(this.db, actor.tenantId, async (tx) => {
-      const res = await tx.query<{ snapshot_json: StudioDocument }>(
+      const res = await tx.query<{ snapshot_json: StudioDocument | string }>(
         `SELECT v.snapshot_json
          FROM documents d
          JOIN document_versions v
@@ -115,17 +145,16 @@ export class PostgreSqlDocumentRepository {
          ORDER BY d.updated_at DESC`,
         [actor.workspaceId],
       );
-      return res.rows.map((r) =>
-        typeof r.snapshot_json === "string" ? (JSON.parse(r.snapshot_json) as StudioDocument) : r.snapshot_json,
-      );
+      return res.rows.map((r) => parseSnapshot(r.snapshot_json));
     });
   }
 
   async getDocument(actor: ActorContext, documentId: string): Promise<StudioDocument> {
     assertCanPerform(actor, "document", "read");
+    assertValidDocumentUuid(documentId);
     return withTenantTransaction(this.db, actor.tenantId, async (tx) => {
-      const res = await tx.query<{ snapshot_json: StudioDocument; workspace_id: string }>(
-        `SELECT d.workspace_id, v.snapshot_json
+      const res = await tx.query<{ snapshot_json: StudioDocument | string; workspace_id: string }>(
+        `SELECT d.workspace_id::text, v.snapshot_json
          FROM documents d
          JOIN document_versions v
            ON v.tenant_id = d.tenant_id AND v.document_id = d.document_id AND v.revision = d.current_revision
@@ -137,7 +166,247 @@ export class PostgreSqlDocumentRepository {
         throw new DatabaseConflictError(404, "DOCUMENT_NOT_FOUND", `Document '${documentId}' not found.`);
       }
       assertTenantWorkspaceAccess(actor, actor.tenantId, row.workspace_id);
-      return typeof row.snapshot_json === "string" ? (JSON.parse(row.snapshot_json) as StudioDocument) : row.snapshot_json;
+      return parseSnapshot(row.snapshot_json);
+    });
+  }
+
+  async listVersions(actor: ActorContext, documentId: string): Promise<DocumentVersion[]> {
+    assertCanPerform(actor, "document", "read");
+    assertValidDocumentUuid(documentId);
+    return withTenantTransaction(this.db, actor.tenantId, async (tx) => {
+      const docRes = await tx.query<{ workspace_id: string }>(
+        "SELECT workspace_id::text FROM documents WHERE document_id = $1::uuid",
+        [documentId],
+      );
+      const docRow = docRes.rows[0];
+      if (!docRow) {
+        throw new DatabaseConflictError(404, "DOCUMENT_NOT_FOUND", `Document '${documentId}' not found.`);
+      }
+      assertTenantWorkspaceAccess(actor, actor.tenantId, docRow.workspace_id);
+
+      const verRes = await tx.query<{
+        revision: number;
+        restored_from_revision: number | null;
+        snapshot_json: StudioDocument | string;
+        created_by: string;
+        created_at: Date | string;
+      }>(
+        `SELECT revision, restored_from_revision, snapshot_json, created_by::text, created_at
+         FROM document_versions
+         WHERE document_id = $1::uuid
+         ORDER BY revision ASC`,
+        [documentId],
+      );
+      return verRes.rows.map((r) => ({
+        versionId: `${documentId}:rev-${r.revision}`,
+        documentId,
+        revision: r.revision,
+        snapshot: parseSnapshot(r.snapshot_json),
+        summary:
+          r.restored_from_revision !== null
+            ? `Restored revision ${r.restored_from_revision} as revision ${r.revision}`
+            : r.revision === 1
+              ? "Initial document created"
+              : `Saved revision ${r.revision}`,
+        source: r.restored_from_revision !== null ? "restore" : "manual",
+        actorId: r.created_by,
+        ...(r.restored_from_revision !== null ? { restoredFromRevision: r.restored_from_revision } : {}),
+        createdAt: r.created_at instanceof Date ? r.created_at.toISOString() : String(r.created_at),
+      }));
+    });
+  }
+
+  async getVersion(actor: ActorContext, documentId: string, revision: number): Promise<DocumentVersion | null> {
+    assertCanPerform(actor, "document", "read");
+    assertValidDocumentUuid(documentId);
+    return withTenantTransaction(this.db, actor.tenantId, async (tx) => {
+      const docRes = await tx.query<{ workspace_id: string }>(
+        "SELECT workspace_id::text FROM documents WHERE document_id = $1::uuid",
+        [documentId],
+      );
+      const docRow = docRes.rows[0];
+      if (!docRow) {
+        throw new DatabaseConflictError(404, "DOCUMENT_NOT_FOUND", `Document '${documentId}' not found.`);
+      }
+      assertTenantWorkspaceAccess(actor, actor.tenantId, docRow.workspace_id);
+
+      const verRes = await tx.query<{
+        revision: number;
+        restored_from_revision: number | null;
+        snapshot_json: StudioDocument | string;
+        created_by: string;
+        created_at: Date | string;
+      }>(
+        `SELECT revision, restored_from_revision, snapshot_json, created_by::text, created_at
+         FROM document_versions
+         WHERE document_id = $1::uuid AND revision = $2`,
+        [documentId, revision],
+      );
+      const r = verRes.rows[0];
+      if (!r) return null;
+      return {
+        versionId: `${documentId}:rev-${r.revision}`,
+        documentId,
+        revision: r.revision,
+        snapshot: parseSnapshot(r.snapshot_json),
+        summary:
+          r.restored_from_revision !== null
+            ? `Restored revision ${r.restored_from_revision} as revision ${r.revision}`
+            : `Revision ${r.revision}`,
+        source: r.restored_from_revision !== null ? "restore" : "manual",
+        actorId: r.created_by,
+        ...(r.restored_from_revision !== null ? { restoredFromRevision: r.restored_from_revision } : {}),
+        createdAt: r.created_at instanceof Date ? r.created_at.toISOString() : String(r.created_at),
+      };
+    });
+  }
+
+  async restoreVersion(actor: ActorContext, documentId: string, targetRevision: number): Promise<StudioDocument> {
+    assertCanPerform(actor, "document", "restore");
+    assertValidDocumentUuid(documentId);
+    return withTenantTransaction(this.db, actor.tenantId, async (tx) => {
+      const curRes = await tx.query<{ workspace_id: string; current_revision: number }>(
+        `SELECT workspace_id::text, current_revision
+         FROM documents
+         WHERE document_id = $1::uuid
+         FOR UPDATE`,
+        [documentId],
+      );
+      const curRow = curRes.rows[0];
+      if (!curRow) {
+        throw new DatabaseConflictError(404, "DOCUMENT_NOT_FOUND", `Document '${documentId}' not found.`);
+      }
+      assertTenantWorkspaceAccess(actor, actor.tenantId, curRow.workspace_id);
+
+      const targetRes = await tx.query<{ snapshot_json: StudioDocument | string }>(
+        `SELECT snapshot_json
+         FROM document_versions
+         WHERE document_id = $1::uuid AND revision = $2`,
+        [documentId, targetRevision],
+      );
+      const targetRow = targetRes.rows[0];
+      if (!targetRow) {
+        throw new DatabaseConflictError(
+          404,
+          "VERSION_NOT_FOUND",
+          `Revision ${targetRevision} was not found for document '${documentId}'.`,
+        );
+      }
+
+      const now = new Date().toISOString();
+      const nextRevision = curRow.current_revision + 1;
+      const restoredDoc: StudioDocument = {
+        ...structuredClone(parseSnapshot(targetRow.snapshot_json)),
+        revision: nextRevision,
+        updatedAt: now,
+      };
+      const contentSha = createHash("sha256").update(JSON.stringify(restoredDoc)).digest("hex");
+
+      const updRes = await tx.query(
+        `UPDATE documents
+         SET title = $1, language = $2, current_revision = $3, status = $4, updated_at = $5::timestamptz
+         WHERE tenant_id = $6::uuid AND document_id = $7::uuid AND current_revision = $8`,
+        [
+          restoredDoc.title,
+          restoredDoc.language,
+          nextRevision,
+          restoredDoc.status,
+          now,
+          actor.tenantId,
+          documentId,
+          curRow.current_revision,
+        ],
+      );
+      if (updRes.rowCount !== 1) {
+        throw new DatabaseConflictError(409, "REVISION_CONFLICT", "Concurrent revision restore conflict.");
+      }
+
+      await tx.query(
+        `INSERT INTO document_versions (
+           tenant_id, document_id, revision, storage_object_key, content_sha256,
+           restored_from_revision, snapshot_json, created_by
+         ) VALUES ($1::uuid, $2::uuid, $3, $4, $5, $6, $7::jsonb, $8::uuid)`,
+        [
+          actor.tenantId,
+          documentId,
+          nextRevision,
+          `${actor.tenantId}/${actor.workspaceId}/documents/${documentId}/rev-${nextRevision}.json`,
+          contentSha,
+          targetRevision,
+          JSON.stringify(restoredDoc),
+          actor.userId,
+        ],
+      );
+
+      await this.insertAuditTx(tx, {
+        tenantId: actor.tenantId,
+        workspaceId: actor.workspaceId,
+        documentId,
+        actorId: actor.userId,
+        actorRole: actor.role,
+        source: "restore",
+        action: "document.version_restored",
+        outcome: "success",
+        revisionBefore: curRow.current_revision,
+        revisionAfter: nextRevision,
+        summary: `Restored revision ${targetRevision} as new PostgreSQL revision ${nextRevision}`,
+      });
+
+      return structuredClone(restoredDoc);
+    });
+  }
+
+  async listAuditEvents(actor: ActorContext, documentId: string): Promise<AuditEvent[]> {
+    assertCanPerform(actor, "audit", "read");
+    assertValidDocumentUuid(documentId);
+    return withTenantTransaction(this.db, actor.tenantId, async (tx) => {
+      const docRes = await tx.query<{ workspace_id: string }>(
+        "SELECT workspace_id::text FROM documents WHERE document_id = $1::uuid",
+        [documentId],
+      );
+      const docRow = docRes.rows[0];
+      if (!docRow) {
+        throw new DatabaseConflictError(404, "DOCUMENT_NOT_FOUND", `Document '${documentId}' not found.`);
+      }
+      assertTenantWorkspaceAccess(actor, actor.tenantId, docRow.workspace_id);
+
+      const res = await tx.query<{
+        audit_id: string;
+        tenant_id: string;
+        workspace_id: string | null;
+        actor_id: string;
+        actor_role: string;
+        source: string;
+        action: string;
+        outcome: "success" | "denied" | "failed";
+        target_id: string;
+        revision_before: number | null;
+        revision_after: number | null;
+        summary: string;
+        created_at: Date | string;
+      }>(
+        `SELECT audit_id::text, tenant_id::text, workspace_id::text, actor_id::text, actor_role,
+                source, action, outcome, target_id, revision_before, revision_after, summary, created_at
+         FROM audit_logs
+         WHERE target_id = $1
+         ORDER BY created_at DESC`,
+        [documentId],
+      );
+      return res.rows.map((r) => ({
+        auditId: r.audit_id,
+        tenantId: r.tenant_id,
+        workspaceId: r.workspace_id ?? actor.workspaceId,
+        documentId: r.target_id,
+        actorId: r.actor_id,
+        actorRole: (isWorkspaceRole(r.actor_role) ? r.actor_role : "viewer") as WorkspaceRole,
+        source: r.source as AuditEvent["source"],
+        action: r.action,
+        outcome: r.outcome,
+        ...(r.revision_before !== null ? { revisionBefore: r.revision_before } : {}),
+        ...(r.revision_after !== null ? { revisionAfter: r.revision_after } : {}),
+        summary: r.summary,
+        createdAt: r.created_at instanceof Date ? r.created_at.toISOString() : String(r.created_at),
+      }));
     });
   }
 
@@ -151,11 +420,13 @@ export class PostgreSqlDocumentRepository {
     documentId: string,
     expectedRevision: number,
     buildNext: (current: StudioDocument, nextRevision: number) => StudioDocument,
+    auditOpts?: { source?: AuditEvent["source"]; action?: string; summary?: string },
   ): Promise<StudioDocument> {
     assertCanPerform(actor, "document", "write");
+    assertValidDocumentUuid(documentId);
     return withTenantTransaction(this.db, actor.tenantId, async (tx) => {
-      const curRes = await tx.query<{ workspace_id: string; current_revision: number; snapshot_json: StudioDocument }>(
-        `SELECT d.workspace_id, d.current_revision, v.snapshot_json
+      const curRes = await tx.query<{ workspace_id: string; current_revision: number; snapshot_json: StudioDocument | string }>(
+        `SELECT d.workspace_id::text, d.current_revision, v.snapshot_json
          FROM documents d
          JOIN document_versions v
            ON v.tenant_id = d.tenant_id AND v.document_id = d.document_id AND v.revision = d.current_revision
@@ -176,8 +447,7 @@ export class PostgreSqlDocumentRepository {
         );
       }
 
-      const currentDoc =
-        typeof row.snapshot_json === "string" ? (JSON.parse(row.snapshot_json) as StudioDocument) : row.snapshot_json;
+      const currentDoc = parseSnapshot(row.snapshot_json);
       const nextRevision = expectedRevision + 1;
       const updatedDoc = buildNext(currentDoc, nextRevision);
       const contentSha = createHash("sha256").update(JSON.stringify(updatedDoc)).digest("hex");
@@ -222,12 +492,12 @@ export class PostgreSqlDocumentRepository {
         documentId,
         actorId: actor.userId,
         actorRole: actor.role,
-        source: "manual",
-        action: "document.update",
+        source: auditOpts?.source ?? "manual",
+        action: auditOpts?.action ?? "document.update",
         outcome: "success",
         revisionBefore: expectedRevision,
         revisionAfter: nextRevision,
-        summary: `Updated PostgreSQL document to revision ${nextRevision}`,
+        summary: auditOpts?.summary ?? `Updated PostgreSQL document to revision ${nextRevision}`,
       });
 
       return structuredClone(updatedDoc);
