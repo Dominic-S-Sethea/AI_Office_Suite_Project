@@ -1,0 +1,34 @@
+{
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "jsx": "react-jsx",
+    "lib": ["ES2023", "DOM", "DOM.Iterable"],
+    "baseUrl": ".",
+    "paths": {
+      "@ai-office-suite/shared-contracts": ["./packages/shared-contracts/src/index.ts"],
+      "@ai-office-suite/validation": ["./packages/validation/src/index.ts"],
+      "@ai-office-suite/authorization": ["./platform/authorization/src/index.ts"],
+      "@ai-office-suite/storage": ["./platform/storage/src/index.ts"],
+      "@ai-office-suite/audit": ["./platform/audit/src/index.ts"],
+      "@ai-office-suite/document-engine": ["./engines/document/src/index.ts"],
+      "@ai-office-suite/document-engine/tiptap-codec": ["./engines/document/src/tiptapCodec.ts"],
+      "@ai-office-suite/calculation-engine": ["./engines/calculation/src/index.ts"],
+      "@ai-office-suite/data-processing": ["./engines/data-processing/src/index.ts"],
+      "@ai-office-suite/file-conversion": ["./engines/file-conversion/src/index.ts"],
+      "@ai-office-suite/speech-engine": ["./engines/speech/src/index.ts"],
+      "@ai-office-suite/documents-module": ["./modules/documents/src/index.ts"],
+      "@ai-office-suite/ai-module": ["./modules/ai/src/index.ts"]
+    }
+  },
+  "include": [
+    "packages/*/src/**/*.ts",
+    "platform/*/src/**/*.ts",
+    "engines/*/src/**/*.ts",
+    "modules/*/src/**/*.ts",
+    "apps/api/src/**/*.ts",
+    "apps/web/src/**/*.ts",
+    "apps/web/src/**/*.tsx",
+    "tests/**/*.ts"
+  ]
+}

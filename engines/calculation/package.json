@@ -1,0 +1,14 @@
+{
+  "name": "@ai-office-suite/calculation-engine",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "@ai-office-suite/shared-contracts": "*",
+    "@ai-office-suite/validation": "*",
+    "exceljs": "^4.4.0"
+  }
+}

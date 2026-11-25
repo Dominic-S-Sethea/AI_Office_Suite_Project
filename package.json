@@ -1,0 +1,45 @@
+{
+  "name": "ai-office-suite",
+  "version": "0.1.0-d1",
+  "description": "AI Office Suite — Modular AI-native corporate productivity platform (Phase D0/D1 Feasibility Prototype)",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "packages/*",
+    "platform/*",
+    "engines/*",
+    "modules/*",
+    "apps/*"
+  ],
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.typecheck.json --noEmit",
+    "build": "npm.cmd run build:api && npm.cmd run build:web",
+    "build:api": "tsc -p apps/api/tsconfig.build.json",
+    "build:web": "npm.cmd run build --workspace=@ai-office-suite/web",
+    "test": "vitest run",
+    "lint:licenses": "node scripts/check-licenses.mjs",
+    "dev:api": "tsx watch apps/api/src/server.ts",
+    "dev:web": "npm.cmd run dev --workspace=@ai-office-suite/web",
+    "dev": "node scripts/dev.mjs"
+  },
+  "dependencies": {
+    "@duckdb/node-api": "1.4.5-r.1",
+    "cors": "^2.8.5",
+    "docx": "^9.5.1",
+    "exceljs": "^4.4.0",
+    "express": "^4.21.2",
+    "fflate": "^0.8.2",
+    "helmet": "^8.1.0",
+    "mammoth": "^1.9.0",
+    "nodejs-polars": "0.26.2",
+    "zod": "^4.0.0"
+  },
+  "devDependencies": {
+    "@types/cors": "^2.8.17",
+    "@types/express": "^5.0.0",
+    "@types/node": "^24.0.0",
+    "tsx": "^4.20.0",
+    "typescript": "^5.9.3",
+    "vitest": "^3.2.4"
+  }
+}

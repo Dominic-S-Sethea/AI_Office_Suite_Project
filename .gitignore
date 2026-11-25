@@ -1,0 +1,16 @@
+node_modules/
+dist/
+apps/api/dist/
+apps/web/dist/
+.local-data/
+.venv-speech/
+.env
+.env.local
+*.local
+*.log
+*.wav
+*.mp3
+coverage/
+tests/artifacts/*.pdf
+tests/artifacts/*.docx
+!.gitkeep

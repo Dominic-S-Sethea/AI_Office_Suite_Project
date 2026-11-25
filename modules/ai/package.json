@@ -1,0 +1,17 @@
+{
+  "name": "@ai-office-suite/ai-module",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "@ai-office-suite/shared-contracts": "*",
+    "@ai-office-suite/validation": "*",
+    "@ai-office-suite/authorization": "*",
+    "@ai-office-suite/audit": "*",
+    "@ai-office-suite/document-engine": "*",
+    "@ai-office-suite/documents-module": "*"
+  }
+}

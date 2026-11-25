@@ -1,0 +1,13 @@
+{
+  "name": "@ai-office-suite/validation",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "@ai-office-suite/shared-contracts": "*",
+    "zod": "^4.0.0"
+  }
+}

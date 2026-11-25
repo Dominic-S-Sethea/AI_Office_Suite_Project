@@ -1,0 +1,26 @@
+{
+  "name": "@ai-office-suite/api",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/server.ts",
+    "build": "tsc -p tsconfig.build.json",
+    "start": "node dist/apps/api/src/server.js"
+  },
+  "dependencies": {
+    "@ai-office-suite/shared-contracts": "*",
+    "@ai-office-suite/validation": "*",
+    "@ai-office-suite/authorization": "*",
+    "@ai-office-suite/storage": "*",
+    "@ai-office-suite/audit": "*",
+    "@ai-office-suite/document-engine": "*",
+    "@ai-office-suite/file-conversion": "*",
+    "@ai-office-suite/speech-engine": "*",
+    "@ai-office-suite/documents-module": "*",
+    "@ai-office-suite/ai-module": "*",
+    "cors": "^2.8.5",
+    "express": "^4.21.2",
+    "helmet": "^8.1.0"
+  }
+}

@@ -1,0 +1,13 @@
+{
+  "name": "@ai-office-suite/document-engine",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./tiptap-codec": "./src/tiptapCodec.ts"
+  },
+  "dependencies": {
+    "@ai-office-suite/shared-contracts": "*"
+  }
+}

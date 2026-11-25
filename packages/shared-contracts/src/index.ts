@@ -1,0 +1,471 @@
+export type WorkspaceRole =
+  | "owner"
+  | "administrator"
+  | "editor"
+  | "reviewer"
+  | "viewer";
+
+export interface ActorContext {
+  tenantId: string;
+  workspaceId: string;
+  userId: string;
+  role: WorkspaceRole;
+}
+
+export type TextAlignment = "left" | "center" | "right" | "justify";
+export type PageSize = "A4" | "Letter";
+export type PageOrientation = "portrait" | "landscape";
+
+export interface TextMarks {
+  bold?: boolean;
+  italic?: boolean;
+  underline?: boolean;
+  highlight?: string;
+  fontFamily?: string;
+  fontSizePt?: number;
+  color?: string;
+}
+
+export interface TextRun {
+  text: string;
+  marks?: TextMarks;
+}
+
+export interface ParagraphBlock {
+  id: string;
+  type: "paragraph";
+  alignment?: TextAlignment;
+  runs: TextRun[];
+}
+
+export interface HeadingBlock {
+  id: string;
+  type: "heading";
+  level: 1 | 2 | 3;
+  alignment?: TextAlignment;
+  runs: TextRun[];
+}
+
+export interface ListBlock {
+  id: string;
+  type: "bullet_list" | "ordered_list";
+  items: TextRun[][];
+}
+
+export interface TableCell {
+  runs: TextRun[];
+  colspan?: number;
+  rowspan?: number;
+}
+
+export interface TableBlock {
+  id: string;
+  type: "table";
+  hasHeaderRow: boolean;
+  rows: TableCell[][];
+}
+
+export interface PageBreakBlock {
+  id: string;
+  type: "page_break";
+}
+
+export interface LinkedMetricReference {
+  datasetId: string;
+  datasetVersion: string;
+  metricId: string;
+  metricVersion: string;
+  reportingPeriod: string;
+  filterContext: Record<string, string>;
+  unit: string;
+  currency?: string;
+  approvalStatus: "draft" | "certified" | "published_snapshot";
+  freshnessTimestamp: string;
+  mode: "live_draft" | "published_snapshot";
+  displayLabel: string;
+  cachedFormattedValue: string;
+}
+
+export interface LinkedMetricPlaceholderBlock {
+  id: string;
+  type: "linked_metric_placeholder";
+  metric: LinkedMetricReference;
+}
+
+export type DocumentBlock =
+  | ParagraphBlock
+  | HeadingBlock
+  | ListBlock
+  | TableBlock
+  | PageBreakBlock
+  | LinkedMetricPlaceholderBlock;
+
+export interface PageLayoutConfig {
+  size: PageSize;
+  orientation: PageOrientation;
+  marginsMm: {
+    top: number;
+    right: number;
+    bottom: number;
+    left: number;
+  };
+  headerText: string;
+  footerText: string;
+  showPageNumbers: boolean;
+}
+
+export interface StudioDocument {
+  documentId: string;
+  tenantId: string;
+  workspaceId: string;
+  title: string;
+  language: "en" | "km" | "bilingual";
+  revision: number;
+  status: "draft" | "in_review" | "approved";
+  layout: PageLayoutConfig;
+  blocks: DocumentBlock[];
+  createdBy: string;
+  createdAt: string;
+  updatedAt: string;
+  sourceImportSha256?: string;
+}
+
+export interface DocumentVersion {
+  versionId: string;
+  documentId: string;
+  revision: number;
+  snapshot: StudioDocument;
+  summary: string;
+  source: "manual" | "typed_ai" | "voice_command" | "import" | "restore";
+  actorId: string;
+  restoredFromRevision?: number;
+  undoneRevision?: number;
+  createdAt: string;
+}
+
+export interface ImportDiagnostics {
+  originalSha256: string;
+  filename: string;
+  byteLength: number;
+  macrosBlocked: boolean;
+  warnings: string[];
+  unsupportedFeatures: string[];
+}
+
+export type DocumentOperationType =
+  | "insert_text"
+  | "replace_selection"
+  | "set_heading"
+  | "toggle_bold"
+  | "set_alignment"
+  | "insert_table"
+  | "undo_last";
+
+export interface DocumentSelectionRef {
+  blockId: string;
+  startOffset?: number;
+  endOffset?: number;
+  selectedText?: string;
+  selectionHash?: string;
+}
+
+export type OperationRiskLevel = "low" | "medium" | "high";
+export type OperationSource = "manual" | "typed_ai" | "voice_command";
+
+export interface DocumentOperationPreview {
+  blockId?: string;
+  beforeText: string;
+  afterText: string;
+  summary: string;
+}
+
+export interface DocumentOperationProposal {
+  operationId: string;
+  documentId: string;
+  expectedRevision: number;
+  selection?: DocumentSelectionRef;
+  action: DocumentOperationType;
+  params: Record<string, unknown>;
+  requestedBy: string;
+  riskLevel: OperationRiskLevel;
+  requiresApproval: boolean;
+  source: OperationSource;
+  inputLanguage: "en" | "km";
+  outputLanguage: "en" | "km" | "match";
+  originalCommand: string;
+  explanation: string;
+  previewDiff: DocumentOperationPreview;
+  createdAt: string;
+}
+
+export type SpeechProviderId =
+  | "mock"
+  | "google-cloud-stt-v2"
+  | "azure-speech"
+  | "faster-whisper";
+
+export type SpeechLanguageCode = "en-US" | "km-KH";
+
+export interface SpeechRecognitionRequest {
+  language: SpeechLanguageCode;
+  mode: "dictation" | "command" | "contextual" | "workflow";
+  fixtureId?: string;
+  simulatedTranscript?: string;
+  audioBase64?: string;
+  mimeType?: string;
+  durationMs?: number;
+}
+
+export interface SpeechRecognitionResult {
+  transcript: string;
+  language: SpeechLanguageCode;
+  confidence: number;
+  provider: SpeechProviderId;
+  isMock: boolean;
+  disclaimer?: string;
+  durationMs: number;
+  warnings: string[];
+}
+
+export interface SpeechRecognitionAdapter {
+  readonly providerId: SpeechProviderId;
+  readonly isMock: boolean;
+  transcribe(request: SpeechRecognitionRequest): Promise<SpeechRecognitionResult>;
+}
+
+export interface AuditEvent {
+  auditId: string;
+  tenantId: string;
+  workspaceId: string;
+  documentId?: string;
+  actorId: string;
+  actorRole: WorkspaceRole;
+  source: OperationSource | "import" | "export" | "restore" | "system";
+  action: string;
+  outcome: "success" | "denied" | "failed";
+  revisionBefore?: number;
+  revisionAfter?: number;
+  operationId?: string;
+  summary: string;
+  metadata?: Record<string, unknown>;
+  createdAt: string;
+}
+
+/**
+ * Planned future studio boundary interfaces (Phase D2+ / D7).
+ * Interfaces only — no implementation authorized in Phase D0/D1.
+ */
+export interface FutureStudioBoundaryDescriptor {
+  studioId: "spreadsheets" | "presentations" | "analytics";
+  status: "planned_future_phase";
+  route: string;
+  contractVersion: "0.1-placeholder";
+}
+
+export const PLANNED_FUTURE_STUDIOS: readonly FutureStudioBoundaryDescriptor[] = [
+  { studioId: "spreadsheets", status: "planned_future_phase", route: "/spreadsheets", contractVersion: "0.1-placeholder" },
+  { studioId: "presentations", status: "planned_future_phase", route: "/presentations", contractVersion: "0.1-placeholder" },
+  { studioId: "analytics", status: "planned_future_phase", route: "/analytics", contractVersion: "0.1-placeholder" },
+] as const;
+
+// =============================================================================
+// Stage 3 FR-03 — Spreadsheet Studio Feasibility Contracts (Phase SS-00 only)
+// =============================================================================
+
+export type ExcelErrorValue =
+  | "#DIV/0!"
+  | "#REF!"
+  | "#VALUE!"
+  | "#NAME?"
+  | "#N/A"
+  | "#NUM!"
+  | "#SPILL!"
+  | "#CYCLE!";
+
+export type CellStoredValue = number | string | boolean | null;
+
+export interface SpreadsheetCellRecord {
+  /** Authoritative stored value (number, string ID with leading zeros, boolean, or null). */
+  value: CellStoredValue;
+  /** Optional formula starting with '='; calculated value is stored separately in evaluatedValue. */
+  formula?: string;
+  /** Evaluated output produced strictly by the deterministic calculation engine. */
+  evaluatedValue?: CellStoredValue | { error: ExcelErrorValue; detail?: string };
+  /** Display format kept distinct from stored value (e.g. '0.00%', '$#,##0.00', '៛#,##0'). */
+  numberFormat?: string;
+  /** Explicit currency code when cell represents money; prevents mixing USD and KHR silently. */
+  currency?: "USD" | "KHR" | "NONE";
+  /** Protected formula/metric cells cannot be overwritten without explicit unlock. */
+  protected?: boolean;
+  /** Unsupported formula warning (never silently evaluated as 0). */
+  unsupportedWarning?: string;
+}
+
+export interface SpreadsheetWorksheet {
+  sheetId: string;
+  name: string;
+  cells: Record<string, SpreadsheetCellRecord>;
+}
+
+export interface SpreadsheetWorkbook {
+  workbookId: string;
+  title: string;
+  revision: number;
+  dateSystem: "1900" | "1904";
+  sheets: SpreadsheetWorksheet[];
+  unsupportedFeatures: string[];
+}
+
+export type SpreadsheetOperationType =
+  | "set_range_formula"
+  | "set_cell_value"
+  | "format_currency"
+  | "create_sheet"
+  | "undo_last";
+
+export interface SpreadsheetOperationProposal {
+  operationId: string;
+  workbookId: string;
+  expectedRevision: number;
+  sheetName: string;
+  targetRange: string;
+  action: SpreadsheetOperationType;
+  formula?: string;
+  fillMode?: "adjust_relative_references" | "fixed";
+  currencyDisplayOnly?: "USD" | "KHR";
+  requiresApproval: boolean;
+  blockedReason?: string;
+  inputLanguage: "en" | "km";
+  source: OperationSource;
+  originalCommand: string;
+  explanation: string;
+}
+
+export interface CsvExportSafetyReport {
+  csv: string;
+  neutralizedFormulaCells: number;
+  warnings: string[];
+}
+
+// =============================================================================
+// Stage 3 FR-04 — Data Preparation Studio Contracts (Phase DP-00 Feasibility)
+// =============================================================================
+
+export interface DatasetSourceRecord {
+  sourceId: string;
+  filename: string;
+  format: "csv" | "xlsx";
+  sha256: string;
+  totalRowsRead: number;
+  acceptedRows: number;
+  rejectedRows: number;
+  columnNames: string[];
+  importedAt: string;
+}
+
+export interface ColumnQualityProfile {
+  columnName: string;
+  inferredType: "string" | "number" | "date" | "mixed";
+  nonNullCount: number;
+  nullCount: number;
+  emptyStringCount: number;
+  zeroCount: number;
+  distinctCount: number;
+  invalidCount: number;
+}
+
+export interface DatasetProfile {
+  datasetId: string;
+  scope: "sample" | "full";
+  sampleSize: number;
+  totalRows: number;
+  columns: ColumnQualityProfile[];
+}
+
+export type DataTransformOpType =
+  | "map_schema"
+  | "trim_normalize"
+  | "parse_date_locale"
+  | "quarantine_missing_required"
+  | "map_bilingual_dictionary"
+  | "deduplicate_composite_key"
+  | "append_datasets"
+  | "validated_join";
+
+export interface DataTransformStep {
+  stepId: string;
+  op: DataTransformOpType;
+  params: Record<string, unknown>;
+}
+
+export interface DataPreparationRecipe {
+  recipeId: string;
+  version: number;
+  tenantId: string;
+  workspaceId: string;
+  pinnedInputSha256s: string[];
+  steps: DataTransformStep[];
+  idempotencyKey: string;
+}
+
+export interface JoinCardinalityReport {
+  expectedCardinality: "one_to_one" | "many_to_one" | "one_to_many" | "many_to_many";
+  leftRows: number;
+  rightRows: number;
+  duplicateRightKeys: string[];
+  unmatchedLeftKeys: string[];
+  outputRows: number;
+  blocked: boolean;
+  reason?: string;
+}
+
+export interface CurrencyControlTotal {
+  currency: string;
+  sourceTotal: number;
+  preparedTotal: number;
+  excludedOrQuarantinedTotal: number;
+  unexplainedDifference: number;
+}
+
+export interface ReconciliationReport {
+  sourceAcceptedRows: number;
+  preparedRows: number;
+  quarantinedRows: number;
+  deduplicatedRows: number;
+  currencyTotals: CurrencyControlTotal[];
+  criticalFailures: string[];
+  passed: boolean;
+}
+
+export interface DatasetExceptionRecord {
+  exceptionId: string;
+  sourceFile: string;
+  sourceRowNumber: number;
+  severity: "warning" | "critical";
+  code: string;
+  message: string;
+  rawRecord: Record<string, unknown>;
+  resolved: boolean;
+}
+
+export interface CertifiedDatasetArtifact {
+  datasetId: string;
+  version: number;
+  tenantId: string;
+  workspaceId: string;
+  status: "draft" | "certified" | "blocked";
+  outputSha256: string;
+  rows: Array<Record<string, unknown>>;
+  exceptions: DatasetExceptionRecord[];
+  reconciliation: ReconciliationReport;
+  joinReport?: JoinCardinalityReport;
+  lineage: {
+    sourceSha256s: string[];
+    recipeId: string;
+    recipeVersion: number;
+    engine: "pipeline-ts" | "duckdb" | "polars";
+    createdAt: string;
+  };
+}
+
+

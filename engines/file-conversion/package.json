@@ -1,0 +1,16 @@
+{
+  "name": "@ai-office-suite/file-conversion",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "@ai-office-suite/shared-contracts": "*",
+    "@ai-office-suite/document-engine": "*",
+    "docx": "^9.5.1",
+    "fflate": "^0.8.2",
+    "mammoth": "^1.9.0"
+  }
+}
