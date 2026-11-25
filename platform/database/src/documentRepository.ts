@@ -466,13 +466,12 @@ export class PostgreSqlDocumentRepository {
     assertCanPerform(actor, "document", "write");
     assertValidDocumentUuid(documentId);
     return withTenantTransaction(this.db, actor.tenantId, async (tx) => {
-      const curRes = await tx.query<{ workspace_id: string; current_revision: number; snapshot_json: StudioDocument | string }>(
-        `SELECT d.workspace_id::text, d.current_revision, v.snapshot_json
-         FROM documents d
-         JOIN document_versions v
-           ON v.tenant_id = d.tenant_id AND v.document_id = d.document_id AND v.revision = d.current_revision
-         WHERE d.document_id = $1::uuid
-         FOR UPDATE OF d`,
+      // Lock ONLY the documents row first (avoiding READ COMMITTED EvalPlanQual join drops under concurrent updates)
+      const curRes = await tx.query<{ workspace_id: string; current_revision: number }>(
+        `SELECT workspace_id::text, current_revision
+         FROM documents
+         WHERE document_id = $1::uuid
+         FOR UPDATE`,
         [documentId],
       );
       const row = curRes.rows[0];
@@ -488,7 +487,18 @@ export class PostgreSqlDocumentRepository {
         );
       }
 
-      const currentDoc = parseSnapshot(row.snapshot_json);
+      const snapRes = await tx.query<{ snapshot_json: StudioDocument | string }>(
+        `SELECT snapshot_json
+         FROM document_versions
+         WHERE document_id = $1::uuid AND revision = $2`,
+        [documentId, row.current_revision],
+      );
+      const snapRow = snapRes.rows[0];
+      if (!snapRow) {
+        throw new DatabaseConflictError(404, "VERSION_NOT_FOUND", `Revision ${row.current_revision} snapshot missing.`);
+      }
+
+      const currentDoc = parseSnapshot(snapRow.snapshot_json);
       const nextRevision = expectedRevision + 1;
       const updatedDoc = buildNext(currentDoc, nextRevision);
       const contentSha = createHash("sha256").update(JSON.stringify(updatedDoc)).digest("hex");
@@ -568,14 +578,12 @@ export class PostgreSqlDocumentRepository {
     assertValidDocumentUuid(documentId);
 
     return withTenantTransaction(this.db, actor.tenantId, async (tx) => {
-      // Lock the document row first so concurrent identical operationIds serialize cleanly
-      const curRes = await tx.query<{ workspace_id: string; current_revision: number; snapshot_json: StudioDocument | string }>(
-        `SELECT d.workspace_id::text, d.current_revision, v.snapshot_json
-         FROM documents d
-         JOIN document_versions v
-           ON v.tenant_id = d.tenant_id AND v.document_id = d.document_id AND v.revision = d.current_revision
-         WHERE d.document_id = $1::uuid
-         FOR UPDATE OF d`,
+      // Lock ONLY the documents row first so concurrent identical operationIds serialize without EPQ join drops
+      const curRes = await tx.query<{ workspace_id: string; current_revision: number }>(
+        `SELECT workspace_id::text, current_revision
+         FROM documents
+         WHERE document_id = $1::uuid
+         FOR UPDATE`,
         [documentId],
       );
       const row = curRes.rows[0];
@@ -616,7 +624,17 @@ export class PostgreSqlDocumentRepository {
         );
       }
 
-      const currentDoc = parseSnapshot(row.snapshot_json);
+      const curSnapRes = await tx.query<{ snapshot_json: StudioDocument | string }>(
+        `SELECT snapshot_json
+         FROM document_versions
+         WHERE document_id = $1::uuid AND revision = $2`,
+        [documentId, row.current_revision],
+      );
+      const curSnapRow = curSnapRes.rows[0];
+      if (!curSnapRow) {
+        throw new DatabaseConflictError(404, "VERSION_NOT_FOUND", `Revision ${row.current_revision} snapshot missing.`);
+      }
+      const currentDoc = parseSnapshot(curSnapRow.snapshot_json);
       let priorSnapshot: StudioDocument | null = null;
       if (loadPriorForUndo && currentDoc.revision > 1) {
         const prevRes = await tx.query<{ snapshot_json: StudioDocument | string }>(
