@@ -1,0 +1,18 @@
+{
+  "name": "@ai-office-suite/intelligence-engine",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "@ai-office-suite/analytics-engine": "*",
+    "@ai-office-suite/audit": "*",
+    "@ai-office-suite/authorization": "*",
+    "@ai-office-suite/presentation-engine": "*",
+    "@ai-office-suite/shared-contracts": "*",
+    "@ai-office-suite/validation": "*",
+    "echarts": "^6.1.0"
+  }
+}

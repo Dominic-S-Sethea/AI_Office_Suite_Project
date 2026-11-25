@@ -355,4 +355,99 @@ export function scanForUnsafeAnalyticalInput(input: string): PromptSafetyScanRes
   };
 }
 
+export function validatePptxUploadBytes(
+  filename: string,
+  bytes: Uint8Array,
+): { ok: true } | { ok: false; code: string; message: string } {
+  const maxBytes = 15 * 1024 * 1024;
+  if (bytes.byteLength === 0) {
+    return { ok: false, code: "EMPTY_UPLOAD", message: "Uploaded presentation file is empty." };
+  }
+  if (bytes.byteLength > maxBytes) {
+    return { ok: false, code: "FILE_TOO_LARGE", message: "Uploaded PPTX exceeds PS-00 15 MB limit." };
+  }
+  const lower = filename.toLowerCase();
+  if (lower.endsWith(".pptm") || lower.endsWith(".potm") || lower.endsWith(".ppsm")) {
+    return { ok: false, code: "MACRO_PRESENTATION_BLOCKED", message: "Macro-enabled PowerPoint files (.pptm/.potm/.ppsm) are blocked." };
+  }
+  if (!lower.endsWith(".pptx")) {
+    return { ok: false, code: "UNSUPPORTED_EXTENSION", message: "Only .pptx files are accepted by the PPTX importer." };
+  }
+  if (
+    bytes.byteLength >= 8 &&
+    bytes[0] === 0xd0 &&
+    bytes[1] === 0xcf &&
+    bytes[2] === 0x11 &&
+    bytes[3] === 0xe0 &&
+    bytes[4] === 0xa1 &&
+    bytes[5] === 0xb1 &&
+    bytes[6] === 0x1a &&
+    bytes[7] === 0xe1
+  ) {
+    return { ok: false, code: "ENCRYPTED_FILE_UNSUPPORTED", message: "Encrypted or legacy OLE2 PowerPoint files are rejected in PS-00." };
+  }
+  if (
+    bytes.byteLength < 4 ||
+    bytes[0] !== 0x50 ||
+    bytes[1] !== 0x4b ||
+    bytes[2] !== 0x03 ||
+    bytes[3] !== 0x04
+  ) {
+    return { ok: false, code: "INVALID_ZIP_MAGIC", message: "File header is not a valid OOXML ZIP container." };
+  }
+  return { ok: true };
+}
+
+const UNSAFE_CHART_SPEC_PATTERNS: ReadonlyArray<{ id: string; pattern: RegExp; reason: string }> = [
+  {
+    id: "html_script_or_handler",
+    pattern: /<\s*script\b|on\w+\s*=|javascript:/i,
+    reason: "Unsafe HTML/script handler rejected in chart specification.",
+  },
+  {
+    id: "external_uri",
+    pattern: /(https?:\/\/|file:\/\/|ftp:\/\/)/i,
+    reason: "External URLs are not permitted inside validated ChartSpec strings.",
+  },
+  {
+    id: "js_callback_or_eval",
+    pattern: /\bfunction\s*\(|\beval\s*\(|=>\s*\{/i,
+    reason: "Executable JavaScript expressions are not permitted inside ChartSpec.",
+  },
+];
+
+export function validateChartSpecSafety(spec: {
+  titleEn: string;
+  titleKm: string;
+  altSummaryEn: string;
+  altSummaryKm: string;
+  categories: string[];
+  series: Array<{ labelEn: string; labelKm: string }>;
+}): PromptSafetyScanResult {
+  const texts = [
+    spec.titleEn,
+    spec.titleKm,
+    spec.altSummaryEn,
+    spec.altSummaryKm,
+    ...spec.categories,
+    ...spec.series.flatMap((s) => [s.labelEn, s.labelKm]),
+  ];
+  const reasons: string[] = [];
+  for (const t of texts) {
+    const promptCheck = scanForUnsafeAnalyticalInput(t);
+    if (!promptCheck.safe) {
+      reasons.push(...promptCheck.reasons);
+    }
+    for (const rule of UNSAFE_CHART_SPEC_PATTERNS) {
+      if (rule.pattern.test(t)) {
+        reasons.push(rule.reason);
+      }
+    }
+  }
+  return {
+    safe: reasons.length === 0,
+    reasons: Array.from(new Set(reasons)),
+  };
+}
+
 export type ValidatedStudioDocument = StudioDocument;

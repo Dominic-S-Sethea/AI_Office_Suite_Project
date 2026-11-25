@@ -1,5 +1,11 @@
 # Changelog — AI Office Suite
 
+## [0.4.0-ps00-bi00] — 2026-11-26 (FR-06 PS-00 Presentation & FR-07 BI-00 Intelligence Studio Feasibility)
+
+### Added & Verified
+- **FR-06 Presentation Studio (`engines/presentation`, `PS-00`):** Added canonical `StudioPresentation`/`SlideElement` contracts, EMU/px geometry conversion, layout overflow & a11y checks (`validatePresentationLayoutAndA11y`), `pptxgenjs@4.0.1` native editable PPTX exporter (with `"overrides": { "image-size": "^2.1.0" }` fixing high DoS advisories), `fflate` hardened `.pptx` importer, Edge HarfBuzz 6-page PDF & 16:9 PNG renderer, and bilingual mock operations (`tests/g1-ps00-presentation-feasibility.test.ts` covering `PPT-T01..T20`; `PPT-T06` reference PowerPoint viewer open noted as pending).
+- **FR-07 Intelligence Studio (`engines/intelligence`, `BI-00`):** Added shared `ChartSpec`/`ChartDataBinding` contracts compiled into `echarts@6.1.0` (Apache-2.0) SSR SVG + HTML `<table>` fallback and constrained Vega-Lite comparison JSON; integrated Section 12 Golden Fixture directly over FR-05 `BusinessAnalysisEngine` (`DataScopePolicy` intersection, policy-keyed caching, principal revocation, race-guarded filtering, drill-through column projection, draft refresh/failure/retry, immutable snapshots, summary CSV export, dashboard-to-presentation generation, and `X-VIS-01..08` cross-module reconciliation).
+
 ## [0.3.0-d2-an00] — 2026-11-26 (Phase D2 Platform Foundation, FR-05 AN-00 & Founder Approvals #1–#4)
 
 ### Added

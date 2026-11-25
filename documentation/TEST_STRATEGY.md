@@ -18,9 +18,12 @@
 | **FR-04 Data Preparation** | `tests/g1-dp00-data-preparation.test.ts` | DP-00 / `DAT-T01..T18`: reordered XLSX+CSV, Khmer/IDs, ambiguous date refusal, null≠0, composite dedupe, §5.4 golden duplicate-key join block & reconciliation, unmatched `C999`, cancel/rerun/drift/EN-KM/injection/cross-tenant/idempotency + DuckDB vs Polars parity & 10k/100k benchmarks |
 | **FR-05 Business Analytics** | `tests/g1-an00-analytics-feasibility.test.ts` | AN-00 / `ANA-T01..T18`: golden financial dataset (`$150k/$90k/$60k/$20k/$40k`, `40.00%`/`26.67%`/`20.00%`), combined ratios, zero-denom unavailable, distinct customers, granularity-aligned budget vs actual, fiscal YTD, partial warnings, multi-currency FX, rounding (`HALF_UP`/`HALF_EVEN`), missing-amount block, V1/V2 versioning, EN/KM parity, ambiguous clarification, tenant/cache isolation, SQL injection rejection, cross-module sync, retry idempotency, snapshot immutability, 10k/50k DuckDB stress |
 | **Phase D2 Platform (PG/Auth)** | `tests/d2-platform-pg-auth.test.ts` | Real `@electric-sql/pglite` PostgreSQL schema + non-superuser `app_runtime` RLS fail-closed negative tests, `REVOKE UPDATE/DELETE ON audit_logs`, HTTP `aios_session` HttpOnly cookie, CSRF `403`, RBAC `403`, concurrent `409 REVISION_CONFLICT`, `token_version` revocation `401`, `.local-data/` dry-run/apply/rollback, logical SQL dump/restore |
+| **FR-06 Presentation (`PS-00`)** | `tests/g1-ps00-presentation-feasibility.test.ts` | `PPT-T01..T20` local verification + `.pptm`/traversal/macro/prompt-injection blocks + PptxGenJS 5/20/50-slide benchmarks + 6-page HarfBuzz PDF & visual slide PNGs (`PPT-T06` reference PowerPoint viewer open pending) |
+| **FR-07 BI & `X-VIS` (`BI-00`)** | `tests/g1-bi00-intelligence-feasibility.test.ts` | `BI-T01..T32` + `X-VIS-01..08` against §12 Golden Fixture, ECharts SSR SVG + Edge PNG + Vega-Lite JSON parity, `DataScopePolicy` row/col/cache/export isolation, revocation, refresh/snapshot/race-guard, 10k/100k benchmarks (`BI-T33..T34` pending P1) |
 
 ## 2. Pending Test Suites (Future Phases)
 
+- Desktop Microsoft PowerPoint / LibreOffice Impress visual compatibility audit (`PPT-T06` reference viewer open).
 - Live native Khmer (`km-KH`) & English (`en-US`) consented multi-speaker WER/CER evaluation (`D5`).
 - Playwright browser UI E2E & WCAG 2.2 AA accessibility audit (`D3` / `D8`).
-- Managed PostgreSQL failover & P1 forecasting backtest coverage (`AN-08` / `D8`).
+- Managed PostgreSQL failover, P1 BI alerts/scheduling (`BI-T33..T34`), and P1 forecasting backtest coverage (`AN-08` / `ENG-BI-11` / `D8`).

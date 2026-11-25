@@ -75,9 +75,15 @@ describe("Phase D2 (G2) — PostgreSQL RLS, Hardened Auth/RBAC, Concurrency & Mi
   });
 
   afterAll(async () => {
-    await new Promise<void>((resolve) => server.close(() => resolve()));
-    await db.close();
-    rmSync(scratchDir, { recursive: true, force: true });
+    if (server) {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+    if (db) {
+      await db.close();
+    }
+    if (scratchDir) {
+      rmSync(scratchDir, { recursive: true, force: true });
+    }
   });
 
   it("enforces fail-closed PostgreSQL RLS as app_runtime, blocks cross-tenant queries/FKs, and forbids audit tampering", async () => {

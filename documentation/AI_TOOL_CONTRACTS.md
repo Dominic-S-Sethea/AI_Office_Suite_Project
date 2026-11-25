@@ -81,3 +81,14 @@ Validates all natural-language analytical plans via `scanForUnsafeAnalyticalInpu
 - **Clarification Gate:** Ambiguous `"Calculate profit"` / `"គណនាប្រាក់ចំណេញ"` resolves to `clarificationRequired: true` rather than guessing `FIN-GROSS-PROFIT` vs `FIN-OPERATING-PROFIT`.
 - **Observed Facts vs AI Interpretation:** Every `AnalyticalResult` populates `observedFacts` strictly from executed BigInt/DuckDB numbers and marks optional narrative commentary with `aiInterpretation.isObservedFact = false`.
 - **Cross-Module Extension:** `LinkedMetricReference` adds `provenanceId`, `calculationEngineVersion`, `precisionPolicyId`, `status`, and `unavailableReason` cleanly in place across Document Studio, Spreadsheet Studio, Presentation Studio, and Intelligence Studio.
+
+## 4. Presentation Operation Proposal (`PresentationOperationProposal`, FR-06 PS-00)
+
+Validates all typed/mock English & Khmer commands in `PresentationWorkspaceStore`:
+- **Actions:** `add_slide`, `replace_text`, `move_resize_element`, `apply_theme`, `insert_metric`, `change_chart_type`, `translate_narrative`, `undo_last`.
+- **Invariants:** Explicit `expectedRevision` (`409`), `requiresApproval: true`, exact `targetElementId` binding, immutable certified `sourceRefs` & `chartSpec.series` when swapping `chartType` or translating slide text, and `scanForPromptInjection()` over both commands and slide text.
+
+## 5. Intelligence Studio Operations & Shared `ChartSpec` (`FR-07 BI-00`)
+
+- **`planBiDashboardCommand` (`isMockPlanner: true`):** Bounded EN/KM operation resolution (`set_department_filter`, `set_chart_type`, `query_metric`, `create_presentation_draft`) sanitized via `scanForUnsafeAnalyticalInput()`.
+- **`ChartSpec` & `ChartDataBinding`:** Shared chart payload validated via `validateChartSpecSafety()` (no `<script>`, URLs, or JS callbacks) and compiled uniformly by Apache ECharts SSR (`engines/intelligence/src/chartAdapters.ts`), Vega-Lite comparison JSON, and `PptxGenJS` native OOXML chart generation (`engines/presentation/src/pptxExporter.ts`).

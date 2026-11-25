@@ -32,10 +32,19 @@
    - Voice transcripts enter the exact same backend authorization, revision-conflict, selection-hash, and approval-confirmation pipeline as typed text commands.
 
 6. **Append-Only Redacted Audit Log (`platform/audit`)**
-   - Audit records redact sensitive keys (`password`, `secret`, `token`, `apiKey`, `authorization`, `cookie`) and token patterns (`sk-*`, JWTs, `Bearer *`, private keys) before writing to JSONL.
+   - Audit records redact sensitive keys (`password`, `secret`, `token`, `apiKey`, `authorization`, `cookie`) and token patterns (`sk-*`, JWTs, `Bearer *`, private keys) before writing to JSONL, and PostgreSQL `audit_logs` revokes `UPDATE` and `DELETE` from `app_runtime`.
+
+7. **Phase D2 PostgreSQL RLS & Identity (`platform/database`, `platform/identity`):**
+   - `ENABLE` + `FORCE ROW LEVEL SECURITY` with fail-closed `NULLIF(current_setting('app.current_tenant_id', true), '')::uuid` enforced under non-superuser `app_runtime`.
+   - Signed `HS256` JWTs paired with `HttpOnly; SameSite=Lax` cookies (`aios_session`), `Sec-Fetch-Site`/`Origin` CSRF checks on cookie mutations, and live database `users.status` + `token_version` epoch checks.
+
+8. **FR-06 Presentation & FR-07 Intelligence Studio Controls (`PS-00` & `BI-00`):**
+   - **PPTX Import Safety:** `validatePptxUploadBytes()` + `fflate` bounds block `.pptm`/macros/`vbaProject.bin`, OLE2 encrypted containers, ZIP traversal, and external `.rels` without network fetch.
+   - **Export Disclosure:** `ExportDisclosurePolicy` strips hidden slides & speaker notes when prohibited by policy, and BI detail export is blocked (`403 UNDERLYING_EXPORT_DENIED`) when `canExportUnderlyingDetail = false`.
+   - **DataScopePolicy, Cache Keying & Chart Sanitization:** Every BI query intersects requested filters with server `DataScopePolicy` (`allowedDepartments`, `allowedColumns`), includes `policyId:policyVersion` + scope in cache keys (`BI-T18`), revokes historical snapshot access immediately (`BI-T19`), and rejects unsafe `<script`/URI/callback payloads via `validateChartSpecSafety()`.
 
 ## 2. Known Remaining Risks (Honest Disclosure)
 
-- Local prototype header identity (`x-workspace-role`) is **not** production authentication — **must not** be exposed outside `127.0.0.1` prior to D2 auth integration.
-- `mammoth` and `exceljs` parse untrusted XML/ZIP inputs in Node; keep dependencies patched and run parsers inside isolated worker containers (`apps/workers`) in D2+.
-- Real multi-tenant database RLS and encrypted-at-rest object storage belong to D2/Stage 6.
+- Prototype `.local-data/` header auth (`provisional-local`) remains loopback-only when used for legacy D1 tests; production paths must run exclusively under `authMode: "jwt-pg"`.
+- `mammoth`, `exceljs`, and `fflate` parse untrusted OOXML/ZIP inputs in Node; keep dependencies patched and isolate file parsers inside worker containers (`apps/workers`) in production.
+- Hosted cloud PostgreSQL `16/17`, KMS secret rotation, inference suppression thresholds, and Playwright UI E2E audits remain gated for D3/Stage 6.

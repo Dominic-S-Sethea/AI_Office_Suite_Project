@@ -1,0 +1,20 @@
+{
+  "name": "@ai-office-suite/presentation-engine",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "@ai-office-suite/analytics-engine": "*",
+    "@ai-office-suite/audit": "*",
+    "@ai-office-suite/authorization": "*",
+    "@ai-office-suite/document-engine": "*",
+    "@ai-office-suite/file-conversion": "*",
+    "@ai-office-suite/shared-contracts": "*",
+    "@ai-office-suite/validation": "*",
+    "fflate": "^0.8.2",
+    "pptxgenjs": "^4.0.1"
+  }
+}

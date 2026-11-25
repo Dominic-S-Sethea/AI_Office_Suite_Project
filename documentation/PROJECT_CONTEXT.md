@@ -1,19 +1,19 @@
 # Project Context — AI Office Suite (AI Corporate Workspace)
 
-**Document Version:** 1.0 (Phase D0/D1 Baseline)  
+**Document Version:** 1.2 (Consolidated FR-03..FR-07 Feasibility + Phase D2 Foundation)  
 **Date:** 26 November 2026  
-**Authorization Status:** Phases **D0** (Engineering Foundation) and **D1** (Technical Feasibility Prototypes + FR-03 SS-00 Spreadsheet Feasibility Extension) ONLY. Commercial launch and D2+ production buildout are not yet authorized.
+**Authorization Status:** Local **D0/D1** baseline, **D2 (`G2`)** PostgreSQL RLS/auth foundation, **FR-03 `SS-00`**, **FR-04 `DP-00`**, **FR-05 `AN-00`**, and **FR-06 `PS-00` / FR-07 `BI-00`** local feasibility prototypes executed. Commercial licensing purchases, public deployments, and `D3` / `SS-01` / `DP-01` / `AN-01` / `PS-01` / `ENG-BI-01` production buildouts remain gated.
 
 ## 1. Product Vision
 
 AI Office Suite is a commercial, AI-native corporate productivity and business intelligence platform for small and medium-sized businesses (SMEs, ~10–250 staff), focused on administration, finance, and management.
 
-The platform connects five functional pillars inside one unified modular workspace:
-1. **Document Studio** — Word-inspired structured document authoring, templates, review, DOCX/PDF export.
-2. **Spreadsheet Studio** — Excel-inspired calculation, financial modeling, XLSX/CSV interoperability, and Formula Intelligence.
-3. **Presentation Studio** — PowerPoint-inspired editable slide decks connected to certified metrics *(planned boundary only)*.
-4. **Intelligence Studio** — Power BI-inspired semantic models, KPIs, and interactive dashboards *(planned boundary only)*.
-5. **AI Intelligence Core** — Contextual AI assistance, controlled tool execution, and English + Khmer voice-to-action.
+The platform connects five functional pillars inside one unified modular workspace backed by **FR-04/05** shared data & analytics engines:
+1. **Document Studio (`FR-02`)** — Word-inspired structured document authoring, templates, review, DOCX/PDF export.
+2. **Spreadsheet Studio (`FR-03`)** — Excel-inspired calculation, financial modeling, XLSX/CSV interoperability, and Formula Intelligence.
+3. **Presentation Studio (`FR-06`)** — PowerPoint-inspired editable 16:9 slide decks (`pptxgenjs` PPTX + HarfBuzz PDF) bound to certified metrics.
+4. **Intelligence Studio (`FR-07`)** — Power BI-inspired semantic dashboards, cross-filters, `DataScopePolicy` row/column governance, Apache ECharts SSR visuals, and scoped drill-through/exports.
+5. **AI Intelligence Core (`FR-09/10`)** — Contextual AI assistance, controlled tool execution, and English + Khmer voice-to-action.
 
 ## 2. Core Engineering Principle
 

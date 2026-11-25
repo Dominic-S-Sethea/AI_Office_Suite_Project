@@ -96,7 +96,7 @@ function renderBlockHtml(block: DocumentBlock): string {
   }
 }
 
-function resolveLocalFontFacesCss(): string {
+export function resolveLocalFontFacesCss(): string {
   const __dirname = path.dirname(fileURLToPath(import.meta.url));
   const workspaceRoot = path.resolve(__dirname, "..", "..", "..");
   const fontCandidates = [

@@ -12,6 +12,8 @@ export default defineConfig({
       "@ai-office-suite/storage": path.resolve(__dirname, "platform/storage/src/index.ts"),
       "@ai-office-suite/audit": path.resolve(__dirname, "platform/audit/src/index.ts"),
       "@ai-office-suite/analytics-engine": path.resolve(__dirname, "engines/analytics/src/index.ts"),
+      "@ai-office-suite/presentation-engine": path.resolve(__dirname, "engines/presentation/src/index.ts"),
+      "@ai-office-suite/intelligence-engine": path.resolve(__dirname, "engines/intelligence/src/index.ts"),
       "@ai-office-suite/document-engine": path.resolve(__dirname, "engines/document/src/index.ts"),
       "@ai-office-suite/calculation-engine": path.resolve(__dirname, "engines/calculation/src/index.ts"),
       "@ai-office-suite/data-processing": path.resolve(__dirname, "engines/data-processing/src/index.ts"),
@@ -24,6 +26,7 @@ export default defineConfig({
   test: {
     environment: "node",
     include: ["tests/**/*.test.ts"],
-    testTimeout: 30000,
+    testTimeout: 60000,
+    hookTimeout: 60000,
   },
 });

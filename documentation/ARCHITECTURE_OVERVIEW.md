@@ -30,8 +30,10 @@ engines/document          engines/file-conversion       engines/speech   engines
 (Canonical AST,           (DOCX export/import +         (Mock + local    (FR-04 DP-00 DuckDB
  Khmer Intl.Segmenter)     HarfBuzz PDF renderer)        Faster-Whisper)  ETL & Polars parity)
 
-[FR-03 SS-00 Spike]:  engines/calculation (Formula dependency graph, exceljs XLSX, OWASP CSV safety)
-[FR-05 AN-00 Spike]:  engines/analytics   (BusinessMetricRegistry, BigInt FIN-POL-V1, DuckDB exact analytics)
+[FR-03 SS-00 Spike]:  engines/calculation  (Formula dependency graph, exceljs XLSX, OWASP CSV safety)
+[FR-05 AN-00 Spike]:  engines/analytics    (BusinessMetricRegistry, BigInt FIN-POL-V1, DuckDB exact analytics)
+[FR-06 PS-00 Spike]:  engines/presentation (StudioPresentation, PptxGenJS native PPTX, fflate import, HarfBuzz PDF/PNG)
+[FR-07 BI-00 Spike]:  engines/intelligence (Apache ECharts SSR SVG, Vega-Lite comparison, DataScopePolicy, FR-05 sync)
 ```
 
 ## 3. Architectural Invariants

@@ -42,3 +42,20 @@
 | :--- | :--- | :--- | :--- |
 | **AN-00** | Analytical engine feasibility, precision policy & reference fixtures | **Complete (Verified)** | Reuses DuckDB + BigInt minor units (`FIN-POL-V1`); `ANA-T01..T18` & cross-module reconciliation passing |
 | **AN-01 – AN-09** | Production metric registry, statistical/forecasting models, Business Scenario Lab, cross-module BI, security hardening | **Gated Pending AN-00 Review** | P1 forecasting (`ANA-04.03`) and advanced stats (`ANA-04.04`) remain out of AN-00 scope |
+
+## 5. Presentation Studio Workstream (`PS-00` .. `PS-12`, FR-06 / Handover V1.2 §13)
+
+| Phase | Deliverable | Status | Notes |
+| :--- | :--- | :--- | :--- |
+| **PS-00** | Slide model, `pptxgenjs` native PPTX export, `fflate` safe import, Khmer HarfBuzz PDF/PNG | **Complete (Local Feasibility Verified)** | Reference PowerPoint desktop open (`PPT-T06`) pending host app availability; unpacked OOXML & PDF/PNG verified |
+| **PS-01 – PS-12** | Production persistence, interactive React slide editor, full themes, PPTX interop, AI ops, voice, BI sync, QA, Alpha | **Gated Pending PS-00 Review & D3 Baseline** | Requires founder sign-off after reviewing `PRESENTATION_FEASIBILITY_REPORT.md` |
+
+## 6. Intelligence Studio Workstream (`BI-00`, `ENG-BI-01` .. `ENG-BI-11`, FR-07 / Handover V1.2 §13)
+
+*(Note: Engineering phases use `ENG-BI-*` to avoid colliding with parent requirement IDs `BI-01..BI-03`.)*
+
+| Phase | Deliverable | Status | Notes |
+| :--- | :--- | :--- | :--- |
+| **BI-00** | `ChartSpec` adapter (`echarts@6.1.0` + Vega-Lite comparison), `DataScopePolicy` RLS/cache, Section 12 FR-05 sync, refresh/snapshot, deck bridge | **Complete (Local Feasibility Verified)** | Verified `BI-T01..T32` & `X-VIS-01..08`; `BI-T33..T34` pending P1 |
+| **ENG-BI-01 – ENG-BI-10** | Report model & D2 persistence, visual builder, FR-04/05 queries, drill-through, snapshots, AI/voice, presentation bridge, QA, Alpha | **Gated Pending BI-00 Review** | Production BI authoring requires founder sign-off |
+| **ENG-BI-11** | Expansion: governed alerts (`BI-T33`), scheduled refresh (`BI-T34`), advanced visuals | **Pending P1 Authorization** | Out of P0 MVP scope |

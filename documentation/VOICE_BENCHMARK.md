@@ -42,5 +42,6 @@ Before enabling production voice in D5, run consented/synthetic audio fixtures c
 6. Office background noise (~50–60 dBA)
 7. Short formatting commands (`make bold` / `ធ្វើឱ្យដិត`)
 8. Multi-step document & spreadsheet instructions
+9. Presentation & dashboard analytical voice instructions (e.g., `"កែចំណងជើងនេះឱ្យខ្លីជាងមុន"`, `"បង្ហាញផ្នែកលក់ និងសេវាកម្ម"`, `"បង្កើតបទបង្ហាញពីផ្ទាំងព័ត៌មាននេះ"` — currently verified via deterministic mock planners `planPresentationOperation` and `planBiDashboardCommand`, native-speaker review pending)
 
-**Target Exit Gate (§17 & FR-03 §25):** ≥ 95% routine-command end-to-end task success for English and ≥ 95% for Khmer evaluated separately, with statistical sample sizes reviewed at the D1/D5 gate.
+**Target Exit Gate (§17 & FR-03 §25 & Handover V1.2 §7.3):** ≥ 95% routine-command end-to-end task success for English and ≥ 95% for Khmer evaluated separately, with statistical sample sizes reviewed at the D1/D5 gate.
