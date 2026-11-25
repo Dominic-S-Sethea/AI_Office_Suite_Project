@@ -1,0 +1,17 @@
+.git
+.gitignore
+.env
+.env.*
+!.env.example
+.local-data
+.venv-speech
+node_modules
+apps/api/dist
+apps/web/dist
+tests
+documentation
+*.log
+*.wav
+*.mp3
+OVERNIGHT_REPORT.md
+SPRINT_8H_REPORT.md

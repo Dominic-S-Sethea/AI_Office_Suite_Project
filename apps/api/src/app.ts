@@ -101,11 +101,12 @@ export function createApiApp(options: CreateApiAppOptions = {}): Express {
   const useJwtPg = authMode === "jwt-pg";
   const pgRepo = options.db ? new PostgreSqlDocumentRepository(options.db) : null;
 
+  const useInMemoryLocalFallback = options.inMemory || (useJwtPg && !options.storageDir);
   const storageDir = options.storageDir ?? path.resolve(process.cwd(), process.env.LOCAL_STORAGE_DIR ?? ".local-data");
-  const storage: DocumentStorageAdapter = options.inMemory
+  const storage: DocumentStorageAdapter = useInMemoryLocalFallback
     ? new InMemoryStorageAdapter()
     : new LocalFilesystemStorageAdapter(storageDir);
-  const audit: AuditStore = options.inMemory
+  const audit: AuditStore = useInMemoryLocalFallback
     ? new InMemoryAuditStore()
     : new LocalJsonlAuditStore(storageDir);
 
