@@ -14,7 +14,7 @@ import {
   speechTranscribeRequestSchema,
   updateDocumentSchema,
 } from "@ai-office-suite/validation";
-import { AuthorizationError, isWorkspaceRole } from "@ai-office-suite/authorization";
+import { AuthorizationError, assertCanPerform, isWorkspaceRole } from "@ai-office-suite/authorization";
 import {
   DatabaseConflictError,
   PostgreSqlDocumentRepository,
@@ -25,14 +25,28 @@ import {
   authenticateUserWithPassword,
   clearSessionCookie,
   createJwtAuthMiddleware,
+  parseCookie,
   revokeUserSessions,
+  SESSION_COOKIE_NAME,
   setSessionCookie,
+  verifyCookieCsrf,
   type AuthenticatedRequest,
 } from "@ai-office-suite/identity";
 import { InMemoryAuditStore, LocalJsonlAuditStore, type AuditStore } from "@ai-office-suite/audit";
 import { InMemoryStorageAdapter, LocalFilesystemStorageAdapter, type DocumentStorageAdapter } from "@ai-office-suite/storage";
-import { DocumentEngineError, createEmptyDocument, normalizeDocumentText } from "@ai-office-suite/document-engine";
-import { DocxImportError, PdfExportError } from "@ai-office-suite/file-conversion";
+import {
+  DocumentEngineError,
+  createEmptyDocument,
+  normalizeDocumentText,
+  previewDocumentOperation,
+} from "@ai-office-suite/document-engine";
+import {
+  DocxImportError,
+  exportToDocxBuffer,
+  exportToPdfBuffer,
+  importFromDocxBuffer,
+  PdfExportError,
+} from "@ai-office-suite/file-conversion";
 import { getSpeechAdapter, SpeechProviderError } from "@ai-office-suite/speech-engine";
 import { DocumentService } from "@ai-office-suite/documents-module";
 import { AiDocumentExecutor, AiPlanningError, planDocumentOperation } from "@ai-office-suite/ai-module";
@@ -42,6 +56,11 @@ export interface CreateApiAppOptions {
   inMemory?: boolean;
   authMode?: "provisional-local" | "jwt-pg";
   db?: PgDatabaseAdapter;
+}
+
+function safeDownloadFilename(raw: string): string {
+  const cleaned = raw.replace(/[^A-Za-z0-9._-]+/g, "_").replace(/^\.+/, "");
+  return cleaned.slice(0, 120) || "document";
 }
 
 function resolvePrototypeActor(req: Request): ActorContext {
@@ -61,6 +80,7 @@ export function createApiApp(options: CreateApiAppOptions = {}): Express {
   }
   const useJwtPg = authMode === "jwt-pg";
   const pgRepo = options.db ? new PostgreSqlDocumentRepository(options.db) : null;
+  const pgAppliedAiOps = new Map<string, StudioDocument>();
 
   const storageDir = options.storageDir ?? path.resolve(process.cwd(), process.env.LOCAL_STORAGE_DIR ?? ".local-data");
   const storage: DocumentStorageAdapter = options.inMemory
@@ -132,6 +152,11 @@ export function createApiApp(options: CreateApiAppOptions = {}): Express {
     });
 
     app.post("/api/auth/logout", (req, res) => {
+      const hasBearer = Boolean(req.headers.authorization?.startsWith("Bearer "));
+      const hasCookie = Boolean(parseCookie(req.headers.cookie, SESSION_COOKIE_NAME));
+      if (!hasBearer && hasCookie) {
+        if (!verifyCookieCsrf(req, res, allowedOrigins)) return;
+      }
       clearSessionCookie(req, res);
       res.json({ ok: true });
     });
@@ -152,8 +177,9 @@ export function createApiApp(options: CreateApiAppOptions = {}): Express {
       }
     });
 
-    // Enforce JWT + PostgreSQL RLS live membership check on all document routes
+    // Enforce JWT + PostgreSQL RLS live membership check on all document & speech routes
     app.use("/api/documents", jwtMiddleware);
+    app.use("/api/speech", jwtMiddleware);
   }
 
   const getActor = (req: Request): ActorContext => {
@@ -210,6 +236,21 @@ export function createApiApp(options: CreateApiAppOptions = {}): Express {
   app.post("/api/documents/seed-bilingual-fixture", async (req, res, next) => {
     try {
       const actor = getActor(req);
+      if (pgRepo) {
+        assertCanPerform(actor, "document", "create");
+        const sample = await documents.seedBilingualSample(actor);
+        const pgDoc: StudioDocument = {
+          ...sample,
+          documentId: randomUUID(),
+        };
+        const created = await pgRepo.createDocument(actor, pgDoc, {
+          source: "manual",
+          action: "document.created",
+          summary: `Seeded bilingual fixture '${pgDoc.title}'.`,
+        });
+        res.status(201).json({ document: created });
+        return;
+      }
       const created = await documents.seedBilingualSample(actor);
       res.status(201).json({ document: created });
     } catch (err) {
@@ -249,6 +290,11 @@ export function createApiApp(options: CreateApiAppOptions = {}): Express {
             revision: nextRevision,
             updatedAt: new Date().toISOString(),
           }),
+          {
+            source: "manual",
+            action: "document.update",
+            summary: parsed.data.summary ?? undefined,
+          },
         );
         res.json({ document: updated });
         return;
@@ -263,7 +309,9 @@ export function createApiApp(options: CreateApiAppOptions = {}): Express {
   app.get("/api/documents/:id/versions", async (req, res, next) => {
     try {
       const actor = getActor(req);
-      const versions = await documents.listVersions(actor, req.params.id);
+      const versions = pgRepo
+        ? await pgRepo.listVersions(actor, req.params.id)
+        : await documents.listVersions(actor, req.params.id);
       res.json({ versions });
     } catch (err) {
       next(err);
@@ -278,7 +326,9 @@ export function createApiApp(options: CreateApiAppOptions = {}): Express {
         res.status(400).json({ error: "Invalid revision number", code: "VALIDATION_ERROR" });
         return;
       }
-      const restored = await documents.restoreVersion(actor, req.params.id, rev);
+      const restored = pgRepo
+        ? await pgRepo.restoreVersion(actor, req.params.id, rev)
+        : await documents.restoreVersion(actor, req.params.id, rev);
       res.json({ document: restored });
     } catch (err) {
       next(err);
@@ -293,8 +343,15 @@ export function createApiApp(options: CreateApiAppOptions = {}): Express {
         res.status(400).json({ error: "Invalid AI plan request", code: "VALIDATION_ERROR", issues: parsed.error.issues });
         return;
       }
-      const doc = await documents.getDocument(actor, req.params.id);
-      const prior = doc.revision > 1 ? await documents.getVersion(actor, doc.documentId, doc.revision - 1) : null;
+      const doc = pgRepo
+        ? await pgRepo.getDocument(actor, req.params.id)
+        : await documents.getDocument(actor, req.params.id);
+      const prior =
+        doc.revision > 1
+          ? pgRepo
+            ? await pgRepo.getVersion(actor, doc.documentId, doc.revision - 1)
+            : await documents.getVersion(actor, doc.documentId, doc.revision - 1)
+          : null;
       const proposal = planDocumentOperation({
         actor,
         document: doc,
@@ -318,6 +375,58 @@ export function createApiApp(options: CreateApiAppOptions = {}): Express {
       }
       if (parsed.data.proposal.documentId !== req.params.id) {
         res.status(400).json({ error: "Proposal documentId mismatch", code: "DOCUMENT_MISMATCH" });
+        return;
+      }
+      if (pgRepo) {
+        assertCanPerform(actor, "ai_assistant", "apply_ai");
+        assertCanPerform(actor, "document", "write");
+        if (!parsed.data.approved) {
+          throw new AiPlanningError(
+            400,
+            "APPROVAL_REQUIRED",
+            "Explicit user approval is required before applying an AI or voice operation.",
+          );
+        }
+        const idemKey = `${actor.tenantId}::${actor.workspaceId}::${req.params.id}::${parsed.data.proposal.operationId}`;
+        const cached = pgAppliedAiOps.get(idemKey);
+        if (cached) {
+          res.json({
+            document: structuredClone(cached),
+            deduplicated: true,
+            appliedOperationId: parsed.data.proposal.operationId,
+          });
+          return;
+        }
+        const currentDoc = await pgRepo.getDocument(actor, req.params.id);
+        const prior =
+          parsed.data.proposal.action === "undo_last" && currentDoc.revision > 1
+            ? await pgRepo.getVersion(actor, req.params.id, currentDoc.revision - 1)
+            : null;
+        const { nextDoc, preview } = previewDocumentOperation(
+          currentDoc,
+          parsed.data.proposal,
+          prior?.snapshot ?? null,
+        );
+        const saved = await pgRepo.updateDocument(
+          actor,
+          req.params.id,
+          parsed.data.proposal.expectedRevision,
+          (_cur, nextRevision) => ({
+            ...nextDoc,
+            revision: nextRevision,
+          }),
+          {
+            source: parsed.data.proposal.source === "voice_command" ? "voice_command" : "typed_ai",
+            action: "document.ai_applied",
+            summary: `[${parsed.data.proposal.source}] ${parsed.data.proposal.action}: ${preview.summary}`,
+          },
+        );
+        pgAppliedAiOps.set(idemKey, structuredClone(saved));
+        res.json({
+          document: saved,
+          deduplicated: false,
+          appliedOperationId: parsed.data.proposal.operationId,
+        });
         return;
       }
       const result = await aiExecutor.applyProposal({
@@ -355,6 +464,24 @@ export function createApiApp(options: CreateApiAppOptions = {}): Express {
         return;
       }
       const buffer = Buffer.from(parsed.data.contentBase64, "base64");
+      if (pgRepo) {
+        assertCanPerform(actor, "document", "create");
+        const { document, diagnostics } = await importFromDocxBuffer({
+          buffer,
+          filename: parsed.data.filename,
+          tenantId: actor.tenantId,
+          workspaceId: actor.workspaceId,
+          actorId: actor.userId,
+        });
+        const pgDoc: StudioDocument = { ...document, documentId: randomUUID() };
+        const created = await pgRepo.createDocument(actor, pgDoc, {
+          source: "import",
+          action: "document.imported_docx",
+          summary: `Imported DOCX '${parsed.data.filename}' (SHA-256 ${diagnostics.originalSha256.slice(0, 12)}).`,
+        });
+        res.status(201).json({ document: created, diagnostics });
+        return;
+      }
       const imported = await documents.importDocx(actor, parsed.data.filename, buffer);
       res.status(201).json(imported);
     } catch (err) {
@@ -365,12 +492,38 @@ export function createApiApp(options: CreateApiAppOptions = {}): Express {
   app.post("/api/documents/:id/export/docx", async (req, res, next) => {
     try {
       const actor = getActor(req);
+      if (pgRepo) {
+        assertCanPerform(actor, "export", "export");
+        const doc = await pgRepo.getDocument(actor, req.params.id);
+        const buffer = await exportToDocxBuffer(doc);
+        await pgRepo.recordAudit(actor, {
+          tenantId: actor.tenantId,
+          workspaceId: actor.workspaceId,
+          documentId: doc.documentId,
+          actorId: actor.userId,
+          actorRole: actor.role,
+          source: "export",
+          action: "document.exported_docx",
+          outcome: "success",
+          revisionBefore: doc.revision,
+          revisionAfter: doc.revision,
+          summary: `Exported DOCX snapshot (${buffer.byteLength} bytes).`,
+        });
+        const filename = safeDownloadFilename(`${doc.documentId}-rev${doc.revision}.docx`);
+        res.setHeader(
+          "Content-Type",
+          "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        );
+        res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
+        res.send(buffer);
+        return;
+      }
       const { buffer, filename } = await documents.exportDocx(actor, req.params.id);
       res.setHeader(
         "Content-Type",
         "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
       );
-      res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
+      res.setHeader("Content-Disposition", `attachment; filename="${safeDownloadFilename(filename)}"`);
       res.send(buffer);
     } catch (err) {
       next(err);
@@ -380,9 +533,33 @@ export function createApiApp(options: CreateApiAppOptions = {}): Express {
   app.post("/api/documents/:id/export/pdf", async (req, res, next) => {
     try {
       const actor = getActor(req);
+      if (pgRepo) {
+        assertCanPerform(actor, "export", "export");
+        const doc = await pgRepo.getDocument(actor, req.params.id);
+        const result = await exportToPdfBuffer(doc);
+        await pgRepo.recordAudit(actor, {
+          tenantId: actor.tenantId,
+          workspaceId: actor.workspaceId,
+          documentId: doc.documentId,
+          actorId: actor.userId,
+          actorRole: actor.role,
+          source: "export",
+          action: "document.exported_pdf",
+          outcome: "success",
+          revisionBefore: doc.revision,
+          revisionAfter: doc.revision,
+          summary: `Exported searchable PDF via ${result.engine} (${result.pdfBuffer.byteLength} bytes).`,
+        });
+        const filename = safeDownloadFilename(`${doc.documentId}-rev${doc.revision}.pdf`);
+        res.setHeader("Content-Type", "application/pdf");
+        res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
+        res.setHeader("X-Pdf-Engine", result.engine);
+        res.send(result.pdfBuffer);
+        return;
+      }
       const result = await documents.exportPdf(actor, req.params.id);
       res.setHeader("Content-Type", "application/pdf");
-      res.setHeader("Content-Disposition", `attachment; filename="${result.filename}"`);
+      res.setHeader("Content-Disposition", `attachment; filename="${safeDownloadFilename(result.filename)}"`);
       res.setHeader("X-Pdf-Engine", result.engine);
       res.send(result.pdfBuffer);
     } catch (err) {
@@ -393,7 +570,9 @@ export function createApiApp(options: CreateApiAppOptions = {}): Express {
   app.get("/api/documents/:id/audit", async (req, res, next) => {
     try {
       const actor = getActor(req);
-      const events = await documents.listAuditEvents(actor, req.params.id);
+      const events = pgRepo
+        ? await pgRepo.listAuditEvents(actor, req.params.id)
+        : await documents.listAuditEvents(actor, req.params.id);
       res.json({ events });
     } catch (err) {
       next(err);

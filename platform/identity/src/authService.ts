@@ -180,6 +180,8 @@ export function signSessionToken(claims: SessionTokenClaims): string {
   );
 }
 
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 export function verifySessionToken(token: string): SessionTokenClaims | null {
   try {
     const decoded = jwt.verify(token, getJwtSecret(), { algorithms: ["HS256"] });
@@ -187,12 +189,16 @@ export function verifySessionToken(token: string): SessionTokenClaims | null {
     const p = decoded as JwtPayload;
     if (
       typeof p.sub !== "string" ||
+      !UUID_PATTERN.test(p.sub) ||
       typeof p.email !== "string" ||
       typeof p.tenant_id !== "string" ||
+      !UUID_PATTERN.test(p.tenant_id) ||
       typeof p.workspace_id !== "string" ||
+      !UUID_PATTERN.test(p.workspace_id) ||
       typeof p.role !== "string" ||
       !isWorkspaceRole(p.role) ||
-      typeof p.tv !== "number"
+      typeof p.tv !== "number" ||
+      !Number.isInteger(p.tv)
     ) {
       return null;
     }
@@ -319,18 +325,28 @@ export function createJwtAuthMiddleware(
       return;
     }
 
-    // Live PostgreSQL re-verification of user status, epoch `token_version`, and live RBAC role
+    // Live PostgreSQL re-verification of user status, org status, epoch `token_version`, and live RBAC role
     try {
-      const liveRes = await db.query<{ status: string; token_version: number; role: string }>(
-        `SELECT u.status, u.token_version, m.role
+      const liveRes = await db.query<{
+        status: string;
+        token_version: number;
+        role: string;
+        org_status: string;
+      }>(
+        `SELECT u.status, u.token_version, m.role, o.status AS org_status
          FROM users u
          JOIN memberships m ON m.user_id = u.user_id
+         JOIN organizations o ON o.tenant_id = m.tenant_id
          WHERE u.user_id = $1::uuid AND m.tenant_id = $2::uuid AND m.workspace_id = $3::uuid`,
         [claims.userId, claims.tenantId, claims.workspaceId],
       );
       const live = liveRes.rows[0];
       if (!live) {
         res.status(403).json({ error: "Account or workspace membership revoked", code: "ACCOUNT_REVOKED" });
+        return;
+      }
+      if (live.org_status !== "active") {
+        res.status(403).json({ error: "Organization is suspended", code: "ORGANIZATION_SUSPENDED" });
         return;
       }
       if (live.status !== "active") {

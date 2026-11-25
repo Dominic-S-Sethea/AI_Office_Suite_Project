@@ -44,6 +44,7 @@ export function parseDecimalToMinorUnits(
   raw: string | number,
   scale = 2,
   maxAbs: bigint = MAX_ABS_MINOR,
+  roundingMode: RoundingMode = "HALF_UP",
 ): bigint {
   let str: string;
   if (typeof raw === "number") {
@@ -70,22 +71,36 @@ export function parseDecimalToMinorUnits(
 
   const [mantissa, expPart] = str.toLowerCase().split("e");
   const expShift = expPart !== undefined ? Number.parseInt(expPart, 10) : 0;
+  if (!Number.isSafeInteger(expShift) || Math.abs(expShift) > 100) {
+    throw new AnalyticsError(422, "NUMERIC_OVERFLOW", `Exponent in '${raw}' exceeds safe financial bounds.`);
+  }
   const [intRaw = "0", fracRaw = ""] = (mantissa ?? "0").split(".");
   const digits = `${intRaw}${fracRaw}`.replace(/^0+(?=\d)/, "") || "0";
   const decimalPlacesAfterShift = fracRaw.length - expShift;
 
   let result: bigint;
   const targetShift = scale - decimalPlacesAfterShift;
+  if (digits === "0") {
+    return 0n;
+  }
+  if (targetShift > 36) {
+    throw new AnalyticsError(
+      422,
+      "NUMERIC_OVERFLOW",
+      `Financial amount '${raw}' exceeds overflow guard of ±${maxAbs.toString()} minor units.`,
+    );
+  }
   if (targetShift >= 0) {
     result = BigInt(digits) * pow10BigInt(targetShift);
   } else {
     const dropDigits = -targetShift;
-    const divisor = pow10BigInt(dropDigits);
-    const num = BigInt(digits);
-    const quot = num / divisor;
-    const rem = num % divisor;
-    const twiceRem = rem * 2n;
-    result = twiceRem >= divisor ? quot + 1n : quot;
+    if (dropDigits > digits.length + 1) {
+      result = 0n;
+    } else {
+      const divisor = pow10BigInt(dropDigits);
+      const num = BigInt(digits);
+      result = roundQuotientExact(num, divisor, roundingMode);
+    }
   }
 
   const signed = sign * result;
@@ -185,6 +200,9 @@ export function divideExactScaled(
   if (denominator === 0n) {
     return { status: "unavailable", reason: "ZERO_DENOMINATOR" };
   }
+  if (!Number.isInteger(outScale) || outScale < 0 || outScale > 12) {
+    throw new AnalyticsError(422, "INVALID_PRECISION_SCALE", `Unsupported outScale '${outScale}'.`);
+  }
   const scaledNum = numerator * multiplier * pow10BigInt(outScale);
   const rounded = roundQuotientExact(scaledNum, denominator, roundingMode);
   return {
@@ -228,7 +246,15 @@ export function convertCurrencyMinorUnits(
 
   // amountMinor is already in 10^targetScale minor units assuming monetary scale match, scale by rate/10^rateScale
   void targetScale;
-  return roundQuotientExact(amountMinor * scaledRate, pow10BigInt(rateScale), roundingMode);
+  const converted = roundQuotientExact(amountMinor * scaledRate, pow10BigInt(rateScale), roundingMode);
+  if (converted > MAX_ABS_MINOR || converted < -MAX_ABS_MINOR) {
+    throw new AnalyticsError(
+      422,
+      "NUMERIC_OVERFLOW",
+      "Currency conversion result exceeds configured financial overflow guard.",
+    );
+  }
+  return converted;
 }
 
 export function formatCurrencyOrRatioDisplay(

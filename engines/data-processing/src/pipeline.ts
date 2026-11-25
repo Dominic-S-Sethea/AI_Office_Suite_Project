@@ -13,6 +13,7 @@ import type {
 } from "@ai-office-suite/shared-contracts";
 import { assertCanPerform, assertTenantWorkspaceAccess } from "@ai-office-suite/authorization";
 import { scanForPromptInjection } from "@ai-office-suite/validation";
+import { unzipSync } from "fflate";
 import ExcelJS from "exceljs";
 
 export class DataPrepError extends Error {
@@ -78,7 +79,8 @@ function splitCsvLine(line: string): string[] {
 
 export function stageCsvSource(csvText: string, filename: string): StagedDataset {
   const sha256 = createHash("sha256").update(csvText, "utf8").digest("hex");
-  const rawLines = csvText.replace(/\r\n/g, "\n").split("\n").filter((l) => l.length > 0);
+  const normalizedText = csvText.replace(/^\uFEFF/, "").replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+  const rawLines = normalizedText.split("\n").filter((l) => l.length > 0);
   if (rawLines.length === 0) {
     return {
       source: {
@@ -145,6 +147,72 @@ export function stageCsvSource(csvText: string, filename: string): StagedDataset
 }
 
 export async function stageXlsxSource(buffer: Uint8Array, filename: string): Promise<StagedDataset> {
+  const lower = filename.toLowerCase();
+  if (lower.endsWith(".xlsm") || lower.endsWith(".xlsb")) {
+    throw new DataPrepError(400, "MACRO_WORKBOOK_BLOCKED", `Macro-enabled workbook '${filename}' is blocked.`);
+  }
+  if (
+    buffer.byteLength >= 8 &&
+    buffer[0] === 0xd0 &&
+    buffer[1] === 0xcf &&
+    buffer[2] === 0x11 &&
+    buffer[3] === 0xe0 &&
+    buffer[4] === 0xa1 &&
+    buffer[5] === 0xb1 &&
+    buffer[6] === 0x1a &&
+    buffer[7] === 0xe1
+  ) {
+    throw new DataPrepError(400, "ENCRYPTED_WORKBOOK_UNSUPPORTED", "Encrypted or OLE2 binary Excel files are not supported.");
+  }
+  if (
+    buffer.byteLength < 4 ||
+    buffer[0] !== 0x50 ||
+    buffer[1] !== 0x4b ||
+    buffer[2] !== 0x03 ||
+    buffer[3] !== 0x04
+  ) {
+    throw new DataPrepError(400, "INVALID_XLSX_ZIP", "Uploaded XLSX is not a valid OOXML ZIP archive.");
+  }
+  let entryCount = 0;
+  let totalBytes = 0;
+  try {
+    unzipSync(buffer, {
+      filter: (f) => {
+        entryCount++;
+        if (entryCount > 600) {
+          throw new DataPrepError(400, "TOO_MANY_ARCHIVE_ENTRIES", "XLSX exceeds entry safety limit.");
+        }
+        if (
+          f.name.includes("..") ||
+          f.name.startsWith("/") ||
+          f.name.startsWith("\\") ||
+          /^[A-Za-z]:/.test(f.name) ||
+          f.name.includes("\0")
+        ) {
+          throw new DataPrepError(400, "ZIP_PATH_TRAVERSAL_BLOCKED", "XLSX archive contains unsafe path entries.");
+        }
+        if (/EncryptedPackage/i.test(f.name)) {
+          throw new DataPrepError(400, "ENCRYPTED_WORKBOOK_UNSUPPORTED", "Encrypted Excel files are not supported.");
+        }
+        if (/vbaProject\.bin|vbaData\.xml|\.xlm$/i.test(f.name)) {
+          throw new DataPrepError(400, "MACRO_WORKBOOK_BLOCKED", `Embedded macro part '${f.name}' blocked.`);
+        }
+        totalBytes += f.originalSize;
+        if (
+          f.originalSize > 25 * 1024 * 1024 ||
+          totalBytes > 64 * 1024 * 1024 ||
+          (f.originalSize > 1_048_576 && f.size > 0 && f.originalSize / f.size > 100)
+        ) {
+          throw new DataPrepError(400, "ZIP_BOMB_BLOCKED", "XLSX archive exceeds decompressed size or ratio bounds.");
+        }
+        return false;
+      },
+    });
+  } catch (err) {
+    if (err instanceof DataPrepError) throw err;
+    throw new DataPrepError(400, "INVALID_XLSX_ZIP", "Unable to inspect XLSX archive safely.");
+  }
+
   const sha256 = createHash("sha256").update(buffer).digest("hex");
   const wb = new ExcelJS.Workbook();
   await wb.xlsx.load(Buffer.from(buffer) as unknown as ExcelJS.Buffer);
