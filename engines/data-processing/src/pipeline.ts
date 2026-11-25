@@ -53,35 +53,231 @@ const BILINGUAL_DEPARTMENT_DICTIONARY: Record<string, string> = {
   "ផ្នែកលក់": "Sales",
 };
 
-function splitCsvLine(line: string): string[] {
-  const fields: string[] = [];
-  let cur = "";
-  let inQuotes = false;
-  for (let i = 0; i < line.length; i++) {
-    const ch = line[i]!;
-    if (ch === '"') {
-      if (inQuotes && line[i + 1] === '"') {
-        cur += '"';
-        i++;
-      } else {
-        inQuotes = !inQuotes;
-      }
-    } else if (ch === "," && !inQuotes) {
-      fields.push(cur);
-      cur = "";
-    } else {
-      cur += ch;
-    }
-  }
-  fields.push(cur);
-  return fields;
+export interface CsvStageOptions {
+  delimiter?: "," | ";" | "\t" | "auto";
+  maxRows?: number;
+  maxCellLength?: number;
 }
 
-export function stageCsvSource(csvText: string, filename: string): StagedDataset {
+export interface XlsxStageOptions {
+  sheetName?: string;
+}
+
+export interface SchemaColumnRule {
+  column: string;
+  required?: boolean;
+  type?: "string" | "number" | "date" | "enum";
+  min?: number;
+  max?: number;
+  pattern?: string;
+  allowedValues?: string[];
+}
+
+export interface CertifiedCsvExportResult {
+  csv: string;
+  csvSha256: string;
+  datasetId: string;
+  version: number;
+  outputSha256: string;
+  rowCount: number;
+  status: CertifiedDatasetArtifact["status"];
+}
+
+const ZERO_DECIMAL_CURRENCIES = new Set(["KHR", "JPY", "KRW", "VND"]);
+
+export function currencyScaleFor(currency: string): number {
+  return ZERO_DECIMAL_CURRENCIES.has(currency.trim().toUpperCase()) ? 0 : 2;
+}
+
+export function normalizeKhmerDigitsText(raw: string, stripCurrencySymbols = false): string {
+  let out = raw.normalize("NFC").replace(/[\u17E0-\u17E9]/g, (ch) => String(ch.charCodeAt(0) - 0x17e0));
+  out = out.replace(/[\uFF10-\uFF19]/g, (ch) => String(ch.charCodeAt(0) - 0xff10));
+  if (stripCurrencySymbols) {
+    out = out
+      .replace(/,/g, "")
+      .replace(/(?:\$|៛|រៀល|\bUSD\b|\bKHR\b)/gi, "")
+      .trim();
+  }
+  return out;
+}
+
+export function parseAmountToMinorUnitsBigInt(raw: unknown, scale: number): bigint | null {
+  if (raw === null || raw === undefined || raw === "") return null;
+  let str = typeof raw === "number" ? (Number.isFinite(raw) ? raw.toString() : "") : String(raw).trim();
+  if (!str) return null;
+  str = str.replace(/,/g, "");
+  // Expand scientific notation cleanly if present
+  if (/^[+-]?\d+(?:\.\d+)?[eE][+-]?\d+$/.test(str)) {
+    const num = Number(str);
+    if (!Number.isFinite(num)) return null;
+    str = num.toFixed(Math.max(0, Math.min(8, scale + 2)));
+  }
+  const match = str.match(/^([+-])?(\d+)(?:\.(\d+))?$/);
+  if (!match) return null;
+  const neg = match[1] === "-";
+  const intPart = match[2]!;
+  const fracPart = match[3] ?? "";
+
+  if (scale === 0) {
+    let units = BigInt(intPart);
+    if (fracPart.length > 0 && Number(fracPart[0]) >= 5) {
+      units += 1n;
+    }
+    return neg ? -units : units;
+  }
+
+  const paddedFrac = fracPart.padEnd(scale + 1, "0");
+  const keptFrac = paddedFrac.slice(0, scale);
+  const roundDigit = Number(paddedFrac[scale] ?? "0");
+  let units = BigInt(intPart) * 10n ** BigInt(scale) + BigInt(keptFrac);
+  if (roundDigit >= 5) {
+    units += 1n;
+  }
+  return neg ? -units : units;
+}
+
+function minorUnitsToNumber(minor: bigint, scale: number): number {
+  if (scale === 0) return Number(minor);
+  const divisor = 10 ** scale;
+  return Number(minor) / divisor;
+}
+
+function detectCsvDelimiter(headerLine: string): "," | ";" | "\t" {
+  const counts: Record<"," | ";" | "\t", number> = { ",": 0, ";": 0, "\t": 0 };
+  let inQuotes = false;
+  for (let i = 0; i < headerLine.length; i++) {
+    const ch = headerLine[i]!;
+    if (ch === '"') {
+      inQuotes = !inQuotes;
+    } else if (!inQuotes && (ch === "," || ch === ";" || ch === "\t")) {
+      counts[ch]++;
+    }
+  }
+  if (counts["\t"] > counts[","] && counts["\t"] >= counts[";"]) return "\t";
+  if (counts[";"] > counts[","]) return ";";
+  return ",";
+}
+
+interface ParsedCsvRecord {
+  fields: string[];
+  startLine: number;
+  rawLine: string;
+  malformedQuote: boolean;
+}
+
+function parseRfc4180Records(
+  text: string,
+  delimiter: "," | ";" | "\t",
+  maxRows: number,
+  maxCellLength: number,
+): ParsedCsvRecord[] {
+  const records: ParsedCsvRecord[] = [];
+  let fields: string[] = [];
+  let cur = "";
+  let inQuotes = false;
+  let fieldStart = true;
+  let lineNum = 1;
+  let recordStartLine = 1;
+  let recordStartOffset = 0;
+
+  const pushRecord = (endOffset: number, malformedQuote: boolean) => {
+    fields.push(cur);
+    // Skip trailing blank line
+    if (fields.length === 1 && fields[0] === "" && !malformedQuote) {
+      fields = [];
+      cur = "";
+      fieldStart = true;
+      return;
+    }
+    if (records.length > maxRows) {
+      throw new DataPrepError(413, "CSV_ROW_LIMIT_EXCEEDED", `CSV exceeds maximum supported row limit (${maxRows}).`);
+    }
+    records.push({
+      fields,
+      startLine: recordStartLine,
+      rawLine: text.slice(recordStartOffset, endOffset),
+      malformedQuote,
+    });
+    fields = [];
+    cur = "";
+    fieldStart = true;
+  };
+
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i]!;
+    if (inQuotes) {
+      if (ch === '"') {
+        if (text[i + 1] === '"') {
+          cur += '"';
+          i++;
+        } else {
+          inQuotes = false;
+        }
+      } else {
+        if (ch === "\n") lineNum++;
+        cur += ch;
+      }
+      if (cur.length > maxCellLength) {
+        throw new DataPrepError(413, "CSV_CELL_LIMIT_EXCEEDED", `CSV cell exceeds safety bound (${maxCellLength} chars).`);
+      }
+      continue;
+    }
+
+    if (ch === '"' && fieldStart) {
+      inQuotes = true;
+      fieldStart = false;
+    } else if (ch === delimiter) {
+      fields.push(cur);
+      cur = "";
+      fieldStart = true;
+    } else if (ch === "\n") {
+      pushRecord(i, false);
+      lineNum++;
+      recordStartLine = lineNum;
+      recordStartOffset = i + 1;
+    } else {
+      cur += ch;
+      fieldStart = false;
+      if (cur.length > maxCellLength) {
+        throw new DataPrepError(413, "CSV_CELL_LIMIT_EXCEEDED", `CSV cell exceeds safety bound (${maxCellLength} chars).`);
+      }
+    }
+  }
+
+  if (cur.length > 0 || fields.length > 0 || inQuotes) {
+    pushRecord(text.length, inQuotes);
+  }
+
+  return records;
+}
+
+function validateUniqueHeaders(headers: string[], filename: string): void {
+  const seen = new Set<string>();
+  for (let i = 0; i < headers.length; i++) {
+    const h = headers[i]!;
+    if (!h) {
+      throw new DataPrepError(400, "EMPTY_HEADER_COLUMN", `Source '${filename}' has an empty header at column ${i + 1}.`);
+    }
+    if (seen.has(h)) {
+      throw new DataPrepError(400, "DUPLICATE_HEADER_COLUMN", `Source '${filename}' has duplicate header column '${h}'.`);
+    }
+    seen.add(h);
+  }
+}
+
+export function stageCsvSource(
+  csvText: string,
+  filename: string,
+  options: CsvStageOptions = {},
+): StagedDataset {
   const sha256 = createHash("sha256").update(csvText, "utf8").digest("hex");
   const normalizedText = csvText.replace(/^\uFEFF/, "").replace(/\r\n/g, "\n").replace(/\r/g, "\n");
-  const rawLines = normalizedText.split("\n").filter((l) => l.length > 0);
-  if (rawLines.length === 0) {
+  const maxRows = Math.max(1, Math.min(1_000_000, Math.trunc(options.maxRows ?? 500_000)));
+  const maxCellLength = Math.max(128, Math.min(500_000, Math.trunc(options.maxCellLength ?? 65_536)));
+
+  const firstNewline = normalizedText.indexOf("\n");
+  const firstLine = firstNewline === -1 ? normalizedText : normalizedText.slice(0, firstNewline);
+  if (!normalizedText.trim()) {
     return {
       source: {
         sourceId: `src_${randomUUID().slice(0, 8)}`,
@@ -99,31 +295,57 @@ export function stageCsvSource(csvText: string, filename: string): StagedDataset
     };
   }
 
-  const headers = splitCsvLine(rawLines[0]!).map((h) => h.trim().normalize("NFC"));
+  const delimiter: "," | ";" | "\t" =
+    options.delimiter && options.delimiter !== "auto" ? options.delimiter : detectCsvDelimiter(firstLine);
+
+  const records = parseRfc4180Records(normalizedText, delimiter, maxRows, maxCellLength);
+  if (records.length === 0) {
+    return {
+      source: {
+        sourceId: `src_${randomUUID().slice(0, 8)}`,
+        filename,
+        format: "csv",
+        sha256,
+        totalRowsRead: 0,
+        acceptedRows: 0,
+        rejectedRows: 0,
+        columnNames: [],
+        importedAt: new Date().toISOString(),
+      },
+      rows: [],
+      rejects: [],
+    };
+  }
+
+  const headerRecord = records[0]!;
+  if (headerRecord.malformedQuote) {
+    throw new DataPrepError(400, "MALFORMED_CSV_HEADER", `Header row in '${filename}' contains an unclosed quote.`);
+  }
+  const headers = headerRecord.fields.map((h) => h.trim().normalize("NFC"));
+  validateUniqueHeaders(headers, filename);
+
   const rows: StagedRow[] = [];
   const rejects: DatasetExceptionRecord[] = [];
 
-  for (let i = 1; i < rawLines.length; i++) {
-    const line = rawLines[i]!;
-    const quoteCount = (line.match(/"/g) ?? []).length;
-    const fields = splitCsvLine(line);
-    if (quoteCount % 2 !== 0 || fields.length !== headers.length) {
+  for (let i = 1; i < records.length; i++) {
+    const rec = records[i]!;
+    if (rec.malformedQuote || rec.fields.length !== headers.length) {
       rejects.push({
         exceptionId: `exc_${randomUUID().slice(0, 8)}`,
         sourceFile: filename,
-        sourceRowNumber: i + 1,
+        sourceRowNumber: rec.startLine,
         severity: "critical",
         code: "MALFORMED_CSV_ROW",
-        message: `Row ${i + 1} column count (${fields.length}) or quoting does not match header (${headers.length}).`,
-        rawRecord: { rawLine: line },
+        message: `Row ${rec.startLine} column count (${rec.fields.length}) or quoting does not match header (${headers.length}).`,
+        rawRecord: { rawLine: rec.rawLine },
         resolved: false,
       });
       continue;
     }
 
-    const row: StagedRow = { __sourceFile: filename, __sourceRowNumber: i + 1 };
+    const row: StagedRow = { __sourceFile: filename, __sourceRowNumber: rec.startLine };
     for (let c = 0; c < headers.length; c++) {
-      const val = (fields[c] ?? "").normalize("NFC");
+      const val = (rec.fields[c] ?? "").normalize("NFC");
       row[headers[c]!] = val === "" ? null : val;
     }
     rows.push(row);
@@ -135,7 +357,7 @@ export function stageCsvSource(csvText: string, filename: string): StagedDataset
       filename,
       format: "csv",
       sha256,
-      totalRowsRead: rawLines.length - 1,
+      totalRowsRead: records.length - 1,
       acceptedRows: rows.length,
       rejectedRows: rejects.length,
       columnNames: headers,
@@ -146,7 +368,11 @@ export function stageCsvSource(csvText: string, filename: string): StagedDataset
   };
 }
 
-export async function stageXlsxSource(buffer: Uint8Array, filename: string): Promise<StagedDataset> {
+export async function stageXlsxSource(
+  buffer: Uint8Array,
+  filename: string,
+  options: XlsxStageOptions = {},
+): Promise<StagedDataset> {
   const lower = filename.toLowerCase();
   if (lower.endsWith(".xlsm") || lower.endsWith(".xlsb")) {
     throw new DataPrepError(400, "MACRO_WORKBOOK_BLOCKED", `Macro-enabled workbook '${filename}' is blocked.`);
@@ -216,9 +442,15 @@ export async function stageXlsxSource(buffer: Uint8Array, filename: string): Pro
   const sha256 = createHash("sha256").update(buffer).digest("hex");
   const wb = new ExcelJS.Workbook();
   await wb.xlsx.load(Buffer.from(buffer) as unknown as ExcelJS.Buffer);
-  const ws = wb.worksheets[0];
+  const ws = options.sheetName ? wb.getWorksheet(options.sheetName) : wb.worksheets[0];
   if (!ws) {
-    throw new DataPrepError(400, "EMPTY_WORKBOOK", `Workbook '${filename}' contains no worksheets.`);
+    throw new DataPrepError(
+      400,
+      "EMPTY_WORKBOOK",
+      options.sheetName
+        ? `Workbook '${filename}' does not contain worksheet '${options.sheetName}'.`
+        : `Workbook '${filename}' contains no worksheets.`,
+    );
   }
 
   const headers: string[] = [];
@@ -228,6 +460,7 @@ export async function stageXlsxSource(buffer: Uint8Array, filename: string): Pro
     const values = (excelRow.values as unknown[]).slice(1);
     if (rowNumber === 1) {
       for (const v of values) headers.push(String(v ?? "").trim().normalize("NFC"));
+      validateUniqueHeaders(headers, filename);
       return;
     }
     const row: StagedRow = { __sourceFile: filename, __sourceRowNumber: rowNumber };
@@ -235,6 +468,16 @@ export async function stageXlsxSource(buffer: Uint8Array, filename: string): Pro
       const raw = values[c];
       if (raw === undefined || raw === null || raw === "") {
         row[headers[c]!] = null;
+      } else if (raw instanceof Date) {
+        row[headers[c]!] = raw.toISOString().slice(0, 10);
+      } else if (typeof raw === "object" && raw !== null && "result" in raw) {
+        const res = (raw as { result: unknown }).result;
+        row[headers[c]!] =
+          res === undefined || res === null || res === ""
+            ? null
+            : typeof res === "string"
+              ? res.normalize("NFC")
+              : res;
       } else if (typeof raw === "object" && raw !== null && "text" in raw) {
         row[headers[c]!] = String((raw as { text: unknown }).text).normalize("NFC");
       } else if (typeof raw === "string") {
@@ -415,6 +658,12 @@ export class DataPreparationPipeline {
     if (/\bstandardize date/i.test(lower) || params.command.includes("ប្តូរទម្រង់កាលបរិច្ឆេទ")) {
       return { intent: "parse_date_locale", inputLanguage: params.command.includes("ប្តូរ") ? "km" : "en" };
     }
+    if (/\bkhmer numeral|normalize numeral|convert khmer digit/i.test(lower) || params.command.includes("បម្លែងលេខខ្មែរ")) {
+      return { intent: "normalize_khmer_numerals", inputLanguage: params.command.includes("បម្លែង") ? "km" : "en" };
+    }
+    if (/\bmask pii|redact pii|anonymize/i.test(lower) || params.command.includes("លាក់ព័ត៌មានផ្ទាល់ខ្លួន")) {
+      return { intent: "mask_pii_columns", inputLanguage: params.command.includes("លាក់") ? "km" : "en" };
+    }
     if (/\bcombine\b/i.test(lower) || params.command.includes("បញ្ចូលឯកសារ")) {
       return {
         intent: "combine_files",
@@ -484,15 +733,38 @@ export class DataPreparationPipeline {
       throw new DataPrepError(499, "JOB_CANCELLED", "Data preparation cancelled cleanly before commit.");
     }
 
-    // Compute source currency control totals from accepted rows with valid numeric amounts
-    const sourceCurrencyTotals = new Map<string, number>();
-    const excludedCurrencyTotals = new Map<string, number>();
+    const normalizesAmountKhmer = recipe.steps.some((st) => {
+      if (st.op !== "normalize_khmer_numerals") return false;
+      const cols = Array.isArray(st.params.columns) ? (st.params.columns as string[]) : ["amount"];
+      return cols.includes("amount");
+    });
+
+    const extractRowAmountMinor = (row: StagedRow, allowKhmerNormalize: boolean): { curr: string; minor: bigint } | null => {
+      const curr = String(row.currency ?? "USD").trim().toUpperCase();
+      const scale = currencyScaleFor(curr);
+      let rawAmt: unknown = row.amount;
+      if (allowKhmerNormalize && typeof rawAmt === "string") {
+        rawAmt = normalizeKhmerDigitsText(rawAmt, true);
+      }
+      const minor = parseAmountToMinorUnitsBigInt(rawAmt, scale);
+      return minor === null ? null : { curr, minor };
+    };
+
+    // Compute exact BigInt minor-unit source control totals (FIN-POL-V1 alignment)
+    const sourceCurrencyTotals = new Map<string, bigint>();
+    const excludedCurrencyTotals = new Map<string, bigint>();
+
+    const recordExcluded = (row: StagedRow) => {
+      const parsed = extractRowAmountMinor(row, normalizesAmountKhmer);
+      if (parsed) {
+        excludedCurrencyTotals.set(parsed.curr, (excludedCurrencyTotals.get(parsed.curr) ?? 0n) + parsed.minor);
+      }
+    };
 
     for (const r of workingRows) {
-      const curr = String(r.currency ?? "USD").trim().toUpperCase();
-      const amt = r.amount === null || r.amount === undefined ? NaN : Number(r.amount);
-      if (Number.isFinite(amt)) {
-        sourceCurrencyTotals.set(curr, (sourceCurrencyTotals.get(curr) ?? 0) + amt);
+      const parsed = extractRowAmountMinor(r, normalizesAmountKhmer);
+      if (parsed) {
+        sourceCurrencyTotals.set(parsed.curr, (sourceCurrencyTotals.get(parsed.curr) ?? 0n) + parsed.minor);
       }
     }
 
@@ -510,6 +782,21 @@ export class DataPreparationPipeline {
           for (const [k, v] of Object.entries(next)) {
             if (!k.startsWith("__") && typeof v === "string") {
               next[k] = v.trim().normalize("NFC");
+            }
+          }
+          return next;
+        });
+      } else if (step.op === "normalize_khmer_numerals") {
+        const columns = Array.isArray(step.params.columns)
+          ? (step.params.columns as string[])
+          : ["amount"];
+        const stripCurrencySymbols = step.params.stripCurrencySymbols !== false;
+        workingRows = workingRows.map((row) => {
+          const next = { ...row };
+          for (const col of columns) {
+            const val = next[col];
+            if (typeof val === "string") {
+              next[col] = normalizeKhmerDigitsText(val, stripCurrencySymbols);
             }
           }
           return next;
@@ -539,6 +826,7 @@ export class DataPreparationPipeline {
               rawRecord: { ...row },
               resolved: false,
             });
+            recordExcluded(row);
             continue;
           }
           const parsed = parseExplicitDate(String(raw), locale);
@@ -553,11 +841,7 @@ export class DataPreparationPipeline {
               rawRecord: { ...row },
               resolved: false,
             });
-            const curr = String(row.currency ?? "USD").trim().toUpperCase();
-            const amt = Number(row.amount);
-            if (Number.isFinite(amt)) {
-              excludedCurrencyTotals.set(curr, (excludedCurrencyTotals.get(curr) ?? 0) + amt);
-            }
+            recordExcluded(row);
             continue;
           }
           surviving.push({ ...row, [col]: parsed.isoDate });
@@ -568,7 +852,8 @@ export class DataPreparationPipeline {
         const surviving: StagedRow[] = [];
         for (const row of workingRows) {
           const raw = row[col];
-          const num = raw === null || raw === undefined || raw === "" ? NaN : Number(raw);
+          const strVal = typeof raw === "string" ? raw.replace(/,/g, "").trim() : raw;
+          const num = strVal === null || strVal === undefined || strVal === "" ? NaN : Number(strVal);
           if (!Number.isFinite(num)) {
             exceptions.push({
               exceptionId: `exc_${randomUUID().slice(0, 8)}`,
@@ -580,11 +865,101 @@ export class DataPreparationPipeline {
               rawRecord: { ...row },
               resolved: false,
             });
+            if (col !== "amount") recordExcluded(row);
             continue;
           }
           surviving.push({ ...row, [col]: num });
         }
         workingRows = surviving;
+      } else if (step.op === "validate_schema_contract") {
+        const rules = Array.isArray(step.params.rules) ? (step.params.rules as SchemaColumnRule[]) : [];
+        const compiledPatterns = new Map<string, RegExp>();
+        for (const rule of rules) {
+          if (rule.pattern) {
+            compiledPatterns.set(rule.column, new RegExp(rule.pattern));
+          }
+        }
+        const surviving: StagedRow[] = [];
+        for (const row of workingRows) {
+          let violation: string | null = null;
+          for (const rule of rules) {
+            const val = row[rule.column];
+            const isEmpty = val === null || val === undefined || val === "";
+            if (rule.required && isEmpty) {
+              violation = `Column '${rule.column}' is required.`;
+              break;
+            }
+            if (isEmpty) continue;
+
+            if (rule.type === "number") {
+              const num = typeof val === "number" ? val : Number(String(val).replace(/,/g, ""));
+              if (!Number.isFinite(num)) {
+                violation = `Column '${rule.column}' expected finite number, got '${String(val)}'.`;
+                break;
+              }
+              if (typeof rule.min === "number" && num < rule.min) {
+                violation = `Column '${rule.column}' value ${num} is below min ${rule.min}.`;
+                break;
+              }
+              if (typeof rule.max === "number" && num > rule.max) {
+                violation = `Column '${rule.column}' value ${num} exceeds max ${rule.max}.`;
+                break;
+              }
+            } else if (rule.type === "date") {
+              if (!/^\d{4}-\d{2}-\d{2}$/.test(String(val).trim())) {
+                violation = `Column '${rule.column}' expected ISO YYYY-MM-DD date, got '${String(val)}'.`;
+                break;
+              }
+            } else if (rule.type === "enum" && Array.isArray(rule.allowedValues)) {
+              if (!rule.allowedValues.includes(String(val))) {
+                violation = `Column '${rule.column}' value '${String(val)}' not in allowed enum [${rule.allowedValues.join(", ")}].`;
+                break;
+              }
+            }
+
+            const regex = compiledPatterns.get(rule.column);
+            if (regex && !regex.test(String(val))) {
+              violation = `Column '${rule.column}' value '${String(val)}' failed contract regex.`;
+              break;
+            }
+          }
+
+          if (violation) {
+            exceptions.push({
+              exceptionId: `exc_${randomUUID().slice(0, 8)}`,
+              sourceFile: row.__sourceFile,
+              sourceRowNumber: row.__sourceRowNumber,
+              severity: "critical",
+              code: "SCHEMA_CONTRACT_VIOLATION",
+              message: violation,
+              rawRecord: { ...row },
+              resolved: false,
+            });
+            recordExcluded(row);
+            continue;
+          }
+          surviving.push(row);
+        }
+        workingRows = surviving;
+      } else if (step.op === "mask_pii_columns") {
+        const columns = Array.isArray(step.params.columns) ? (step.params.columns as string[]) : [];
+        const mode = step.params.mode === "hash_token" ? "hash_token" : "redact";
+        const salt = typeof step.params.salt === "string" ? step.params.salt : `${actor.tenantId}:${recipe.recipeId}`;
+        workingRows = workingRows.map((row) => {
+          const next = { ...row };
+          for (const col of columns) {
+            const raw = next[col];
+            if (raw === null || raw === undefined || raw === "") continue;
+            const s = String(raw).trim();
+            if (mode === "hash_token") {
+              const digest = createHash("sha256").update(`${salt}::${col}::${s}`).digest("hex").slice(0, 16);
+              next[col] = `pii_${digest}`;
+            } else {
+              next[col] = maskPiiStringValue(s);
+            }
+          }
+          return next;
+        });
       } else if (step.op === "deduplicate_composite_key") {
         const keys = Array.isArray(step.params.keys)
           ? (step.params.keys as string[])
@@ -605,11 +980,7 @@ export class DataPreparationPipeline {
               rawRecord: { ...row },
               resolved: true,
             });
-            const curr = String(row.currency ?? "USD").trim().toUpperCase();
-            const amt = Number(row.amount);
-            if (Number.isFinite(amt)) {
-              excludedCurrencyTotals.set(curr, (excludedCurrencyTotals.get(curr) ?? 0) + amt);
-            }
+            recordExcluded(row);
             continue;
           }
           seen.add(composite);
@@ -679,6 +1050,8 @@ export class DataPreparationPipeline {
             });
             if (unmatchedPolicy === "retain_and_report") {
               joinedRows.push({ ...lRow, customer_name: null, customer_matched: false });
+            } else {
+              recordExcluded(lRow);
             }
           } else {
             joinedRows.push({
@@ -702,13 +1075,12 @@ export class DataPreparationPipeline {
       }
     }
 
-    // Final reconciliation by currency
-    const preparedCurrencyTotals = new Map<string, number>();
+    // Final exact BigInt minor-unit reconciliation by currency (FIN-POL-V1)
+    const preparedCurrencyTotals = new Map<string, bigint>();
     for (const r of workingRows) {
-      const curr = String(r.currency ?? "USD").trim().toUpperCase();
-      const amt = Number(r.amount);
-      if (Number.isFinite(amt)) {
-        preparedCurrencyTotals.set(curr, (preparedCurrencyTotals.get(curr) ?? 0) + amt);
+      const parsed = extractRowAmountMinor(r, normalizesAmountKhmer);
+      if (parsed) {
+        preparedCurrencyTotals.set(parsed.curr, (preparedCurrencyTotals.get(parsed.curr) ?? 0n) + parsed.minor);
       }
     }
 
@@ -720,16 +1092,22 @@ export class DataPreparationPipeline {
     const currencyTotals: CurrencyControlTotal[] = Array.from(allCurrencies)
       .sort()
       .map((currency) => {
-        const src = Math.round((sourceCurrencyTotals.get(currency) ?? 0) * 100) / 100;
-        const prep = Math.round((preparedCurrencyTotals.get(currency) ?? 0) * 100) / 100;
-        const excl = Math.round((excludedCurrencyTotals.get(currency) ?? 0) * 100) / 100;
-        const diff = Math.round((src - (prep + excl)) * 100) / 100;
+        const scale = currencyScaleFor(currency);
+        const srcMinor = sourceCurrencyTotals.get(currency) ?? 0n;
+        const prepMinor = preparedCurrencyTotals.get(currency) ?? 0n;
+        const exclMinor = excludedCurrencyTotals.get(currency) ?? 0n;
+        const diffMinor = srcMinor - (prepMinor + exclMinor);
         return {
           currency,
-          sourceTotal: src,
-          preparedTotal: prep,
-          excludedOrQuarantinedTotal: excl,
-          unexplainedDifference: diff,
+          scale,
+          sourceTotal: minorUnitsToNumber(srcMinor, scale),
+          preparedTotal: minorUnitsToNumber(prepMinor, scale),
+          excludedOrQuarantinedTotal: minorUnitsToNumber(exclMinor, scale),
+          unexplainedDifference: minorUnitsToNumber(diffMinor, scale),
+          sourceMinorUnits: srcMinor.toString(),
+          preparedMinorUnits: prepMinor.toString(),
+          excludedMinorUnits: exclMinor.toString(),
+          unexplainedMinorUnits: diffMinor.toString(),
         };
       });
 
@@ -737,9 +1115,9 @@ export class DataPreparationPipeline {
       .filter((e) => e.severity === "critical" && !e.resolved)
       .map((e) => `${e.code}: ${e.message}`);
     for (const ct of currencyTotals) {
-      if (Math.abs(ct.unexplainedDifference) > 0.01) {
+      if (ct.unexplainedMinorUnits && BigInt(ct.unexplainedMinorUnits) !== 0n) {
         criticalFailures.push(
-          `RECONCILIATION_MISMATCH (${ct.currency}): unexplained difference ${ct.unexplainedDifference}`,
+          `RECONCILIATION_MISMATCH (${ct.currency}): unexplained minor-unit difference ${ct.unexplainedMinorUnits}`,
         );
       }
     }
@@ -807,4 +1185,59 @@ export class DataPreparationPipeline {
 
     return structuredClone(artifact);
   }
+}
+
+function maskPiiStringValue(raw: string): string {
+  // Email masking: keep first char + domain
+  if (/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(raw)) {
+    const [local, domain] = raw.split("@");
+    return `${local![0] ?? "*"}***@${domain}`;
+  }
+  // Cambodian phone numbers (+855 / 0xx) or generic phone/account numbers
+  const digits = raw.replace(/\D/g, "");
+  if (digits.length >= 6) {
+    return `***-***-${digits.slice(-4)}`;
+  }
+  return "***REDACTED***";
+}
+
+function escapeSafeCsvCell(value: unknown): string {
+  if (value === null || value === undefined) return "";
+  if (typeof value === "number") return Number.isFinite(value) ? String(value) : "";
+  if (typeof value === "boolean") return value ? "true" : "false";
+  let s = String(value);
+  // OWASP CSV formula-injection neutralization for string payloads
+  if (/^[\s\t\r]*[=+\-@]/.test(s) || s.startsWith("\t") || s.startsWith("\r")) {
+    s = `'${s}`;
+  }
+  if (/[",\n\r]/.test(s)) {
+    return `"${s.replace(/"/g, '""')}"`;
+  }
+  return s;
+}
+
+export function exportCertifiedDatasetToSafeCsv(
+  artifact: CertifiedDatasetArtifact,
+  columns?: string[],
+): CertifiedCsvExportResult {
+  const colNames =
+    columns && columns.length > 0
+      ? columns
+      : Array.from(new Set(artifact.rows.flatMap((r) => Object.keys(r)))).sort();
+
+  const lines: string[] = [colNames.map(escapeSafeCsvCell).join(",")];
+  for (const row of artifact.rows) {
+    lines.push(colNames.map((c) => escapeSafeCsvCell(row[c])).join(","));
+  }
+  const csv = `${lines.join("\r\n")}\r\n`;
+  const csvSha256 = createHash("sha256").update(csv, "utf8").digest("hex");
+  return {
+    csv,
+    csvSha256,
+    datasetId: artifact.datasetId,
+    version: artifact.version,
+    outputSha256: artifact.outputSha256,
+    rowCount: artifact.rows.length,
+    status: artifact.status,
+  };
 }

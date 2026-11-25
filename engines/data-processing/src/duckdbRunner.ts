@@ -23,8 +23,10 @@ export interface EngineParityResult {
   duplicateCustomerKeys: string[];
   unmatchedCustomerIds: string[];
   currencyTotals: Record<string, number>;
+  currencyMinorTotals?: Record<string, string>;
   decimalDivisionSample: string;
   externalAccessBlocked: boolean;
+  blockedSandboxProbes?: string[];
 }
 
 export interface EngineStressResult {
@@ -33,6 +35,12 @@ export interface EngineStressResult {
   p50Ms: number;
   p95Ms: number;
   rssDeltaMb: number;
+}
+
+function currencyScaleForCode(currency: string): number {
+  const c = currency.trim().toUpperCase();
+  if (c === "KHR" || c === "JPY" || c === "KRW" || c === "VND") return 0;
+  return 2;
 }
 
 export async function runDuckDbComparison(
@@ -92,12 +100,21 @@ export async function runDuckDbComparison(
     // Lock down external filesystem/network access inside DuckDB after staged load
     await conn.run("SET enable_external_access = false");
 
-    let externalAccessBlocked = false;
-    try {
-      await conn.runAndReadAll("SELECT * FROM read_csv_auto('package.json')");
-    } catch {
-      externalAccessBlocked = true;
+    const sandboxProbes: Array<{ name: string; sql: string }> = [
+      { name: "read_csv_auto", sql: "SELECT * FROM read_csv_auto('package.json')" },
+      { name: "read_parquet", sql: "SELECT * FROM read_parquet('nonexistent.parquet')" },
+      { name: "glob", sql: "SELECT * FROM glob('*')" },
+      { name: "copy_to_file", sql: "COPY (SELECT 1) TO '/tmp/aios_duckdb_escape.csv'" },
+    ];
+    const blockedSandboxProbes: string[] = [];
+    for (const probe of sandboxProbes) {
+      try {
+        await conn.runAndReadAll(probe.sql);
+      } catch {
+        blockedSandboxProbes.push(probe.name);
+      }
     }
+    const externalAccessBlocked = blockedSandboxProbes.length === sandboxProbes.length;
 
     // Check duplicate right keys
     const dupReader = await conn.runAndReadAll(`
@@ -132,14 +149,22 @@ export async function runDuckDbComparison(
       .map((r) => String(r.customer_id));
 
     const totalsReader = await conn.runAndReadAll(`
-      SELECT currency, SUM(amount)::DOUBLE AS total_amt
+      SELECT
+        currency,
+        SUM(amount)::DOUBLE AS total_amt,
+        CAST(SUM(CAST(ROUND(amount * 100) AS BIGINT)) AS VARCHAR) AS total_minor_scale2,
+        CAST(SUM(CAST(ROUND(amount) AS BIGINT)) AS VARCHAR) AS total_minor_scale0
       FROM sales_dedup
       GROUP BY currency
       ORDER BY currency
     `);
     const currencyTotals: Record<string, number> = {};
+    const currencyMinorTotals: Record<string, string> = {};
     for (const row of totalsReader.getRowObjects()) {
-      currencyTotals[String(row.currency)] = Math.round(Number(row.total_amt) * 100) / 100;
+      const code = String(row.currency);
+      const scale = currencyScaleForCode(code);
+      currencyTotals[code] = Math.round(Number(row.total_amt) * 100) / 100;
+      currencyMinorTotals[code] = String(scale === 0 ? row.total_minor_scale0 : row.total_minor_scale2);
     }
 
     // Document DuckDB DECIMAL division behavior (§5.6 caveat check)
@@ -158,8 +183,10 @@ export async function runDuckDbComparison(
       duplicateCustomerKeys,
       unmatchedCustomerIds,
       currencyTotals,
+      currencyMinorTotals,
       decimalDivisionSample,
       externalAccessBlocked,
+      blockedSandboxProbes,
     };
   } finally {
     conn.closeSync();
@@ -168,11 +195,17 @@ export async function runDuckDbComparison(
 }
 
 export async function benchmarkDuckDbStress(rowCount: number): Promise<EngineStressResult> {
+  const safeRowCount = Math.trunc(rowCount);
+  if (!Number.isSafeInteger(safeRowCount) || safeRowCount < 1 || safeRowCount > 5_000_000) {
+    throw new RangeError(`benchmarkDuckDbStress rowCount must be an integer in [1, 5000000], got ${rowCount}`);
+  }
+
   const instance = await DuckDBInstance.create(":memory:");
   const conn = await instance.connect();
   try {
     await conn.run("SET memory_limit = '512MB'");
     await conn.run("SET threads = 4");
+    await conn.run("SET allow_unsigned_extensions = false");
     await conn.run(`
       CREATE TABLE stress_sales AS
       SELECT
@@ -182,7 +215,7 @@ export async function benchmarkDuckDbStress(rowCount: number): Promise<EngineStr
         'C' || LPAD(((i % 500) + 1)::VARCHAR, 3, '0') AS customer_id,
         CASE WHEN i % 2 = 0 THEN 'USD' ELSE 'KHR' END AS currency,
         CAST(((i % 100) + 10) AS DECIMAL(18,2)) AS amount
-      FROM range(0, ${Math.trunc(rowCount)}) t(i);
+      FROM range(0, ${safeRowCount}) t(i);
 
       CREATE TABLE stress_customers AS
       SELECT
@@ -190,6 +223,7 @@ export async function benchmarkDuckDbStress(rowCount: number): Promise<EngineStr
         'Customer ' || i::VARCHAR AS customer_name
       FROM range(1, 501) t(i);
     `);
+    await conn.run("SET enable_external_access = false");
 
     const query = `
       WITH dedup AS (
@@ -216,7 +250,7 @@ export async function benchmarkDuckDbStress(rowCount: number): Promise<EngineStr
     samples.sort((a, b) => a - b);
     return {
       engine: "duckdb",
-      rowCount,
+      rowCount: safeRowCount,
       p50Ms: Math.round(samples[1]! * 100) / 100,
       p95Ms: Math.round(samples[2]! * 100) / 100,
       rssDeltaMb: Math.round(((rssAfter - rssBefore) / (1024 * 1024)) * 100) / 100,
