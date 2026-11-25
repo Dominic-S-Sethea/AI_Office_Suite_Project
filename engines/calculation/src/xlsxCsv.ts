@@ -95,30 +95,79 @@ export async function importWorkbookFromXlsxBuffer(
     );
   }
 
+  if (
+    buffer.byteLength < 4 ||
+    buffer[0] !== 0x50 ||
+    buffer[1] !== 0x4b ||
+    buffer[2] !== 0x03 ||
+    buffer[3] !== 0x04
+  ) {
+    throw new WorkbookInteroperabilityError(400, "INVALID_XLSX_ZIP", "Uploaded XLSX is not a valid ZIP archive.");
+  }
+
   let zipEntries: Record<string, Uint8Array>;
+  let entryCount = 0;
+  let totalUncompressedBytes = 0;
+  const MAX_ENTRIES = 600;
+  const MAX_ENTRY_BYTES = 25 * 1024 * 1024;
+  const MAX_TOTAL_BYTES = 64 * 1024 * 1024;
   try {
     zipEntries = unzipSync(buffer, {
-      filter: (f) => f.originalSize <= 25 * 1024 * 1024,
+      filter: (f) => {
+        entryCount++;
+        if (entryCount > MAX_ENTRIES) {
+          throw new WorkbookInteroperabilityError(400, "TOO_MANY_ARCHIVE_ENTRIES", "XLSX exceeds archive entry safety limit.");
+        }
+        if (
+          f.name.includes("..") ||
+          f.name.startsWith("/") ||
+          f.name.startsWith("\\") ||
+          /^[A-Za-z]:/.test(f.name) ||
+          f.name.includes("\0")
+        ) {
+          throw new WorkbookInteroperabilityError(
+            400,
+            "ZIP_PATH_TRAVERSAL_BLOCKED",
+            "XLSX archive contains unsafe path-traversal entries.",
+          );
+        }
+        if (/EncryptedPackage/i.test(f.name)) {
+          throw new WorkbookInteroperabilityError(
+            400,
+            "ENCRYPTED_WORKBOOK_UNSUPPORTED",
+            "Encrypted Excel files are not supported.",
+          );
+        }
+        if (/vbaProject\.bin|vbaData\.xml|\.xlm$/i.test(f.name)) {
+          throw new WorkbookInteroperabilityError(
+            400,
+            "MACRO_WORKBOOK_BLOCKED",
+            `Embedded macro part '${f.name}' detected and blocked.`,
+          );
+        }
+        totalUncompressedBytes += f.originalSize;
+        if (
+          f.originalSize > MAX_ENTRY_BYTES ||
+          totalUncompressedBytes > MAX_TOTAL_BYTES ||
+          (f.originalSize > 1_048_576 && f.size > 0 && f.originalSize / f.size > 100)
+        ) {
+          throw new WorkbookInteroperabilityError(
+            400,
+            "ZIP_BOMB_BLOCKED",
+            "XLSX archive exceeds safe decompressed size or compression ratio bounds.",
+          );
+        }
+        return true;
+      },
     });
-  } catch {
+  } catch (err) {
+    if (err instanceof WorkbookInteroperabilityError) throw err;
     throw new WorkbookInteroperabilityError(400, "INVALID_XLSX_ZIP", "Uploaded XLSX is not a valid ZIP archive.");
   }
 
   const entryNames = Object.keys(zipEntries);
-  if (entryNames.some((n) => n.includes("..") || n.startsWith("/") || n.startsWith("\\"))) {
-    throw new WorkbookInteroperabilityError(
-      400,
-      "ZIP_PATH_TRAVERSAL_BLOCKED",
-      "XLSX archive contains unsafe path-traversal entries.",
-    );
-  }
-  const macroPart = entryNames.find((n) => /vbaProject\.bin|vbaData\.xml/i.test(n));
-  if (macroPart) {
-    throw new WorkbookInteroperabilityError(
-      400,
-      "MACRO_WORKBOOK_BLOCKED",
-      `Embedded macro part '${macroPart}' detected and blocked.`,
-    );
+  if (!entryNames.some((n) => n === "xl/workbook.xml")) {
+    throw new WorkbookInteroperabilityError(400, "INVALID_XLSX_STRUCTURE", "Archive is missing xl/workbook.xml.");
   }
 
   const unsupportedFeatures: string[] = [];
@@ -238,7 +287,7 @@ export function exportSheetToSafeCsv(sheet: SpreadsheetWorksheet): CsvExportSafe
         text = `'${text}`;
         neutralizedFormulaCells++;
       }
-      if (text.includes(",") || text.includes('"') || text.includes("\n")) {
+      if (text.includes(",") || text.includes('"') || text.includes("\n") || text.includes("\r")) {
         text = `"${text.replace(/"/g, '""')}"`;
       }
       rowValues.push(text);

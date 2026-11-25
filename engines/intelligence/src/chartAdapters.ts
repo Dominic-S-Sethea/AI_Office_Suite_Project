@@ -2,6 +2,7 @@ import { execFile } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import * as echarts from "echarts";
 import type { ChartSpec } from "@ai-office-suite/shared-contracts";
@@ -242,7 +243,7 @@ export async function renderChartSpecPngViaEdge(
         `--user-data-dir=${userDataDir}`,
         `--window-size=${width + 40},${height + 40}`,
         `--screenshot=${path.resolve(outputPngPath)}`,
-        `file:///${htmlPath.replace(/\\/g, "/")}`,
+        pathToFileURL(htmlPath).href,
       ],
       { timeout: 25_000, windowsHide: true },
     );

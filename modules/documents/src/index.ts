@@ -328,7 +328,7 @@ export class DocumentService {
   }
 
   async exportDocx(actor: ActorContext, documentId: string): Promise<{ buffer: Buffer; filename: string }> {
-    assertCanPerform(actor, "export", "read");
+    assertCanPerform(actor, "export", "export");
     const doc = await this.getDocument(actor, documentId);
     const buffer = await exportToDocxBuffer(doc);
     this.recordAudit({
@@ -410,7 +410,7 @@ export class DocumentService {
   }
 
   async exportPdf(actor: ActorContext, documentId: string): Promise<PdfExportResult & { filename: string }> {
-    assertCanPerform(actor, "export", "read");
+    assertCanPerform(actor, "export", "export");
     const doc = await this.getDocument(actor, documentId);
     const result = await exportToPdfBuffer(doc);
     this.recordAudit({

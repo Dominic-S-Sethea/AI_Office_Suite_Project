@@ -59,24 +59,54 @@ export function importFromPptxBuffer(params: {
 
   const originalSha256 = createHash("sha256").update(params.buffer).digest("hex");
   let entries: Record<string, Uint8Array>;
+  let entryCount = 0;
+  let totalUncompressedBytes = 0;
+  const MAX_ENTRIES = 600;
+  const MAX_ENTRY_BYTES = 35 * 1024 * 1024;
+  const MAX_TOTAL_BYTES = 100 * 1024 * 1024;
   try {
     entries = unzipSync(params.buffer, {
-      filter: (file) => file.originalSize <= 35 * 1024 * 1024,
+      filter: (file) => {
+        entryCount++;
+        if (entryCount > MAX_ENTRIES) {
+          throw new PptxImportError(400, "TOO_MANY_ARCHIVE_ENTRIES", "PPTX exceeds PS-00 entry safety bound.");
+        }
+        if (
+          file.name.includes("..") ||
+          file.name.startsWith("/") ||
+          file.name.startsWith("\\") ||
+          /^[A-Za-z]:/.test(file.name) ||
+          file.name.includes("\0")
+        ) {
+          throw new PptxImportError(400, "ZIP_PATH_TRAVERSAL_BLOCKED", "Unsafe path traversal entry detected inside PPTX archive.");
+        }
+        if (/EncryptedPackage/i.test(file.name)) {
+          throw new PptxImportError(400, "ENCRYPTED_FILE_UNSUPPORTED", "Encrypted PPTX files are not supported.");
+        }
+        if (/vbaProject\.bin|vbaData\.xml|\.xlm$/i.test(file.name)) {
+          throw new PptxImportError(400, "MACRO_CONTENT_BLOCKED", "Embedded macro content blocked inside PPTX.");
+        }
+        totalUncompressedBytes += file.originalSize;
+        if (
+          file.originalSize > MAX_ENTRY_BYTES ||
+          totalUncompressedBytes > MAX_TOTAL_BYTES ||
+          (file.originalSize > 1_048_576 && file.size > 0 && file.originalSize / file.size > 100)
+        ) {
+          throw new PptxImportError(
+            400,
+            "ZIP_BOMB_BLOCKED",
+            "PPTX archive exceeds safe decompressed size or compression ratio bounds.",
+          );
+        }
+        return true;
+      },
     });
-  } catch {
+  } catch (err) {
+    if (err instanceof PptxImportError) throw err;
     throw new PptxImportError(400, "MALFORMED_PPTX_ARCHIVE", "Unable to unpack OOXML PPTX ZIP safely.");
   }
 
   const names = Object.keys(entries);
-  if (names.length > 600) {
-    throw new PptxImportError(400, "TOO_MANY_ARCHIVE_ENTRIES", "PPTX exceeds PS-00 entry safety bound.");
-  }
-  if (names.some((n) => n.includes("..") || n.startsWith("/") || n.startsWith("\\"))) {
-    throw new PptxImportError(400, "ZIP_PATH_TRAVERSAL_BLOCKED", "Unsafe path traversal entry detected inside PPTX archive.");
-  }
-  if (names.some((n) => /vbaProject\.bin|vbaData\.xml|\.xlm$/i.test(n))) {
-    throw new PptxImportError(400, "MACRO_CONTENT_BLOCKED", "Embedded macro content blocked inside PPTX.");
-  }
   if (!entries["ppt/presentation.xml"]) {
     throw new PptxImportError(400, "MISSING_PRESENTATION_XML", "Archive missing ppt/presentation.xml.");
   }

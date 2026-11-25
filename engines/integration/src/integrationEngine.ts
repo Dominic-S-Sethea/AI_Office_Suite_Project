@@ -1930,6 +1930,7 @@ export class CrossModuleIntegrationEngine {
     updatedTitle: string,
   ): Promise<ReportingPackageManifest> {
     this.assertPrincipalActive(actor);
+    assertCanPerform(actor, "document", "write");
     const pkg = this.stagedPackages.get(`${packageId}::v${packageVersion}`);
     if (!pkg) {
       throw new IntegrationError(404, "PACKAGE_NOT_FOUND", `Package '${packageId}' v${packageVersion} not found.`);
@@ -1973,7 +1974,16 @@ export class CrossModuleIntegrationEngine {
     if (!policy.canPublish) {
       throw new IntegrationError(403, "PUBLISH_FORBIDDEN", "Caller policy lacks package publication permission.");
     }
-    const pkg = this.stagedPackages.get(`${params.packageId}::v${params.packageVersion}`);
+    const pkgKey = `${params.packageId}::v${params.packageVersion}`;
+    const alreadyPublished = this.publishedPackages.get(pkgKey);
+    if (alreadyPublished) {
+      assertTenantWorkspaceAccess(actor, alreadyPublished.tenantId, alreadyPublished.workspaceId);
+      const prevKey = (alreadyPublished as ReportingPackageManifest & { _pubIdemKey?: string })._pubIdemKey;
+      if (prevKey === params.idempotencyKey) {
+        return structuredClone(alreadyPublished);
+      }
+    }
+    const pkg = this.stagedPackages.get(pkgKey);
     if (!pkg) {
       throw new IntegrationError(404, "PACKAGE_NOT_FOUND", `Staged package '${params.packageId}' v${params.packageVersion} not found.`);
     }
@@ -2036,7 +2046,9 @@ export class CrossModuleIntegrationEngine {
       this.linkedBindings.set(frozen.bindingId, frozen);
     }
 
-    this.publishedPackages.set(`${candidate.packageId}::v${candidate.packageVersion}`, structuredClone(candidate));
+    const storedPublished = structuredClone(candidate) as ReportingPackageManifest & { _pubIdemKey?: string };
+    storedPublished._pubIdemKey = params.idempotencyKey;
+    this.publishedPackages.set(pkgKey, storedPublished);
     return structuredClone(candidate);
   }
 

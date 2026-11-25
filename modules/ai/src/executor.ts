@@ -37,7 +37,7 @@ export class AiDocumentExecutor {
     assertCanPerform(actor, "ai_assistant", "apply_ai");
     assertCanPerform(actor, "document", "write");
 
-    if (proposal.requiresApproval && !approved) {
+    if (!approved) {
       this.audit.append({
         auditId: `aud_${randomUUID()}`,
         tenantId: actor.tenantId,
@@ -59,11 +59,12 @@ export class AiDocumentExecutor {
       );
     }
 
-    // Idempotency guard: prevent duplicate mutations on network retry (D4.05 / AI-07)
-    const cached = this.appliedOperations.get(proposal.operationId);
+    // Tenant/workspace/document-scoped idempotency guard preventing cross-tenant BOLA leaks (D4.05 / AI-07)
+    const idempotencyCacheKey = `${actor.tenantId}::${actor.workspaceId}::${proposal.documentId}::${proposal.operationId}`;
+    const cached = this.appliedOperations.get(idempotencyCacheKey);
     if (cached) {
       return {
-        document: cached,
+        document: structuredClone(cached),
         deduplicated: true,
         appliedOperationId: proposal.operationId,
       };
@@ -93,7 +94,7 @@ export class AiDocumentExecutor {
       ...(proposal.action === "undo_last" && priorVersion ? { undoneRevision: currentDoc.revision } : {}),
     });
 
-    this.appliedOperations.set(proposal.operationId, saved);
+    this.appliedOperations.set(idempotencyCacheKey, structuredClone(saved));
     return {
       document: saved,
       deduplicated: false,

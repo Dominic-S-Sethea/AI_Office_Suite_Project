@@ -1,5 +1,5 @@
 import { PGlite } from "@electric-sql/pglite";
-import { Pool, type PoolClient } from "pg";
+import { Pool, type PoolClient, type PoolConfig } from "pg";
 
 export interface PgQueryResult<T extends Record<string, unknown> = Record<string, unknown>> {
   rows: T[];
@@ -78,8 +78,8 @@ export class NodePgDatabaseAdapter implements PgDatabaseAdapter {
   readonly engine = "node-pg" as const;
   private readonly pool: Pool;
 
-  constructor(connectionString: string) {
-    this.pool = new Pool({ connectionString });
+  constructor(connectionString: string, poolOptions?: Omit<PoolConfig, "connectionString">) {
+    this.pool = new Pool({ ...poolOptions, connectionString });
   }
 
   async query<T extends Record<string, unknown> = Record<string, unknown>>(
@@ -99,6 +99,7 @@ export class NodePgDatabaseAdapter implements PgDatabaseAdapter {
 
   async withTransaction<T>(fn: (tx: PgQueryExecutor) => Promise<T>): Promise<T> {
     const client: PoolClient = await this.pool.connect();
+    let releaseErr: Error | undefined;
     try {
       await client.query("BEGIN");
       const executor: PgQueryExecutor = {
@@ -120,10 +121,14 @@ export class NodePgDatabaseAdapter implements PgDatabaseAdapter {
       await client.query("COMMIT");
       return out;
     } catch (err) {
-      await client.query("ROLLBACK").catch(() => undefined);
+      try {
+        await client.query("ROLLBACK");
+      } catch (rbErr) {
+        releaseErr = rbErr instanceof Error ? rbErr : new Error(String(rbErr));
+      }
       throw err;
     } finally {
-      client.release();
+      client.release(releaseErr);
     }
   }
 

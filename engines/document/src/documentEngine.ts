@@ -142,6 +142,17 @@ export function previewDocumentOperation(
     if (!priorRevisionDoc) {
       throw new DocumentEngineError(400, "NOTHING_TO_UNDO", "No prior document revision is available to undo.");
     }
+    if (
+      priorRevisionDoc.documentId !== doc.documentId ||
+      priorRevisionDoc.tenantId !== doc.tenantId ||
+      priorRevisionDoc.workspaceId !== doc.workspaceId
+    ) {
+      throw new DocumentEngineError(
+        409,
+        "UNDO_SNAPSHOT_MISMATCH",
+        "Prior revision snapshot does not belong to the target document or tenant workspace.",
+      );
+    }
     const restored = structuredClone(priorRevisionDoc);
     restored.revision = doc.revision + 1;
     restored.updatedAt = nextDoc.updatedAt;

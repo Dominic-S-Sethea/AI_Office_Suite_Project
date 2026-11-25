@@ -107,7 +107,6 @@ CREATE TABLE IF NOT EXISTS xi_outbox_events (
 
 GRANT SELECT, INSERT, UPDATE ON
   xi_artifacts,
-  xi_artifact_revisions,
   xi_dependency_edges,
   xi_workflow_runs,
   xi_reporting_packages,
@@ -115,8 +114,15 @@ GRANT SELECT, INSERT, UPDATE ON
   xi_outbox_events
   TO app_runtime;
 
+GRANT SELECT, INSERT ON
+  xi_artifact_revisions
+  TO app_runtime;
+
+REVOKE UPDATE, DELETE ON
+  xi_artifact_revisions
+  FROM app_runtime;
+
 REVOKE DELETE ON
-  xi_artifact_revisions,
   xi_package_approvals,
   xi_outbox_events
   FROM app_runtime;
@@ -290,11 +296,13 @@ export async function loadWorkflowRunRow(
   runId: string,
 ): Promise<WorkflowRun | null> {
   return withTenantTransaction(db, tenantId, async (tx) => {
-    const res = await tx.query<{ run_json: WorkflowRun }>(
+    const res = await tx.query<{ run_json: WorkflowRun | string }>(
       `SELECT run_json FROM xi_workflow_runs WHERE tenant_id = $1::uuid AND run_id = $2`,
       [tenantId, runId],
     );
-    return res.rows[0]?.run_json ?? null;
+    const raw = res.rows[0]?.run_json;
+    if (!raw) return null;
+    return typeof raw === "string" ? (JSON.parse(raw) as WorkflowRun) : raw;
   });
 }
 
@@ -364,8 +372,19 @@ export async function commitPackagePublicationTx(
     simulateFailureBeforeCommit?: boolean;
   },
 ): Promise<{ outboxEventId: string }> {
-  const outboxEventId = randomUUID();
+  let outboxEventId: string = randomUUID();
   await withTenantTransaction(db, params.tenantId, async (tx) => {
+    const existingOutbox = await tx.query<{ event_id: string }>(
+      `SELECT event_id::text
+       FROM xi_outbox_events
+       WHERE tenant_id = $1::uuid AND idempotency_key = $2`,
+      [params.tenantId, params.idempotencyKey],
+    );
+    if (existingOutbox.rows[0]?.event_id) {
+      outboxEventId = existingOutbox.rows[0].event_id;
+      return;
+    }
+
     const pkgRes = await tx.query<{ manifest_digest_sha256: string; lifecycle_status: string }>(
       `SELECT manifest_digest_sha256, lifecycle_status
        FROM xi_reporting_packages

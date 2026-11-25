@@ -137,6 +137,12 @@ describe("Phase D2 (G2) — PostgreSQL RLS, Hardened Auth/RBAC, Concurrency & Mi
       }),
     ).rejects.toThrow();
 
+    await expect(
+      withTenantTransaction(db, TENANT_ALPHA, async (tx) => {
+        await tx.query("UPDATE document_versions SET snapshot_json = '{}'::jsonb");
+      }),
+    ).rejects.toThrow();
+
     // 5. Cross-tenant HTTP access via Beta Owner -> blocked on Alpha doc
     const loginBeta = await fetch(`${baseUrl}/api/auth/login`, {
       method: "POST",
@@ -294,7 +300,9 @@ describe("Phase D2 (G2) — PostgreSQL RLS, Hardened Auth/RBAC, Concurrency & Mi
     await initializePostgreSqlSchema(restoreDb);
     await restoreLogicalBackupSnapshot(restoreDb, snapshot);
     const restoredCount = await restoreDb.query<{ cnt: number }>("SELECT COUNT(*)::INTEGER AS cnt FROM documents");
+    const restoredAuditCount = await restoreDb.query<{ cnt: number }>("SELECT COUNT(*)::INTEGER AS cnt FROM audit_logs");
     expect(Number(restoredCount.rows[0]?.cnt ?? 0)).toBe((snapshot.documents as unknown[]).length);
+    expect(Number(restoredAuditCount.rows[0]?.cnt ?? 0)).toBe((snapshot.auditLogs as unknown[]).length);
     await restoreDb.close();
   });
 });

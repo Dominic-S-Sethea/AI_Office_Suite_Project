@@ -73,6 +73,8 @@ export function formatCellAddr(col: number, row: number): string {
   return `${colIndexToLetters(col)}${row}`;
 }
 
+const MAX_EXPANDED_RANGE_CELLS = 250_000;
+
 export function expandRange(rangeStr: string, defaultSheet: string): Array<{ sheet: string; addr: string }> | null {
   const parts = rangeStr.split(":");
   if (parts.length !== 2) return null;
@@ -84,6 +86,8 @@ export function expandRange(rangeStr: string, defaultSheet: string): Array<{ she
   const r2 = Math.max(start.row, end.row);
   const c1 = Math.min(start.col, end.col);
   const c2 = Math.max(start.col, end.col);
+  const totalCells = (r2 - r1 + 1) * (c2 - c1 + 1);
+  if (totalCells > MAX_EXPANDED_RANGE_CELLS) return null;
   const list: Array<{ sheet: string; addr: string }> = [];
   for (let r = r1; r <= r2; r++) {
     for (let c = c1; c <= c2; c++) {
@@ -327,9 +331,12 @@ export function recalculateWorkbook(workbook: SpreadsheetWorkbook): {
       const start = parseCellRef(parts[0]!.trim());
       const end = parseCellRef(parts[1]!.trim());
       if (!start || !end) return { error: "#REF!" };
-      const colIdx = Number(evalExpr(argsRaw[2] ?? "1", sheetName, stack, ""));
+      const colIdxVal = evalExpr(argsRaw[2] ?? "1", sheetName, stack, "");
+      if (isExcelError(colIdxVal)) return colIdxVal;
+      const colIdx = Number(colIdxVal);
       if (!Number.isInteger(colIdx) || colIdx < 1) return { error: "#VALUE!" };
       const targetSheet = start.sheet ?? sheetName;
+      if (!sheetMap.has(targetSheet)) return { error: "#REF!" };
       const targetCol = start.col + colIdx - 1;
       if (targetCol > end.col) return { error: "#REF!" };
       for (let r = start.row; r <= end.row; r++) {
@@ -345,9 +352,16 @@ export function recalculateWorkbook(workbook: SpreadsheetWorkbook): {
       const n = toNumber(evalExpr(argsRaw[0] ?? "", sheetName, stack, ""));
       if (typeof n !== "number") return n;
       if (fn === "ABS") return Math.abs(n);
-      const digits = Number(evalExpr(argsRaw[1] ?? "0", sheetName, stack, ""));
-      const factor = 10 ** (Number.isFinite(digits) ? Math.trunc(digits) : 0);
-      return Math.round(n * factor) / factor;
+      const digitsVal = toNumber(evalExpr(argsRaw[1] ?? "0", sheetName, stack, ""));
+      if (typeof digitsVal !== "number") return digitsVal;
+      const digits = Math.trunc(digitsVal);
+      if (digits === 0) {
+        return Math.sign(n) * Math.round(Math.abs(n));
+      }
+      const absN = Math.abs(n);
+      const shifted = Number(`${absN}e${digits}`);
+      const roundedAbs = Number(`${Math.round(shifted)}e${-digits}`);
+      return Math.sign(n) * roundedAbs;
     }
 
     if (fn === "LEN" || fn === "TRIM") {
@@ -385,13 +399,20 @@ export function recalculateWorkbook(workbook: SpreadsheetWorkbook): {
       return Number(expr);
     }
 
-    // Parenthesized whole expression
+    // Parenthesized whole expression (quote-aware)
     if (expr.startsWith("(") && expr.endsWith(")")) {
       let depth = 0;
+      let inQuote = false;
       let balancedOuter = true;
       for (let i = 0; i < expr.length - 1; i++) {
-        if (expr[i] === "(") depth++;
-        else if (expr[i] === ")") depth--;
+        const ch = expr[i]!;
+        if (ch === '"' && expr[i - 1] !== "\\") {
+          inQuote = !inQuote;
+          continue;
+        }
+        if (inQuote) continue;
+        if (ch === "(") depth++;
+        else if (ch === ")") depth--;
         if (depth === 0) {
           balancedOuter = false;
           break;

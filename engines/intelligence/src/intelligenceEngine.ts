@@ -314,6 +314,11 @@ export class IntelligenceStudioEngine {
 
   revokePrincipalAccess(tenantId: string, userId: string): void {
     this.revokedPrincipals.add(`${tenantId}::${userId}`);
+    for (const key of this.policyResultCache.keys()) {
+      if (key.startsWith(`${tenantId}|`)) {
+        this.policyResultCache.delete(key);
+      }
+    }
   }
 
   invalidatePolicyCache(): void {
@@ -369,6 +374,8 @@ export class IntelligenceStudioEngine {
       throw new IntelligenceEngineError(499, "QUERY_CANCELLED", "Analytical dashboard query was cancelled.");
     }
 
+    const report = this.getReport(actor, reportId);
+
     const seqKey = `${reportId}::${actor.userId}`;
     const seq = opts?.interactionSeq ?? 1;
     const prevSeq = this.latestSeqByReportActor.get(seqKey) ?? 0;
@@ -377,18 +384,19 @@ export class IntelligenceStudioEngine {
     }
     this.latestSeqByReportActor.set(seqKey, seq);
 
-    const report = this.getReport(actor, reportId);
     const effectiveDepartments = this.resolveEffectiveDepartments(policy, opts?.requestedDepartments);
     const periodStart = opts?.periodStart ?? "2026-11-01";
     const periodEndExclusive = opts?.periodEndExclusive ?? "2026-12-01";
     const lang = opts?.language ?? "en";
 
-    // Policy-keyed cache preventing cross-role cache leaks (BI-T18)
+    // Policy-keyed cache preventing cross-role & column-scope cache leaks (BI-T18)
     const cacheKey = [
       actor.tenantId,
       actor.workspaceId,
       policy.policyId,
       policy.policyVersion,
+      policy.principalRole,
+      policy.allowedColumns.slice().sort().join(","),
       effectiveDepartments.slice().sort().join(","),
       report.datasetManifestId,
       report.datasetVersion,
@@ -729,6 +737,9 @@ export class IntelligenceStudioEngine {
     returnFilterContext: { departments?: string[] };
   } {
     this.assertNotRevoked(actor);
+    if (policy.tenantId !== actor.tenantId) {
+      throw new IntelligenceEngineError(403, "POLICY_TENANT_MISMATCH", "DataScopePolicy tenant mismatch.");
+    }
     const report = this.getReport(actor, reportId);
     const effectiveDepartments = this.resolveEffectiveDepartments(policy, filter.departments);
     const baseRows =
@@ -809,6 +820,10 @@ export class IntelligenceStudioEngine {
     idempotencyKey: string,
   ): PublishedBiSnapshot {
     this.assertNotRevoked(actor);
+    if (policy.tenantId !== actor.tenantId) {
+      throw new IntelligenceEngineError(403, "POLICY_TENANT_MISMATCH", "DataScopePolicy tenant mismatch.");
+    }
+    assertTenantWorkspaceAccess(actor, evaluated.report.tenantId, evaluated.report.workspaceId);
     if (!policy.canPublish) {
       throw new IntelligenceEngineError(403, "PUBLISH_FORBIDDEN", "Actor policy lacks publication permission.");
     }
@@ -903,6 +918,10 @@ export class IntelligenceStudioEngine {
     opts?: { requestUnderlyingDetail?: boolean },
   ): { csv: string; policyScope: string; datasetVersion: number; effectiveDepartments: string[] } {
     this.assertNotRevoked(actor);
+    if (policy.tenantId !== actor.tenantId) {
+      throw new IntelligenceEngineError(403, "POLICY_TENANT_MISMATCH", "DataScopePolicy tenant mismatch.");
+    }
+    assertTenantWorkspaceAccess(actor, evaluated.report.tenantId, evaluated.report.workspaceId);
     assertCanPerform(actor, "export", "export");
     if (opts?.requestUnderlyingDetail && !policy.canExportUnderlyingDetail) {
       throw new IntelligenceEngineError(
@@ -913,7 +932,7 @@ export class IntelligenceStudioEngine {
     }
 
     const csvEscape = (raw: string): string => {
-      const dangerous = /^[\s\x00-\x1f]*[=+\-@]/.test(raw);
+      const dangerous = /^[\s\x00-\x1f]*[=+\-@]|^[\t\r]/.test(raw);
       const safe = dangerous ? `'${raw}` : raw;
       return /[",\n\r]/.test(safe) ? `"${safe.replace(/"/g, '""')}"` : safe;
     };
@@ -952,6 +971,8 @@ export class IntelligenceStudioEngine {
     evaluated: EvaluatedReportResponse,
     language: "en" | "km" | "bilingual" = "bilingual",
   ): StudioPresentation {
+    this.assertNotRevoked(actor);
+    assertTenantWorkspaceAccess(actor, evaluated.report.tenantId, evaluated.report.workspaceId);
     const netSalesRef: LinkedMetricReference =
       evaluated.visualResults.vis_kpi_net_sales!.metricResults["FIN-NET-SALES"]!.linkedMetricReference;
     const opProfitRef: LinkedMetricReference =

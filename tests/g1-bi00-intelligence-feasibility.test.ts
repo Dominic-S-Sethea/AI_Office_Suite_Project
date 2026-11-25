@@ -6,6 +6,7 @@ import { AuthorizationError } from "@ai-office-suite/authorization";
 import { recalculateWorkbook } from "@ai-office-suite/calculation-engine";
 import { buildCrossModuleReconciledOutputs } from "@ai-office-suite/analytics-engine";
 import { exportPresentationToPptxBuffer } from "@ai-office-suite/presentation-engine";
+import { detectChromiumBinary } from "@ai-office-suite/file-conversion";
 import {
   benchmarkBiWorkload,
   ChartAdapterError,
@@ -101,17 +102,21 @@ describe("FR-07 BI-00 & Integrated X-VIS — Intelligence Studio Feasibility (BI
     const vegaLiteJson = compileChartSpecToVegaLiteJson(deptChartSpec, "en");
     expect((vegaLiteJson.data as { values: unknown[] }).values).toHaveLength(3);
 
-    // Render ECharts chart PNG via headless Edge into tests/artifacts/ for direct visual inspection
-    const artifactsDir = path.resolve(process.cwd(), "tests", "artifacts");
-    mkdirSync(artifactsDir, { recursive: true });
-    const chartShot = await renderChartSpecPngViaEdge(
-      fullEval.visualResults.vis_chart_budget_vs_actual?.chartSpec!,
-      path.join(artifactsDir, "bi-dashboard-revenue-chart.png"),
-      760,
-      400,
-      "en",
-    );
-    expect(chartShot.byteLength).toBeGreaterThan(5_000);
+    // Render ECharts chart PNG via headless Chromium/Edge into tests/artifacts/ for direct visual inspection
+    if (detectChromiumBinary()) {
+      const artifactsDir = path.resolve(process.cwd(), "tests", "artifacts");
+      mkdirSync(artifactsDir, { recursive: true });
+      const chartShot = await renderChartSpecPngViaEdge(
+        fullEval.visualResults.vis_chart_budget_vs_actual?.chartSpec!,
+        path.join(artifactsDir, "bi-dashboard-revenue-chart.png"),
+        760,
+        400,
+        "en",
+      );
+      expect(chartShot.byteLength).toBeGreaterThan(5_000);
+    } else {
+      console.warn("DISCLOSURE: Skipping BI chart PNG render — no Chromium/Chrome/Edge binary detected on host.");
+    }
 
     // BI-T05 & X-VIS-02: Cross-filter to Sales + Services ($125k / $35k / 28.00% / +19.05% / +$3k variance)
     const filteredEval = await engine.evaluateReport(FULL_EDITOR, POLICY_ALL, saved.reportId, {

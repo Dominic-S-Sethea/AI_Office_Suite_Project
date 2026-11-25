@@ -171,47 +171,66 @@ export async function importFromDocxBuffer(params: {
   const originalSha256 = createHash("sha256").update(params.buffer).digest("hex");
 
   let zipEntries: Record<string, Uint8Array>;
+  let entryCount = 0;
+  let totalUncompressedBytes = 0;
+  const MAX_ENTRIES = 500;
+  const MAX_ENTRY_BYTES = 25 * 1024 * 1024;
+  const MAX_TOTAL_BYTES = 64 * 1024 * 1024;
   try {
     zipEntries = unzipSync(params.buffer, {
-      filter: (file) => file.originalSize <= 25 * 1024 * 1024,
+      filter: (file) => {
+        entryCount++;
+        if (entryCount > MAX_ENTRIES) {
+          throw new DocxImportError(400, "TOO_MANY_ARCHIVE_ENTRIES", "DOCX archive exceeds Phase D1 entry safety limit.");
+        }
+        if (
+          file.name.includes("..") ||
+          file.name.startsWith("/") ||
+          file.name.startsWith("\\") ||
+          /^[A-Za-z]:/.test(file.name) ||
+          file.name.includes("\0")
+        ) {
+          throw new DocxImportError(
+            400,
+            "ZIP_PATH_TRAVERSAL_BLOCKED",
+            "DOCX archive contains unsafe relative or absolute path entries.",
+          );
+        }
+        if (/EncryptedPackage/i.test(file.name)) {
+          throw new DocxImportError(
+            400,
+            "ENCRYPTED_FILE_UNSUPPORTED",
+            "Encrypted DOCX files are not supported.",
+          );
+        }
+        if (/vbaProject\.bin|vbaData\.xml|\.xlm$/i.test(file.name)) {
+          throw new DocxImportError(
+            400,
+            "MACRO_CONTENT_BLOCKED",
+            `Embedded macro part '${file.name}' detected and blocked. Macro execution and import are prohibited.`,
+          );
+        }
+        totalUncompressedBytes += file.originalSize;
+        if (
+          file.originalSize > MAX_ENTRY_BYTES ||
+          totalUncompressedBytes > MAX_TOTAL_BYTES ||
+          (file.originalSize > 1_048_576 && file.size > 0 && file.originalSize / file.size > 100)
+        ) {
+          throw new DocxImportError(
+            400,
+            "ZIP_BOMB_BLOCKED",
+            "DOCX archive exceeds safe decompressed size or compression ratio limits.",
+          );
+        }
+        return true;
+      },
     });
-  } catch {
+  } catch (err) {
+    if (err instanceof DocxImportError) throw err;
     throw new DocxImportError(400, "MALFORMED_DOCX_ARCHIVE", "Unable to unpack OOXML ZIP container safely.");
   }
 
   const entryNames = Object.keys(zipEntries);
-  if (entryNames.length > 500) {
-    throw new DocxImportError(400, "TOO_MANY_ARCHIVE_ENTRIES", "DOCX archive exceeds Phase D1 entry safety limit.");
-  }
-
-  // ZIP path traversal defense
-  if (entryNames.some((n) => n.includes("..") || n.startsWith("/") || n.startsWith("\\"))) {
-    throw new DocxImportError(
-      400,
-      "ZIP_PATH_TRAVERSAL_BLOCKED",
-      "DOCX archive contains unsafe relative or absolute path entries.",
-    );
-  }
-
-  if (entryNames.some((n) => /EncryptedPackage/i.test(n))) {
-    throw new DocxImportError(
-      400,
-      "ENCRYPTED_FILE_UNSUPPORTED",
-      "Encrypted DOCX files are not supported.",
-    );
-  }
-
-  // Strictly block macro-bearing OOXML parts (D3.05 / PLT-04)
-  const macroEntry = entryNames.find((name) =>
-    /vbaProject\.bin|vbaData\.xml|\.xlm$/i.test(name),
-  );
-  if (macroEntry) {
-    throw new DocxImportError(
-      400,
-      "MACRO_CONTENT_BLOCKED",
-      `Embedded macro part '${macroEntry}' detected and blocked. Macro execution and import are prohibited.`,
-    );
-  }
 
   if (!zipEntries["word/document.xml"]) {
     throw new DocxImportError(400, "MISSING_DOCUMENT_XML", "Archive does not contain word/document.xml.");

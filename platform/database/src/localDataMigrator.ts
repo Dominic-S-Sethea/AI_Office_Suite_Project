@@ -256,24 +256,103 @@ export async function restoreLogicalBackupSnapshot(
         [m.tenant_id, m.workspace_id, m.user_id, m.role, m.created_at],
       );
     }
-    for (const d of snapshot.documents as Array<{ tenant_id: string; workspace_id: string; document_id: string; title: string; language: string; current_revision: number; status: string; created_by: string; created_at: string; updated_at: string }>) {
+    for (const d of snapshot.documents as Array<{
+      tenant_id: string;
+      workspace_id: string;
+      document_id: string;
+      title: string;
+      language: string;
+      current_revision: number;
+      published_revision?: number | null;
+      status: string;
+      created_by: string;
+      created_at: string;
+      updated_at: string;
+    }>) {
       await tx.query(
-        "INSERT INTO documents (tenant_id, workspace_id, document_id, title, language, current_revision, status, created_by, created_at, updated_at) VALUES ($1::uuid, $2::uuid, $3::uuid, $4, $5, $6, $7, $8::uuid, $9::timestamptz, $10::timestamptz)",
-        [d.tenant_id, d.workspace_id, d.document_id, d.title, d.language, d.current_revision, d.status, d.created_by, d.created_at, d.updated_at],
+        `INSERT INTO documents
+           (tenant_id, workspace_id, document_id, title, language, current_revision, published_revision, status, created_by, created_at, updated_at)
+         VALUES ($1::uuid, $2::uuid, $3::uuid, $4, $5, $6, $7, $8, $9::uuid, $10::timestamptz, $11::timestamptz)`,
+        [
+          d.tenant_id,
+          d.workspace_id,
+          d.document_id,
+          d.title,
+          d.language,
+          d.current_revision,
+          d.published_revision ?? null,
+          d.status,
+          d.created_by,
+          d.created_at,
+          d.updated_at,
+        ],
       );
     }
-    for (const v of snapshot.documentVersions as Array<{ tenant_id: string; document_id: string; revision: number; storage_object_key: string; content_sha256: string; snapshot_json: unknown; created_by: string; created_at: string }>) {
+    for (const v of snapshot.documentVersions as Array<{
+      tenant_id: string;
+      document_id: string;
+      revision: number;
+      storage_object_key: string;
+      content_sha256: string;
+      source_import_sha256?: string | null;
+      restored_from_revision?: number | null;
+      snapshot_json: unknown;
+      created_by: string;
+      created_at: string;
+    }>) {
       await tx.query(
-        "INSERT INTO document_versions (tenant_id, document_id, revision, storage_object_key, content_sha256, snapshot_json, created_by, created_at) VALUES ($1::uuid, $2::uuid, $3, $4, $5, $6::jsonb, $7::uuid, $8::timestamptz)",
+        `INSERT INTO document_versions
+           (tenant_id, document_id, revision, storage_object_key, content_sha256, source_import_sha256, restored_from_revision, snapshot_json, created_by, created_at)
+         VALUES ($1::uuid, $2::uuid, $3, $4, $5, $6, $7, $8::jsonb, $9::uuid, $10::timestamptz)`,
         [
           v.tenant_id,
           v.document_id,
           v.revision,
           v.storage_object_key,
           v.content_sha256,
+          v.source_import_sha256 ?? null,
+          v.restored_from_revision ?? null,
           typeof v.snapshot_json === "string" ? v.snapshot_json : JSON.stringify(v.snapshot_json),
           v.created_by,
           v.created_at,
+        ],
+      );
+    }
+    for (const a of (snapshot.auditLogs ?? []) as Array<{
+      audit_id: string;
+      tenant_id: string;
+      workspace_id?: string | null;
+      actor_id: string;
+      actor_role: string;
+      source: string;
+      action: string;
+      outcome: string;
+      target_type: string;
+      target_id: string;
+      revision_before?: number | null;
+      revision_after?: number | null;
+      summary: string;
+      created_at: string;
+    }>) {
+      await tx.query(
+        `INSERT INTO audit_logs
+           (audit_id, tenant_id, workspace_id, actor_id, actor_role, source, action, outcome, target_type, target_id, revision_before, revision_after, summary, created_at)
+         VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14::timestamptz)`,
+        [
+          a.audit_id,
+          a.tenant_id,
+          a.workspace_id ?? null,
+          a.actor_id,
+          a.actor_role,
+          a.source,
+          a.action,
+          a.outcome,
+          a.target_type,
+          a.target_id,
+          a.revision_before ?? null,
+          a.revision_after ?? null,
+          a.summary,
+          a.created_at,
         ],
       );
     }
