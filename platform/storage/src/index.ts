@@ -1,5 +1,5 @@
-import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { createHash, randomUUID } from "node:crypto";
+import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import type { DocumentVersion, StudioDocument } from "@ai-office-suite/shared-contracts";
 
@@ -15,7 +15,7 @@ export interface DocumentStorageAdapter {
 /**
  * Local filesystem adapter for Phase D1 feasibility prototypes.
  * - Imported binaries are written once by SHA-256 hash (immutable original archive).
- * - Document versions are append-only JSON files; restoring a prior revision creates a new revision.
+ * - Document versions are append-only JSON files written atomically via temp-file rename; restoring creates a new revision.
  */
 export class LocalFilesystemStorageAdapter implements DocumentStorageAdapter {
   private readonly baseDir: string;
@@ -26,10 +26,26 @@ export class LocalFilesystemStorageAdapter implements DocumentStorageAdapter {
     mkdirSync(path.join(this.baseDir, "documents"), { recursive: true });
   }
 
+  private assertContainedPath(targetPath: string): string {
+    const resolved = path.resolve(targetPath);
+    if (resolved !== this.baseDir && !resolved.startsWith(this.baseDir + path.sep)) {
+      throw new Error(`Storage path containment violation blocked: '${targetPath}'.`);
+    }
+    return resolved;
+  }
+
+  private sanitizeDocumentId(documentId: string): string {
+    const safeId = documentId.replace(/[^a-zA-Z0-9_-]/g, "_").replace(/^_+/, "");
+    if (!safeId || safeId.length > 160) {
+      throw new Error("Invalid documentId for local storage.");
+    }
+    return safeId;
+  }
+
   async saveOriginalBinary(bytes: Uint8Array, extension: string): Promise<{ sha256: string; path: string }> {
     const sha256 = createHash("sha256").update(bytes).digest("hex");
-    const safeExt = extension.replace(/[^a-z0-9]/gi, "").toLowerCase() || "bin";
-    const filePath = path.join(this.baseDir, "originals", `${sha256}.${safeExt}`);
+    const safeExt = extension.replace(/[^a-z0-9]/gi, "").toLowerCase().slice(0, 12) || "bin";
+    const filePath = this.assertContainedPath(path.join(this.baseDir, "originals", `${sha256}.${safeExt}`));
     // Write-once: never overwrite an existing original binary with the same SHA-256.
     if (!existsSync(filePath)) {
       writeFileSync(filePath, bytes, { flag: "wx" });
@@ -38,36 +54,56 @@ export class LocalFilesystemStorageAdapter implements DocumentStorageAdapter {
   }
 
   private versionsDir(documentId: string): string {
-    const safeId = documentId.replace(/[^a-zA-Z0-9_-]/g, "_");
-    const dir = path.join(this.baseDir, "documents", safeId, "versions");
+    const safeId = this.sanitizeDocumentId(documentId);
+    const dir = this.assertContainedPath(path.join(this.baseDir, "documents", safeId, "versions"));
     mkdirSync(dir, { recursive: true });
     return dir;
   }
 
   async saveDocumentVersion(version: DocumentVersion): Promise<void> {
+    if (!Number.isInteger(version.revision) || version.revision < 1) {
+      throw new Error("Version revision must be a positive integer.");
+    }
     const dir = this.versionsDir(version.documentId);
     const filename = `rev-${String(version.revision).padStart(6, "0")}.json`;
-    const filePath = path.join(dir, filename);
+    const filePath = this.assertContainedPath(path.join(dir, filename));
     if (existsSync(filePath)) {
       throw new Error(`Immutable version conflict: revision ${version.revision} already exists for ${version.documentId}.`);
     }
-    writeFileSync(filePath, JSON.stringify(version, null, 2), "utf8");
+    const tmpPath = this.assertContainedPath(path.join(dir, `.${filename}.${randomUUID()}.tmp`));
+    try {
+      writeFileSync(tmpPath, JSON.stringify(version, null, 2), { encoding: "utf8", flag: "wx" });
+      if (existsSync(filePath)) {
+        throw new Error(`Immutable version conflict: revision ${version.revision} already exists for ${version.documentId}.`);
+      }
+      renameSync(tmpPath, filePath);
+    } catch (err) {
+      if (existsSync(tmpPath)) {
+        try {
+          rmSync(tmpPath, { force: true });
+        } catch {
+          // best-effort temp cleanup
+        }
+      }
+      throw err;
+    }
   }
 
   async listVersions(documentId: string): Promise<DocumentVersion[]> {
-    const safeId = documentId.replace(/[^a-zA-Z0-9_-]/g, "_");
-    const dir = path.join(this.baseDir, "documents", safeId, "versions");
+    const safeId = this.sanitizeDocumentId(documentId);
+    const dir = this.assertContainedPath(path.join(this.baseDir, "documents", safeId, "versions"));
     if (!existsSync(dir)) return [];
     const files = readdirSync(dir)
-      .filter((name) => name.endsWith(".json"))
+      .filter((name) => name.endsWith(".json") && !name.startsWith("."))
       .sort();
-    return files.map((file) => JSON.parse(readFileSync(path.join(dir, file), "utf8")) as DocumentVersion);
+    return files.map((file) => JSON.parse(readFileSync(this.assertContainedPath(path.join(dir, file)), "utf8")) as DocumentVersion);
   }
 
   async getVersion(documentId: string, revision: number): Promise<DocumentVersion | null> {
-    const safeId = documentId.replace(/[^a-zA-Z0-9_-]/g, "_");
+    if (!Number.isInteger(revision) || revision < 1) return null;
+    const safeId = this.sanitizeDocumentId(documentId);
     const filename = `rev-${String(revision).padStart(6, "0")}.json`;
-    const filePath = path.join(this.baseDir, "documents", safeId, "versions", filename);
+    const filePath = this.assertContainedPath(path.join(this.baseDir, "documents", safeId, "versions", filename));
     if (!existsSync(filePath)) return null;
     return JSON.parse(readFileSync(filePath, "utf8")) as DocumentVersion;
   }

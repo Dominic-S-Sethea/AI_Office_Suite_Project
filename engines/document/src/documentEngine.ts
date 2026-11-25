@@ -384,3 +384,97 @@ export function previewDocumentOperation(
     }
   }
 }
+
+export interface DocumentBlockDiffEntry {
+  blockId: string;
+  blockType: DocumentBlock["type"];
+  changeType: "added" | "removed" | "modified";
+  beforeText?: string;
+  afterText?: string;
+}
+
+export interface DocumentRevisionDiff {
+  documentId: string;
+  fromRevision: number;
+  toRevision: number;
+  metadataChanged: {
+    titleChanged: boolean;
+    languageChanged: boolean;
+    layoutChanged: boolean;
+  };
+  summary: {
+    added: number;
+    removed: number;
+    modified: number;
+    unchanged: number;
+  };
+  blocks: DocumentBlockDiffEntry[];
+}
+
+export function computeDocumentRevisionDiff(
+  fromDoc: StudioDocument,
+  toDoc: StudioDocument,
+): DocumentRevisionDiff {
+  const fromMap = new Map<string, DocumentBlock>(fromDoc.blocks.map((b) => [b.id, b]));
+  const toMap = new Map<string, DocumentBlock>(toDoc.blocks.map((b) => [b.id, b]));
+
+  const diffs: DocumentBlockDiffEntry[] = [];
+  let added = 0;
+  let removed = 0;
+  let modified = 0;
+  let unchanged = 0;
+
+  for (const oldBlock of fromDoc.blocks) {
+    const nextBlock = toMap.get(oldBlock.id);
+    if (!nextBlock) {
+      removed++;
+      diffs.push({
+        blockId: oldBlock.id,
+        blockType: oldBlock.type,
+        changeType: "removed",
+        beforeText: normalizeDocumentText(getBlockPlainText(oldBlock)),
+      });
+    } else {
+      const beforeJson = JSON.stringify(oldBlock);
+      const afterJson = JSON.stringify(nextBlock);
+      if (beforeJson !== afterJson) {
+        modified++;
+        diffs.push({
+          blockId: nextBlock.id,
+          blockType: nextBlock.type,
+          changeType: "modified",
+          beforeText: normalizeDocumentText(getBlockPlainText(oldBlock)),
+          afterText: normalizeDocumentText(getBlockPlainText(nextBlock)),
+        });
+      } else {
+        unchanged++;
+      }
+    }
+  }
+
+  for (const nextBlock of toDoc.blocks) {
+    if (!fromMap.has(nextBlock.id)) {
+      added++;
+      diffs.push({
+        blockId: nextBlock.id,
+        blockType: nextBlock.type,
+        changeType: "added",
+        afterText: normalizeDocumentText(getBlockPlainText(nextBlock)),
+      });
+    }
+  }
+
+  return {
+    documentId: toDoc.documentId,
+    fromRevision: fromDoc.revision,
+    toRevision: toDoc.revision,
+    metadataChanged: {
+      titleChanged: fromDoc.title !== toDoc.title,
+      languageChanged: fromDoc.language !== toDoc.language,
+      layoutChanged: JSON.stringify(fromDoc.layout) !== JSON.stringify(toDoc.layout),
+    },
+    summary: { added, removed, modified, unchanged },
+    blocks: diffs,
+  };
+}
+

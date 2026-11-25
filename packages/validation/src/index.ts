@@ -210,6 +210,16 @@ const INJECTION_PATTERNS: ReadonlyArray<{ id: string; pattern: RegExp; reason: s
     reason: "Prompt injection instruction override attempt detected.",
   },
   {
+    id: "khmer_system_override",
+    pattern: /(មិនអើពើ\s*(?:លើ|ចំពោះ)?\s*(?:ការណែនាំ|សេចក្តីណែនាំ)(?:មុន|ពីមុន)|បំបែកប្រព័ន្ធ|បំពានការណែនាំប្រព័ន្ធ)/u,
+    reason: "Khmer prompt injection instruction override attempt detected.",
+  },
+  {
+    id: "role_framing_marker",
+    pattern: /(<\|(?:system|im_start|im_end|assistant)\|>|\[\/?INST\]|<<\/?SYS>>|^\s*#{2,4}\s*system\s*:)/im,
+    reason: "LLM control or role-framing delimiter injection detected.",
+  },
+  {
     id: "shell_or_code_exec",
     pattern: /\b(run\s+shell|execute\s+bash|powershell|rm\s+-rf|child_process|eval\(|process\.env)\b/i,
     reason: "Unauthorized OS or code execution directive detected.",
@@ -220,11 +230,33 @@ const INJECTION_PATTERNS: ReadonlyArray<{ id: string; pattern: RegExp; reason: s
     reason: "Secret or credential exfiltration attempt detected.",
   },
   {
+    id: "khmer_secret_exfiltration",
+    pattern: /(បង្ហាញ|លួចយក|បញ្ជូនចេញ).{0,24}(ពាក្យសម្ងាត់|កូនសោ|សម្ងាត់|ថូខឹន)/u,
+    reason: "Khmer secret or credential exfiltration attempt detected.",
+  },
+  {
     id: "cross_tenant_probe",
     pattern: /\b(other\s+tenant|all\s+tenants|bypass\s+rbac|skip\s+approval|disable\s+audit)\b/i,
     reason: "Authorization or audit bypass instruction detected.",
   },
+  {
+    id: "khmer_bypass_probe",
+    pattern: /(រំលងការអនុម័ត|បិទកំណត់ត្រាសវនកម្ម|ទិន្នន័យក្រុមហ៊ុនផ្សេង|រំលងសិទ្ធិ)/u,
+    reason: "Khmer authorization or audit bypass instruction detected.",
+  },
+  {
+    id: "active_content_or_markdown_exfil",
+    pattern: /(!\[[^\]]*\]\(\s*https?:\/\/|<script\b|javascript:|data:text\/html)/i,
+    reason: "Active script or external Markdown image exfiltration vector detected.",
+  },
 ];
+
+function normalizeForPromptScan(raw: string): string {
+  // Remove zero-width, soft-hyphen, and bidirectional override characters before NFKC folding
+  return raw
+    .replace(/[\u00AD\u200B-\u200F\u202A-\u202E\u2060-\u206F\uFEFF]/g, "")
+    .normalize("NFKC");
+}
 
 export interface PromptSafetyScanResult {
   safe: boolean;
@@ -235,12 +267,14 @@ export function scanForPromptInjection(
   command: string,
   selectedDocumentText?: string,
 ): PromptSafetyScanResult {
+  const normalizedCommand = normalizeForPromptScan(command);
+  const normalizedDocText = selectedDocumentText ? normalizeForPromptScan(selectedDocumentText) : undefined;
   const reasons: string[] = [];
   for (const rule of INJECTION_PATTERNS) {
-    if (rule.pattern.test(command)) {
+    if (rule.pattern.test(normalizedCommand)) {
       reasons.push(rule.reason);
     }
-    if (selectedDocumentText && rule.pattern.test(selectedDocumentText)) {
+    if (normalizedDocText && rule.pattern.test(normalizedDocText)) {
       reasons.push(`Untrusted document text triggered safety rule (${rule.id}): ${rule.reason}`);
     }
   }
@@ -481,4 +515,40 @@ export function validateReportingManifestSafety(manifest: ReportingPackageManife
   };
 }
 
+export const listDocumentsQuerySchema = z.object({
+  q: z.string().trim().max(120).optional(),
+  language: z.enum(["en", "km", "bilingual"]).optional(),
+  limit: z.coerce.number().int().min(1).max(100).optional(),
+  offset: z.coerce.number().int().min(0).max(100_000).optional(),
+});
+
+export const dataPrepStageProfileSchema = z.object({
+  filename: z.string().trim().min(1).max(200),
+  csvText: z.string().min(1).max(5_000_000),
+  delimiter: z.enum([",", ";", "\t", "auto"]).optional(),
+  profileScope: z.enum(["sample", "full"]).default("full"),
+  sampleSize: z.number().int().min(1).max(200).optional(),
+  expectedColumns: z.array(z.string().min(1).max(120)).max(200).optional(),
+  steps: z
+    .array(
+      z.object({
+        stepId: z.string().min(1).max(80),
+        op: z.enum([
+          "trim_normalize",
+          "normalize_khmer_numerals",
+          "parse_date_locale",
+          "quarantine_missing_required",
+          "validate_schema_contract",
+          "mask_pii_columns",
+          "map_bilingual_dictionary",
+          "deduplicate_composite_key",
+        ]),
+        params: z.record(z.string(), z.unknown()),
+      }),
+    )
+    .max(30)
+    .optional(),
+});
+
 export type ValidatedStudioDocument = StudioDocument;
+

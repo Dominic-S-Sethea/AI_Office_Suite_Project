@@ -9,7 +9,9 @@ import {
   aiApplyRequestSchema,
   aiPlanRequestSchema,
   createDocumentSchema,
+  dataPrepStageProfileSchema,
   importDocxRequestSchema,
+  listDocumentsQuerySchema,
   loginRequestSchema,
   speechTranscribeRequestSchema,
   updateDocumentSchema,
@@ -18,6 +20,7 @@ import { AuthorizationError, assertCanPerform, isWorkspaceRole } from "@ai-offic
 import {
   DatabaseConflictError,
   PostgreSqlDocumentRepository,
+  verifyDatabaseRlsReadiness,
   type PgDatabaseAdapter,
 } from "@ai-office-suite/database";
 import {
@@ -35,11 +38,18 @@ import {
 import { InMemoryAuditStore, LocalJsonlAuditStore, type AuditStore } from "@ai-office-suite/audit";
 import { InMemoryStorageAdapter, LocalFilesystemStorageAdapter, type DocumentStorageAdapter } from "@ai-office-suite/storage";
 import {
+  computeDocumentRevisionDiff,
   DocumentEngineError,
   createEmptyDocument,
   normalizeDocumentText,
   previewDocumentOperation,
 } from "@ai-office-suite/document-engine";
+import {
+  DataPreparationPipeline,
+  DataPrepError,
+  profileDataset,
+  stageCsvSource,
+} from "@ai-office-suite/data-processing";
 import {
   DocxImportError,
   exportToDocxBuffer,
@@ -50,12 +60,22 @@ import {
 import { getSpeechAdapter, SpeechProviderError } from "@ai-office-suite/speech-engine";
 import { DocumentService } from "@ai-office-suite/documents-module";
 import { AiDocumentExecutor, AiPlanningError, planDocumentOperation } from "@ai-office-suite/ai-module";
+import { createSlidingWindowRateLimiter } from "./rateLimit.ts";
+import { createApiObservability } from "./observability.ts";
 
 export interface CreateApiAppOptions {
   storageDir?: string;
   inMemory?: boolean;
   authMode?: "provisional-local" | "jwt-pg";
   db?: PgDatabaseAdapter;
+  enableStructuredLogs?: boolean;
+  logSink?: (line: string) => void;
+  rateLimit?: {
+    enabled?: boolean;
+    windowMs?: number;
+    loginMaxPerWindow?: number;
+    apiMaxPerWindow?: number;
+  };
 }
 
 function safeDownloadFilename(raw: string): string {
@@ -80,13 +100,13 @@ export function createApiApp(options: CreateApiAppOptions = {}): Express {
   }
   const useJwtPg = authMode === "jwt-pg";
   const pgRepo = options.db ? new PostgreSqlDocumentRepository(options.db) : null;
-  const pgAppliedAiOps = new Map<string, StudioDocument>();
 
+  const useInMemoryLocalFallback = options.inMemory || (useJwtPg && !options.storageDir);
   const storageDir = options.storageDir ?? path.resolve(process.cwd(), process.env.LOCAL_STORAGE_DIR ?? ".local-data");
-  const storage: DocumentStorageAdapter = options.inMemory
+  const storage: DocumentStorageAdapter = useInMemoryLocalFallback
     ? new InMemoryStorageAdapter()
     : new LocalFilesystemStorageAdapter(storageDir);
-  const audit: AuditStore = options.inMemory
+  const audit: AuditStore = useInMemoryLocalFallback
     ? new InMemoryAuditStore()
     : new LocalJsonlAuditStore(storageDir);
 
@@ -98,10 +118,42 @@ export function createApiApp(options: CreateApiAppOptions = {}): Express {
     .map((s) => s.trim())
     .filter(Boolean);
 
+  const rateLimitEnabled = options.rateLimit?.enabled ?? process.env.NODE_ENV !== "test";
+  const loginLimiter = createSlidingWindowRateLimiter({
+    windowMs: options.rateLimit?.windowMs ?? 60_000,
+    maxRequests: options.rateLimit?.loginMaxPerWindow ?? 15,
+    keyGenerator: (req) => {
+      const ip = req.ip || req.socket?.remoteAddress || "unknown";
+      const email =
+        typeof req.body === "object" && req.body !== null && typeof (req.body as { email?: unknown }).email === "string"
+          ? (req.body as { email: string }).email.trim().toLowerCase().slice(0, 120)
+          : "";
+      return `login:${ip}:${email}`;
+    },
+  });
+  const apiLimiter = createSlidingWindowRateLimiter({
+    windowMs: options.rateLimit?.windowMs ?? 60_000,
+    maxRequests: options.rateLimit?.apiMaxPerWindow ?? 300,
+  });
+  const observability = createApiObservability({
+    enableStructuredLogs: options.enableStructuredLogs,
+    sink: options.logSink,
+  });
+
   const app = express();
+  app.disable("x-powered-by");
+  app.use(observability.middleware);
   app.use(
     helmet({
-      contentSecurityPolicy: false,
+      contentSecurityPolicy: {
+        directives: {
+          defaultSrc: ["'none'"],
+          frameAncestors: ["'none'"],
+          baseUri: ["'none'"],
+          formAction: ["'none'"],
+        },
+      },
+      referrerPolicy: { policy: "no-referrer" },
     }),
   );
   app.use(
@@ -111,10 +163,25 @@ export function createApiApp(options: CreateApiAppOptions = {}): Express {
     }),
   );
   app.use(express.json({ limit: "25mb" }));
-  app.use((_req, res, next) => {
+  app.use((req, res, next) => {
     res.setHeader("X-Auth-Mode", useJwtPg ? "jwt-postgresql-rls" : "provisional-local-prototype");
+    if (
+      req.path.startsWith("/api/auth") ||
+      req.path.startsWith("/api/documents") ||
+      req.path.startsWith("/api/data-prep") ||
+      req.path.startsWith("/api/metrics")
+    ) {
+      res.setHeader("Cache-Control", "no-store, max-age=0");
+      res.setHeader("Pragma", "no-cache");
+    }
     next();
   });
+
+  if (rateLimitEnabled) {
+    app.use("/api/documents", apiLimiter.middleware);
+    app.use("/api/speech", apiLimiter.middleware);
+    app.use("/api/data-prep", apiLimiter.middleware);
+  }
 
   app.get("/api/health", (_req, res) => {
     res.json({
@@ -126,9 +193,53 @@ export function createApiApp(options: CreateApiAppOptions = {}): Express {
     });
   });
 
+  app.get("/api/ready", async (_req, res) => {
+    if (!useJwtPg || !options.db) {
+      res.json({
+        status: "ready",
+        authMode,
+        checks: { storage: options.inMemory ? "in-memory" : "local-fs" },
+      });
+      return;
+    }
+    const report = await verifyDatabaseRlsReadiness(options.db);
+    res.status(report.ready ? 200 : 503).json({
+      status: report.ready ? "ready" : "degraded",
+      authMode,
+      engine: report.engine,
+      checks: report.checks,
+    });
+  });
+
   if (useJwtPg && options.db) {
     const db = options.db;
     const jwtMiddleware = createJwtAuthMiddleware(db, allowedOrigins);
+
+    if (rateLimitEnabled) {
+      app.use("/api/auth/login", loginLimiter.middleware);
+    }
+
+    app.get("/api/metrics", jwtMiddleware, (req, res) => {
+      const authReq = req as AuthenticatedRequest;
+      if (authReq.actor?.role !== "owner" && authReq.actor?.role !== "administrator") {
+        res.status(403).json({
+          error: "Metrics endpoint requires owner or administrator role.",
+          code: "FORBIDDEN_ROLE",
+        });
+        return;
+      }
+      res.json({
+        service: "ai-office-suite-api",
+        authMode,
+        metrics: observability.getMetrics(),
+        rateLimits: {
+          enabled: rateLimitEnabled,
+          login: loginLimiter.getStats(),
+          api: apiLimiter.getStats(),
+        },
+        ...(db.getPoolStats ? { dbPool: db.getPoolStats() } : {}),
+      });
+    });
 
     app.post("/api/auth/login", async (req, res, next) => {
       try {
@@ -177,9 +288,28 @@ export function createApiApp(options: CreateApiAppOptions = {}): Express {
       }
     });
 
-    // Enforce JWT + PostgreSQL RLS live membership check on all document & speech routes
+    // Enforce JWT + PostgreSQL RLS live membership check on all document, speech & data-prep routes
     app.use("/api/documents", jwtMiddleware);
     app.use("/api/speech", jwtMiddleware);
+    app.use("/api/data-prep", jwtMiddleware);
+  } else {
+    app.get("/api/metrics", (req, res) => {
+      const actor = resolvePrototypeActor(req);
+      if (actor.role !== "owner" && actor.role !== "administrator") {
+        res.status(403).json({ error: "Metrics endpoint requires owner or administrator role.", code: "FORBIDDEN_ROLE" });
+        return;
+      }
+      res.json({
+        service: "ai-office-suite-api",
+        authMode,
+        metrics: observability.getMetrics(),
+        rateLimits: {
+          enabled: rateLimitEnabled,
+          login: loginLimiter.getStats(),
+          api: apiLimiter.getStats(),
+        },
+      });
+    });
   }
 
   const getActor = (req: Request): ActorContext => {
@@ -196,8 +326,15 @@ export function createApiApp(options: CreateApiAppOptions = {}): Express {
   app.get("/api/documents", async (req, res, next) => {
     try {
       const actor = getActor(req);
-      const list = pgRepo ? await pgRepo.listDocuments(actor) : await documents.listDocuments(actor);
-      res.json({ documents: list });
+      const parsed = listDocumentsQuerySchema.safeParse(req.query);
+      if (!parsed.success) {
+        res.status(400).json({ error: "Invalid document list query", code: "VALIDATION_ERROR", issues: parsed.error.issues });
+        return;
+      }
+      const page = pgRepo
+        ? await pgRepo.listDocumentsFiltered(actor, parsed.data)
+        : await documents.listDocumentsFiltered(actor, parsed.data);
+      res.json(page);
     } catch (err) {
       next(err);
     }
@@ -318,6 +455,32 @@ export function createApiApp(options: CreateApiAppOptions = {}): Express {
     }
   });
 
+  app.get("/api/documents/:id/versions/:fromRev/diff/:toRev", async (req, res, next) => {
+    try {
+      const actor = getActor(req);
+      const fromRev = Number(req.params.fromRev);
+      const toRev = Number(req.params.toRev);
+      if (!Number.isInteger(fromRev) || fromRev < 1 || !Number.isInteger(toRev) || toRev < 1) {
+        res.status(400).json({ error: "Invalid revision numbers", code: "VALIDATION_ERROR" });
+        return;
+      }
+      const fromVer = pgRepo
+        ? await pgRepo.getVersion(actor, req.params.id, fromRev)
+        : await documents.getVersion(actor, req.params.id, fromRev);
+      const toVer = pgRepo
+        ? await pgRepo.getVersion(actor, req.params.id, toRev)
+        : await documents.getVersion(actor, req.params.id, toRev);
+      if (!fromVer || !toVer) {
+        res.status(404).json({ error: "Requested document revision not found", code: "VERSION_NOT_FOUND" });
+        return;
+      }
+      const diff = computeDocumentRevisionDiff(fromVer.snapshot, toVer.snapshot);
+      res.json({ diff });
+    } catch (err) {
+      next(err);
+    }
+  });
+
   app.post("/api/documents/:id/versions/:revision/restore", async (req, res, next) => {
     try {
       const actor = getActor(req);
@@ -387,46 +550,26 @@ export function createApiApp(options: CreateApiAppOptions = {}): Express {
             "Explicit user approval is required before applying an AI or voice operation.",
           );
         }
-        const idemKey = `${actor.tenantId}::${actor.workspaceId}::${req.params.id}::${parsed.data.proposal.operationId}`;
-        const cached = pgAppliedAiOps.get(idemKey);
-        if (cached) {
-          res.json({
-            document: structuredClone(cached),
-            deduplicated: true,
-            appliedOperationId: parsed.data.proposal.operationId,
-          });
-          return;
-        }
-        const currentDoc = await pgRepo.getDocument(actor, req.params.id);
-        const prior =
-          parsed.data.proposal.action === "undo_last" && currentDoc.revision > 1
-            ? await pgRepo.getVersion(actor, req.params.id, currentDoc.revision - 1)
-            : null;
-        const { nextDoc, preview } = previewDocumentOperation(
-          currentDoc,
-          parsed.data.proposal,
-          prior?.snapshot ?? null,
-        );
-        const saved = await pgRepo.updateDocument(
+        const result = await pgRepo.applyAiOperationIdempotent({
           actor,
-          req.params.id,
-          parsed.data.proposal.expectedRevision,
-          (_cur, nextRevision) => ({
-            ...nextDoc,
-            revision: nextRevision,
-          }),
-          {
-            source: parsed.data.proposal.source === "voice_command" ? "voice_command" : "typed_ai",
-            action: "document.ai_applied",
-            summary: `[${parsed.data.proposal.source}] ${parsed.data.proposal.action}: ${preview.summary}`,
+          documentId: req.params.id,
+          operationId: parsed.data.proposal.operationId,
+          expectedRevision: parsed.data.proposal.expectedRevision,
+          source: parsed.data.proposal.source === "voice_command" ? "voice_command" : "typed_ai",
+          loadPriorForUndo: parsed.data.proposal.action === "undo_last",
+          buildNext: (currentDoc, priorSnapshot, nextRevision) => {
+            const { nextDoc, preview } = previewDocumentOperation(
+              currentDoc,
+              parsed.data.proposal,
+              priorSnapshot,
+            );
+            return {
+              updatedDoc: { ...nextDoc, revision: nextRevision },
+              summary: `[${parsed.data.proposal.source}] ${parsed.data.proposal.action}: ${preview.summary}`,
+            };
           },
-        );
-        pgAppliedAiOps.set(idemKey, structuredClone(saved));
-        res.json({
-          document: saved,
-          deduplicated: false,
-          appliedOperationId: parsed.data.proposal.operationId,
         });
+        res.json(result);
         return;
       }
       const result = await aiExecutor.applyProposal({
@@ -579,12 +722,107 @@ export function createApiApp(options: CreateApiAppOptions = {}): Express {
     }
   });
 
+  app.post("/api/data-prep/stage-and-profile", async (req, res, next) => {
+    try {
+      const actor = getActor(req);
+      assertCanPerform(actor, "document", "write");
+      const parsed = dataPrepStageProfileSchema.safeParse(req.body);
+      if (!parsed.success) {
+        res.status(400).json({ error: "Invalid data-prep staging payload", code: "VALIDATION_ERROR", issues: parsed.error.issues });
+        return;
+      }
+
+      const staged = stageCsvSource(parsed.data.csvText, parsed.data.filename, {
+        delimiter: parsed.data.delimiter ?? "auto",
+        maxRows: 50_000,
+      });
+      const profile = profileDataset(staged.source.sourceId, staged.rows, {
+        scope: parsed.data.profileScope,
+        sampleSize: parsed.data.sampleSize,
+      });
+
+      let dryRunArtifact: {
+        status: string;
+        outputSha256: string;
+        reconciliation: unknown;
+        exceptionCount: number;
+        sampleRows: Array<Record<string, unknown>>;
+      } | null = null;
+
+      if (parsed.data.steps && parsed.data.steps.length > 0) {
+        const expectedColumns =
+          parsed.data.expectedColumns && parsed.data.expectedColumns.length > 0
+            ? parsed.data.expectedColumns
+            : staged.source.columnNames;
+        const sandboxPipeline = new DataPreparationPipeline();
+        const artifact = sandboxPipeline.executeRecipe({
+          actor,
+          recipe: {
+            recipeId: `sandbox_${randomUUID().slice(0, 8)}`,
+            version: 1,
+            tenantId: actor.tenantId,
+            workspaceId: actor.workspaceId,
+            pinnedInputSha256s: [staged.source.sha256],
+            idempotencyKey: `idem_${randomUUID()}`,
+            steps: parsed.data.steps,
+          },
+          salesSources: [staged],
+          expectedColumns,
+        });
+        dryRunArtifact = {
+          status: artifact.status,
+          outputSha256: artifact.outputSha256,
+          reconciliation: artifact.reconciliation,
+          exceptionCount: artifact.exceptions.length,
+          sampleRows: artifact.rows.slice(0, 50),
+        };
+      }
+
+      if (pgRepo) {
+        await pgRepo.recordAudit(actor, {
+          tenantId: actor.tenantId,
+          workspaceId: actor.workspaceId,
+          actorId: actor.userId,
+          actorRole: actor.role,
+          source: "import",
+          action: "data_prep.stage_and_profile",
+          outcome: "success",
+          summary: `Staged '${parsed.data.filename}' (${staged.source.acceptedRows} accepted, ${staged.source.rejectedRows} rejected).`,
+        });
+      } else {
+        audit.append({
+          auditId: `aud_${randomUUID()}`,
+          tenantId: actor.tenantId,
+          workspaceId: actor.workspaceId,
+          actorId: actor.userId,
+          actorRole: actor.role,
+          source: "import",
+          action: "data_prep.stage_and_profile",
+          outcome: "success",
+          summary: `Staged '${parsed.data.filename}' (${staged.source.acceptedRows} accepted, ${staged.source.rejectedRows} rejected).`,
+          createdAt: new Date().toISOString(),
+        });
+      }
+
+      res.json({
+        source: staged.source,
+        profile,
+        rejects: staged.rejects.slice(0, 50),
+        sampleRows: staged.rows.slice(0, 50),
+        dryRun: dryRunArtifact,
+      });
+    } catch (err) {
+      next(err);
+    }
+  });
+
   app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
     if (
       err instanceof AuthenticationError ||
       err instanceof AuthorizationError ||
       err instanceof DatabaseConflictError ||
       err instanceof DocumentEngineError ||
+      err instanceof DataPrepError ||
       err instanceof DocxImportError ||
       err instanceof PdfExportError ||
       err instanceof SpeechProviderError ||

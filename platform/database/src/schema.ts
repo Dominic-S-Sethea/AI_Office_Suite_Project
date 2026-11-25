@@ -101,6 +101,18 @@ CREATE TABLE IF NOT EXISTS audit_logs (
   created_at       TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+CREATE TABLE IF NOT EXISTS ai_applied_operations (
+  tenant_id        UUID NOT NULL,
+  workspace_id     UUID NOT NULL,
+  document_id      UUID NOT NULL,
+  operation_id     TEXT NOT NULL,
+  result_revision  INTEGER NOT NULL CHECK (result_revision >= 1),
+  actor_id         UUID NOT NULL REFERENCES users(user_id),
+  applied_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (tenant_id, workspace_id, document_id, operation_id),
+  FOREIGN KEY (tenant_id, document_id) REFERENCES documents(tenant_id, document_id)
+);
+
 CREATE TABLE IF NOT EXISTS migration_batches (
   batch_id           UUID PRIMARY KEY,
   target_tenant_id   UUID NOT NULL REFERENCES organizations(tenant_id),
@@ -114,9 +126,10 @@ CREATE TABLE IF NOT EXISTS migration_batches (
 
 GRANT USAGE ON SCHEMA public TO app_runtime;
 GRANT SELECT, INSERT, UPDATE ON organizations, users, memberships, workspaces, documents, idempotency_keys TO app_runtime;
-GRANT SELECT, INSERT ON document_versions, audit_logs TO app_runtime;
+GRANT SELECT, INSERT ON document_versions, audit_logs, ai_applied_operations TO app_runtime;
 REVOKE UPDATE, DELETE ON audit_logs FROM app_runtime;
 REVOKE UPDATE, DELETE ON document_versions FROM app_runtime;
+REVOKE UPDATE, DELETE ON ai_applied_operations FROM app_runtime;
 
 ALTER TABLE workspaces ENABLE ROW LEVEL SECURITY;
 ALTER TABLE workspaces FORCE ROW LEVEL SECURITY;
@@ -152,10 +165,83 @@ DROP POLICY IF EXISTS tenant_isolation_audit_logs ON audit_logs;
 CREATE POLICY tenant_isolation_audit_logs ON audit_logs
   USING (tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')::uuid)
   WITH CHECK (tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')::uuid);
+
+ALTER TABLE ai_applied_operations ENABLE ROW LEVEL SECURITY;
+ALTER TABLE ai_applied_operations FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS tenant_isolation_ai_applied_operations ON ai_applied_operations;
+CREATE POLICY tenant_isolation_ai_applied_operations ON ai_applied_operations
+  USING (tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')::uuid)
+  WITH CHECK (tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')::uuid);
 `;
 
 export async function initializePostgreSqlSchema(db: PgDatabaseAdapter): Promise<void> {
   await db.exec(D2_POSTGRESQL_SCHEMA_SQL);
+}
+
+export interface DatabaseReadinessReport {
+  ready: boolean;
+  engine: "pglite" | "node-pg";
+  checks: {
+    connectivity: boolean;
+    appRuntimeLeastPrivilege: boolean;
+    coreForceRlsEnabled: boolean;
+    missingForceRlsTables: string[];
+  };
+}
+
+const CORE_RLS_TABLES = [
+  "workspaces",
+  "documents",
+  "document_versions",
+  "idempotency_keys",
+  "audit_logs",
+  "ai_applied_operations",
+] as const;
+
+export async function verifyDatabaseRlsReadiness(db: PgDatabaseAdapter): Promise<DatabaseReadinessReport> {
+  let connectivity = false;
+  let appRuntimeLeastPrivilege = false;
+  let coreForceRlsEnabled = false;
+  let missingForceRlsTables: string[] = [...CORE_RLS_TABLES];
+
+  try {
+    const ping = await db.query<{ ok: number }>("SELECT 1 AS ok");
+    connectivity = ping.rows[0]?.ok === 1;
+
+    const roleRes = await db.query<{ rolsuper: boolean; rolbypassrls: boolean }>(
+      "SELECT rolsuper, rolbypassrls FROM pg_roles WHERE rolname = 'app_runtime'",
+    );
+    const roleRow = roleRes.rows[0];
+    appRuntimeLeastPrivilege = Boolean(roleRow && roleRow.rolsuper === false && roleRow.rolbypassrls === false);
+
+    const rlsRes = await db.query<{ relname: string; relrowsecurity: boolean; relforcerowsecurity: boolean }>(
+      `SELECT c.relname, c.relrowsecurity, c.relforcerowsecurity
+       FROM pg_class c
+       JOIN pg_namespace n ON n.oid = c.relnamespace
+       WHERE n.nspname = 'public' AND c.relname = ANY($1::text[])`,
+      [Array.from(CORE_RLS_TABLES)],
+    );
+    const okSet = new Set(
+      rlsRes.rows
+        .filter((r) => r.relrowsecurity === true && r.relforcerowsecurity === true)
+        .map((r) => r.relname),
+    );
+    missingForceRlsTables = CORE_RLS_TABLES.filter((t) => !okSet.has(t));
+    coreForceRlsEnabled = missingForceRlsTables.length === 0;
+  } catch {
+    connectivity = false;
+  }
+
+  return {
+    ready: connectivity && appRuntimeLeastPrivilege && coreForceRlsEnabled,
+    engine: db.engine,
+    checks: {
+      connectivity,
+      appRuntimeLeastPrivilege,
+      coreForceRlsEnabled,
+      missingForceRlsTables,
+    },
+  };
 }
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;

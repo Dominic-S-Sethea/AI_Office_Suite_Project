@@ -94,6 +94,10 @@ export class AiDocumentExecutor {
       ...(proposal.action === "undo_last" && priorVersion ? { undoneRevision: currentDoc.revision } : {}),
     });
 
+    if (this.appliedOperations.size >= 1000) {
+      const oldest = this.appliedOperations.keys().next().value;
+      if (oldest !== undefined) this.appliedOperations.delete(oldest);
+    }
     this.appliedOperations.set(idempotencyCacheKey, structuredClone(saved));
     return {
       document: saved,

@@ -15,16 +15,18 @@
 | **FR-06 `PS-00` Presentation Feasibility** | Owned slide model, native PPTX I/O, Khmer PDF/PNG & `PPT-T01..T20` | `engines/presentation` (`PresentationWorkspaceStore`, `pptxgenjs@4.0.1` export with `ExportDisclosurePolicy`, hardened `fflate@0.8.2` importer, Edge HarfBuzz PDF/PNG render, 5/20/50-slide benchmarks, visual PNG inspection) |
 | **FR-07 `BI-00` Intelligence Feasibility** | Owned BI engine, `ChartSpec`, ECharts SSR, `BI-T01..T32` & `X-VIS-01..08` | `engines/intelligence` (`echarts@6.1.0` SSR SVG/ARIA/PNG + constrained Vega-Lite JSON comparator, FR-05 Section 12 Golden Fixture, `DataScopePolicy` row/col/cache/revocation/export controls, stale-seq race guard, 6-slide PPTX handoff, `10k/100k` benchmarks) |
 | **FR-08 `XI-00` Cross-Module Integration Feasibility** | Shared Registry, Linked Objects, Workflows, PG Outbox Publication & `INT-T01..T24` | `engines/integration` (`CrossModuleIntegrationEngine`, PostgreSQL RLS `xi_*` schema & atomic `commitPackagePublicationTx` + `xi_outbox_events`, extended `LinkedMetricReference`, one-way sync, V1/V2/V3 versioning, DB crash/rehydrate recovery, digest-bound approval invalidation, EN/KM `planCrossModuleWorkflow`, all `INT-T01..T24` passing) |
+| **Linux/CI, Live PG16 & 8-Hour Hardening Sprint** | Cross-platform CI, Live PG16 RLS, Security, Data Pipeline, Workspace Features, DevOps & Audit | Linux/CI portability, live PostgreSQL 16.16 verification (`13` `FORCE RLS` tables + PG16 EPQ concurrency fix + durable `ai_applied_operations` ledger), Chromium CSS/SSRF lockdown, rate limiting, RFC 4180 + BigInt `FIN-POL-V1` data pipeline operators (`normalize_khmer_numerals`, `validate_schema_contract`, `mask_pii_columns`, safe CSV export), RLS document search/diff + DOCX import UI, non-root Docker/Compose + `scripts/db-cli.mjs` + CI PG16 service job, stress benchmarks (`STRESS_AND_PERFORMANCE_REPORT.md`), full OWASP audit (`SECURITY_AUDIT_REPORT.md`) & `DEVOPS_RUNBOOK.md` |
 
-## 2. Verification Results (Latest Run `task-1032`)
+## 2. Verification Results (Latest Linux + PG16 Verification)
 
-- `node scripts/check-licenses.mjs`: **PASS** — scanned `468` installed third-party package versions (`47` direct dependencies); `0` disallowed licenses detected (`jszip@3.10.2` permissive `MIT` branch selected).
-- `npm.cmd audit --omit=dev --audit-level=high`: **PASS (high+)** — exit `0` (`0` high/critical production advisories after `"overrides": { "image-size": "^2.1.0" }`; `2` pre-existing moderate `uuid <11.1.1` advisories via `exceljs@4.4.0` disclosed).
-- `npm.cmd run typecheck`: **PASS** — `tsc -p tsconfig.typecheck.json --noEmit` exited `0` (`0` errors).
-- `npm.cmd run build`: **PASS** — `build:api` + `build:web` (`107` modules including Khmer `.woff2` bundles, `built in 8.75s`).
-- `npm.cmd test`: **PASS** — **12/12 test files, 32/32 tests passed** in `47.27s` (all prior 11 suites plus `tests/g1-xi00-cross-module-integration.test.ts`).
-- **Legacy Naming Hygiene Scan:** **`0` matches** across `ai-office-suite/`.
-- **`package-lock.json` SHA-256:** `992FA2A38F544476B999A74AAA783AD17DEB0E7BD0E05B15011594DE86595233`.
+- `npm run lint:hygiene`: **PASS** — `0` forbidden tracked files, `0` leaked secrets, speech gate boundaries (`423` / `isMock: true`) intact.
+- `npm run lint:licenses`: **PASS** — scanned `467` installed third-party package versions (`47` direct dependencies); `0` disallowed licenses detected (`jszip@3.10.2` permissive `MIT` branch selected).
+- `npm audit --omit=dev --audit-level=high`: **PASS (high+)** — exit `0` (`0` high/critical production advisories; `2` pre-existing moderate `uuid <11.1.1` advisories via `exceljs@4.4.0` disclosed).
+- `npm run typecheck`: **PASS** — `tsc -p tsconfig.typecheck.json --noEmit` exited `0` (`0` errors).
+- `npm run build`: **PASS** — `build:api` + `build:web` (`107` Vite modules including Khmer `.woff2` bundles on Linux).
+- `npm test` + Live PostgreSQL 16.16 Docker (`TEST_POSTGRES_URL`): **PASS** — all self-contained suites + live PG16 RLS/concurrency/stress suites passing (`0` failures).
+- `npm run bench:check`: **PASS** — all DuckDB/Polars/Pipeline/Spreadsheet budgets green (`benchmarks/baseline.json`).
+- **Legacy Naming Hygiene Scan:** **`0` matches** across the repository.
 
 ## 3. Open Gates & Blockers
 

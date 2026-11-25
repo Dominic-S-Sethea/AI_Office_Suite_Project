@@ -14,9 +14,16 @@ export interface PgQueryExecutor {
   exec(sql: string): Promise<void>;
 }
 
+export interface PgPoolStats {
+  totalCount: number;
+  idleCount: number;
+  waitingCount: number;
+}
+
 export interface PgDatabaseAdapter extends PgQueryExecutor {
   readonly engine: "pglite" | "node-pg";
   withTransaction<T>(fn: (tx: PgQueryExecutor) => Promise<T>): Promise<T>;
+  getPoolStats?(): PgPoolStats;
   close(): Promise<void>;
 }
 
@@ -130,6 +137,14 @@ export class NodePgDatabaseAdapter implements PgDatabaseAdapter {
     } finally {
       client.release(releaseErr);
     }
+  }
+
+  getPoolStats(): PgPoolStats {
+    return {
+      totalCount: this.pool.totalCount,
+      idleCount: this.pool.idleCount,
+      waitingCount: this.pool.waitingCount,
+    };
   }
 
   async close(): Promise<void> {

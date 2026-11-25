@@ -1,0 +1,39 @@
+{
+  "schemaVersion": 1,
+  "recordedAt": "2026-11-25",
+  "environment": "Ubuntu 24.04 x86_64, Node v22.23.5, PostgreSQL 16.16 (Docker), DuckDB v1.4.5, Polars 0.26.2",
+  "budgets": {
+    "duckdb_50k_p95_ms": 250,
+    "polars_50k_p95_ms": 250,
+    "pipeline_10k_bigint_ms": 1500,
+    "spreadsheet_5k_recalc_ms": 1000
+  },
+  "observedDeepSoak": {
+    "pg16_100_concurrent_reads_5_tenants": {
+      "poolMax": 5,
+      "p50Ms": 434.84,
+      "p95Ms": 587.6,
+      "p99Ms": 596.17,
+      "rssDeltaMb": 9.88,
+      "crossTenantLeaks": 0
+    },
+    "pipeline_50k_bilingual_bigint": {
+      "stageMs": 229.06,
+      "execMs": 696.73,
+      "rssDeltaMb": 59.72,
+      "unexplainedMinorUnits": "0"
+    },
+    "duckdb_100k": {
+      "p50Ms": 44.29,
+      "p95Ms": 55.16,
+      "rssDeltaMb": 21.13
+    },
+    "polars_100k": {
+      "p50Ms": 28.32,
+      "p95Ms": 42.55,
+      "rssDeltaMb": 37.0
+    },
+    "malicious_ooxml_60_burst_ms": 58.63,
+    "bi_80_evals_revocation_thrash_ms": 622.86
+  }
+}

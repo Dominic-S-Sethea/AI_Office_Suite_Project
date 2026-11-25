@@ -396,8 +396,11 @@ export interface DatasetProfile {
 export type DataTransformOpType =
   | "map_schema"
   | "trim_normalize"
+  | "normalize_khmer_numerals"
   | "parse_date_locale"
   | "quarantine_missing_required"
+  | "validate_schema_contract"
+  | "mask_pii_columns"
   | "map_bilingual_dictionary"
   | "deduplicate_composite_key"
   | "append_datasets"
@@ -436,6 +439,11 @@ export interface CurrencyControlTotal {
   preparedTotal: number;
   excludedOrQuarantinedTotal: number;
   unexplainedDifference: number;
+  scale?: number;
+  sourceMinorUnits?: string;
+  preparedMinorUnits?: string;
+  excludedMinorUnits?: string;
+  unexplainedMinorUnits?: string;
 }
 
 export interface ReconciliationReport {

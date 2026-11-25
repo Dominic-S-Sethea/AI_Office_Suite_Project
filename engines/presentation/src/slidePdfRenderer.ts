@@ -9,7 +9,16 @@ import type {
   PresentationSlide,
   StudioPresentation,
 } from "@ai-office-suite/shared-contracts";
-import { countPdfPages, detectChromiumBinary, PdfExportError, resolveLocalFontFacesCss } from "@ai-office-suite/file-conversion";
+import {
+  countPdfPages,
+  detectChromiumBinary,
+  HARDENED_CHROMIUM_BASE_ARGS,
+  PDF_RENDER_CSP_META,
+  PdfExportError,
+  resolveLocalFontFacesCss,
+  sanitizeCssColor,
+  sanitizeSafeImageDataUri,
+} from "@ai-office-suite/file-conversion";
 
 const execFileAsync = promisify(execFile);
 
@@ -18,7 +27,12 @@ function esc(text: string): string {
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;");
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function safeColor(raw: unknown, fallback: string): string {
+  return sanitizeCssColor(raw) ?? fallback;
 }
 
 function renderSimpleChartSvg(spec: ChartSpec, widthPx: number, heightPx: number, lang: "en" | "km" | "bilingual"): string {
@@ -64,6 +78,10 @@ function renderSimpleChartSvg(spec: ChartSpec, widthPx: number, heightPx: number
 }
 
 function renderSlideHtml(slide: PresentationSlide, deck: StudioPresentation): string {
+  const primaryColor = safeColor(deck.theme.primaryColor, "#2563EB");
+  const textColor = safeColor(deck.theme.textColor, "#0F172A");
+  const bgColor = safeColor(deck.theme.backgroundColor, "#FFFFFF");
+
   const items = slide.elements
     .slice()
     .sort((a, b) => a.zIndex - b.zIndex)
@@ -75,27 +93,36 @@ function renderSlideHtml(slide: PresentationSlide, deck: StudioPresentation): st
       const baseStyle = `position:absolute;left:${leftPx}px;top:${topPx}px;width:${wPx}px;height:${hPx}px;box-sizing:border-box;`;
 
       if (el.type === "shape") {
-        return `<div style="${baseStyle}background:${esc(el.fillColor)};border-radius:${el.shapeKind === "round_rect" ? "8px" : "0"};"></div>`;
+        const fill = safeColor(el.fillColor, "#E2E8F0");
+        return `<div style="${baseStyle}background:${fill};border-radius:${el.shapeKind === "round_rect" ? "8px" : "0"};"></div>`;
       }
       if (el.type === "connector") {
-        return `<div style="${baseStyle}border-top:${el.strokeWidthPt}px solid ${esc(el.lineColor)};"></div>`;
+        const lineColor = safeColor(el.lineColor, "#64748B");
+        const stroke = Number.isFinite(el.strokeWidthPt) ? Math.min(24, Math.max(0.5, el.strokeWidthPt)) : 1;
+        return `<div style="${baseStyle}border-top:${stroke}px solid ${lineColor};"></div>`;
       }
       if (el.type === "image") {
-        return `<img src="${esc(el.dataUriBase64)}" alt="${esc(el.altText)}" style="${baseStyle}object-fit:contain;" />`;
+        const safeUri = sanitizeSafeImageDataUri(el.dataUriBase64);
+        if (!safeUri) {
+          return `<div style="${baseStyle}background:#F1F5F9;border:1px dashed #94A3B8;display:flex;align-items:center;justify-content:center;font-size:11pt;color:#64748B;">Blocked unsafe image URI</div>`;
+        }
+        return `<img src="${safeUri}" alt="${esc(el.altText)}" style="${baseStyle}object-fit:contain;" />`;
       }
       if (el.type === "text") {
-        return `<div style="${baseStyle}font-size:${el.fontSizePt}pt;font-weight:${el.bold ? 700 : 400};color:${esc(el.color ?? deck.theme.textColor)};line-height:1.45;white-space:pre-wrap;overflow-wrap:break-word;">${esc(el.text)}</div>`;
+        const elColor = safeColor(el.color, textColor);
+        const fontSize = Number.isFinite(el.fontSizePt) ? Math.min(144, Math.max(6, el.fontSizePt)) : 14;
+        return `<div style="${baseStyle}font-size:${fontSize}pt;font-weight:${el.bold ? 700 : 400};color:${elColor};line-height:1.45;white-space:pre-wrap;overflow-wrap:break-word;">${esc(el.text)}</div>`;
       }
       if (el.type === "metric") {
         const label = deck.language === "km" ? el.labelKm : el.labelEn;
         return `<div style="${baseStyle}background:#F8FAFC;border:1px solid #CBD5E1;border-radius:10px;padding:16px;">
           <div style="font-size:12pt;color:#475569;margin-bottom:8px;">${esc(label)}</div>
-          <div style="font-size:24pt;font-weight:700;color:${esc(deck.theme.primaryColor)};">${esc(el.metricRef.cachedFormattedValue)}</div>
+          <div style="font-size:24pt;font-weight:700;color:${primaryColor};">${esc(el.metricRef.cachedFormattedValue)}</div>
           <div style="font-size:10pt;color:#64748B;margin-top:8px;">${esc(el.metricRef.reportingPeriod)}</div>
         </div>`;
       }
       if (el.type === "table") {
-        const head = `<tr>${el.headers.map((h) => `<th style="background:${esc(deck.theme.primaryColor)};color:#fff;padding:8px 12px;text-align:left;border:1px solid #CBD5E1;">${esc(h)}</th>`).join("")}</tr>`;
+        const head = `<tr>${el.headers.map((h) => `<th style="background:${primaryColor};color:#fff;padding:8px 12px;text-align:left;border:1px solid #CBD5E1;">${esc(h)}</th>`).join("")}</tr>`;
         const rows = el.rows
           .map(
             (r) =>
@@ -108,7 +135,7 @@ function renderSlideHtml(slide: PresentationSlide, deck: StudioPresentation): st
     })
     .join("\n");
 
-  return `<section class="slide" style="position:relative;width:1280px;height:720px;background:${esc(deck.theme.backgroundColor)};overflow:hidden;page-break-after:always;break-after:page;">${items}</section>`;
+  return `<section class="slide" style="position:relative;width:1280px;height:720px;background:${bgColor};overflow:hidden;page-break-after:always;break-after:page;">${items}</section>`;
 }
 
 export function buildPresentationHtml(deck: StudioPresentation, slideIndex?: number): string {
@@ -119,6 +146,7 @@ export function buildPresentationHtml(deck: StudioPresentation, slideIndex?: num
 <html lang="km">
 <head>
   <meta charset="UTF-8" />
+  ${PDF_RENDER_CSP_META}
   <title>${esc(deck.title)}</title>
   <style>
     ${fontCss}
@@ -149,11 +177,7 @@ export async function exportPresentationPdf(deck: StudioPresentation): Promise<{
     await execFileAsync(
       browserPath,
       [
-        "--headless=new",
-        "--disable-gpu",
-        "--no-sandbox",
-        "--no-first-run",
-        "--disable-extensions",
+        ...HARDENED_CHROMIUM_BASE_ARGS,
         `--user-data-dir=${userDataDir}`,
         "--no-pdf-header-footer",
         `--print-to-pdf=${pdfPath}`,
@@ -186,11 +210,7 @@ export async function renderPresentationSlideScreenshot(
     await execFileAsync(
       browserPath,
       [
-        "--headless=new",
-        "--disable-gpu",
-        "--no-sandbox",
-        "--no-first-run",
-        "--disable-extensions",
+        ...HARDENED_CHROMIUM_BASE_ARGS,
         `--user-data-dir=${userDataDir}`,
         "--window-size=1280,720",
         `--screenshot=${path.resolve(outputPngPath)}`,

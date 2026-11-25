@@ -7,7 +7,13 @@ import { promisify } from "node:util";
 import * as echarts from "echarts";
 import type { ChartSpec } from "@ai-office-suite/shared-contracts";
 import { validateChartSpecSafety } from "@ai-office-suite/validation";
-import { detectChromiumBinary, PdfExportError, resolveLocalFontFacesCss } from "@ai-office-suite/file-conversion";
+import {
+  detectChromiumBinary,
+  HARDENED_CHROMIUM_BASE_ARGS,
+  PDF_RENDER_CSP_META,
+  PdfExportError,
+  resolveLocalFontFacesCss,
+} from "@ai-office-suite/file-conversion";
 
 const execFileAsync = promisify(execFile);
 
@@ -28,7 +34,8 @@ function escapeHtml(text: string): string {
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;");
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
 }
 
 export function compileChartSpecToEChartsOption(
@@ -229,17 +236,13 @@ export async function renderChartSpecPngViaEdge(
   try {
     writeFileSync(
       htmlPath,
-      `<!DOCTYPE html><html lang="km"><head><meta charset="UTF-8"/><style>${fontCss} body{margin:16px;background:#fff;font-family:'Inter','Noto Sans Khmer',sans-serif;}</style></head><body>${svg}</body></html>`,
+      `<!DOCTYPE html><html lang="km"><head><meta charset="UTF-8"/>${PDF_RENDER_CSP_META}<style>${fontCss} body{margin:16px;background:#fff;font-family:'Inter','Noto Sans Khmer',sans-serif;}</style></head><body>${svg}</body></html>`,
       "utf8",
     );
     await execFileAsync(
       browserPath,
       [
-        "--headless=new",
-        "--disable-gpu",
-        "--no-sandbox",
-        "--no-first-run",
-        "--disable-extensions",
+        ...HARDENED_CHROMIUM_BASE_ARGS,
         `--user-data-dir=${userDataDir}`,
         `--window-size=${width + 40},${height + 40}`,
         `--screenshot=${path.resolve(outputPngPath)}`,

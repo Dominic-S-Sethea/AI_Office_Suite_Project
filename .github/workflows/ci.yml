@@ -1,4 +1,4 @@
-name: AI Office Suite — D0/D1 Baseline CI
+name: AI Office Suite — CI Validation & PostgreSQL 16 RLS
 
 on:
   push:
@@ -6,23 +6,30 @@ on:
   pull_request:
     branches: [main]
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
 jobs:
   validate:
-    name: Validate (licenses, typecheck, build, D1 tests)
+    name: Validate (hygiene, licenses, typecheck, build, tests, audit)
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: "24.22.3"
+          node-version: "22"
           cache: npm
 
       - name: Install dependencies
         run: npm ci --no-audit --no-fund
+
+      - name: Repository hygiene & gate boundary check
+        run: npm run lint:hygiene
 
       - name: Check dependency license compliance
         run: npm run lint:licenses
@@ -33,8 +40,48 @@ jobs:
       - name: Build API and Web
         run: npm run build
 
-      - name: Run D1 feasibility & vertical-slice tests
+      - name: Run full self-contained test suite
         run: npm test
 
       - name: Production dependency vulnerability audit
         run: npm audit --omit=dev --audit-level=high
+
+  postgres16-rls:
+    name: Live PostgreSQL 16 RLS, Privilege & Migration Verification
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: ci_ephemeral_pg16_password
+          POSTGRES_DB: aios_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U postgres -d aios_ci"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=10
+    env:
+      DATABASE_URL: postgres://postgres:ci_ephemeral_pg16_password@127.0.0.1:5432/aios_ci
+      TEST_POSTGRES_URL: postgres://postgres:ci_ephemeral_pg16_password@127.0.0.1:5432/aios_ci
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: Apply PostgreSQL 16 core + integration schemas
+        run: npm run db:migrate
+
+      - name: Verify least-privilege app_runtime & FORCE RLS catalogs
+        run: npm run db:verify-rls
+
+      - name: Run live PostgreSQL 16 RLS, concurrency & backup/restore suite
+        run: npx vitest run tests/d2-live-postgres16-rls.test.ts

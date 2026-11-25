@@ -47,6 +47,19 @@ export function runPolarsComparison(
     currencyTotals[String(row.currency)] = Math.round(Number(row.total_amt) * 100) / 100;
   }
 
+  const minorTotalsMap = new Map<string, bigint>();
+  for (const row of dedupDf.toRecords() as Array<Record<string, unknown>>) {
+    const code = String(row.currency ?? "USD").trim().toUpperCase();
+    const scale = code === "KHR" || code === "JPY" || code === "KRW" || code === "VND" ? 0 : 2;
+    const mult = scale === 0 ? 1 : 100;
+    const minor = BigInt(Math.round(Number(row.amount ?? 0) * mult));
+    minorTotalsMap.set(code, (minorTotalsMap.get(code) ?? 0n) + minor);
+  }
+  const currencyMinorTotals: Record<string, string> = {};
+  for (const [k, v] of Array.from(minorTotalsMap.entries()).sort(([a], [b]) => a.localeCompare(b))) {
+    currencyMinorTotals[k] = v.toString();
+  }
+
   return {
     engine: "polars",
     engineVersion: String(pl.version ?? "0.26.2"),
@@ -54,6 +67,7 @@ export function runPolarsComparison(
     duplicateCustomerKeys,
     unmatchedCustomerIds: Array.from(unmatchedIds).sort(),
     currencyTotals,
+    currencyMinorTotals,
     decimalDivisionSample: String(1000 / 3),
     externalAccessBlocked: true, // In-memory DataFrames only; no external URI loader invoked
   };

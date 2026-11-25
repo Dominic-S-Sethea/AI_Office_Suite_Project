@@ -49,8 +49,16 @@
    - **Policy-Keyed Cache Invalidation (`INT-T24`):** Policy narrowing immediately evicts stale cached results so prior broader scopes never leak across policy versions.
    - **Digest-Bound Approval & Complete-File Export Disclosure (`INT-T17`, `INT-T19`, `INT-T21`, `INT-T22`):** Post-approval manifest edits invalidate approvals (`409 APPROVAL_INVALIDATED`); atomic PostgreSQL publication commits `xi_reporting_packages`, `xi_artifacts`, `audit_logs`, and `xi_outbox_events` together under `app_runtime` RLS; external PPTX exports verify scoped chart series only (`$80k`, zero unauthorized departments/invoice IDs/speaker notes).
 
+10. **Sprint Hardening Controls (`documentation/SECURITY_AUDIT_REPORT.md`):**
+    - **Headless Chromium CSS/SSRF Lockdown:** Strict allowlist sanitizers for CSS colors/fonts and raster-only base64 image URIs (`pdfExporter.ts`, `slidePdfRenderer.ts`), offline `<meta Content-Security-Policy: default-src 'none'>`, and Chromium offline flags block CSS injection and metadata SSRF.
+    - **Auth Timing, Rate Limiting & HTTP Headers:** Constant-time dummy bcrypt check on unknown emails eliminates user-enumeration timing side-channels; memory-bounded sliding-window rate limits (`429 RATE_LIMITED`) protect `/api/auth/login` (IP+email bucket) and write/export endpoints; strict Helmet CSP (`default-src 'none'; frame-ancestors 'none'`) and `Cache-Control: no-store` protect API responses.
+    - **Bilingual & Obfuscation-Resistant Prompt Safety:** `scanForPromptInjection()` strips zero-width/bidi characters, NFKC-folds text, and detects Khmer injection/exfiltration directives, LLM role-framing tokens, and Markdown/HTML exfil links.
+    - **Durable Tenant-RLS AI Ledger & Concurrency Safety:** `ai_applied_operations` enforces `FORCE ROW LEVEL SECURITY` and revokes `UPDATE`/`DELETE` from `app_runtime`; `documents` row locks run without `JOIN` to avoid PostgreSQL `READ COMMITTED` EvalPlanQual phantom 404s.
+    - **Data Pipeline Isolation & BigInt Reconciliation:** `DataPreparationPipeline` scopes idempotency/history caches by `tenantId::workspaceId`, enforces RFC 4180 multi-line CSV bounds + header uniqueness, and reconciles currency totals via exact BigInt minor units (`FIN-POL-V1`).
+
 ## 2. Known Remaining Risks (Honest Disclosure)
 
-- Prototype `.local-data/` header auth (`provisional-local`) remains loopback-only when used for legacy D1 tests; production paths must run exclusively under `authMode: "jwt-pg"`.
-- `mammoth`, `exceljs`, and `fflate` parse untrusted OOXML/ZIP inputs in Node; keep dependencies patched and isolate file parsers inside worker containers (`apps/workers`) in production.
-- Hosted cloud PostgreSQL `16/17`, KMS secret rotation, inference suppression thresholds, and Playwright UI E2E audits remain gated for D3/Stage 6.
+- Prototype `.local-data/` header auth (`provisional-local`) remains loopback-only when used for legacy D1 tests; production deployments run exclusively under `AUTH_MODE=jwt-pg` (enforced fail-closed in `apps/api/src/server.ts`).
+- `mammoth`, `exceljs`, and `fflate` parse untrusted OOXML/ZIP inputs in Node; pre-decompression `fflate` filters block zip bombs/macros/traversal, and parsers should move into isolated worker containers (`apps/workers`) prior to pilot (`D8`/`D9`).
+- Multi-replica distributed rate limiting (Redis/WAF), hosted cloud PostgreSQL `16/17` KMS secret rotation, inference suppression thresholds, and Playwright UI E2E audits remain gated for `D3`/`D8`.
+

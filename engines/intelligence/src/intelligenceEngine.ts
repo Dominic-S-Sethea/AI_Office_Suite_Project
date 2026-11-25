@@ -706,6 +706,10 @@ export class IntelligenceStudioEngine {
     };
 
     if (!opts?.chartKindOverride) {
+      if (this.policyResultCache.size >= 500) {
+        const oldest = this.policyResultCache.keys().next().value;
+        if (oldest !== undefined) this.policyResultCache.delete(oldest);
+      }
       this.policyResultCache.set(cacheKey, structuredClone(response));
     }
 

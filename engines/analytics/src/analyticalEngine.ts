@@ -973,11 +973,16 @@ export function buildCrossModuleReconciledOutputs(
 }
 
 export async function benchmarkAnalyticsDuckDb(rowCount: number): Promise<AnalyticsStressResult> {
+  const safeRowCount = Math.trunc(rowCount);
+  if (!Number.isSafeInteger(safeRowCount) || safeRowCount < 1 || safeRowCount > 5_000_000) {
+    throw new RangeError(`benchmarkAnalyticsDuckDb rowCount must be an integer in [1, 5000000], got ${rowCount}`);
+  }
   const instance = await DuckDBInstance.create(":memory:");
   const conn = await instance.connect();
   try {
     await conn.run("SET memory_limit = '256MB'");
     await conn.run("SET threads = 2");
+    await conn.run("SET allow_unsigned_extensions = false");
     await conn.run(`
       CREATE TABLE bench_sales AS
       SELECT
@@ -990,8 +995,9 @@ export async function benchmarkAnalyticsDuckDb(rowCount: number): Promise<Analyt
         CAST(((i % 200) + 50) AS DECIMAL(18,2)) AS net_sales,
         CAST(((i % 100) + 20) AS DECIMAL(18,2)) AS cogs,
         CAST(((i % 30) + 10) AS DECIMAL(18,2)) AS opex
-      FROM range(0, ${Math.trunc(rowCount)}) t(i);
+      FROM range(0, ${safeRowCount}) t(i);
     `);
+    await conn.run("SET enable_external_access = false");
 
     const query = `
       SELECT department,
@@ -1015,7 +1021,7 @@ export async function benchmarkAnalyticsDuckDb(rowCount: number): Promise<Analyt
     samples.sort((a, b) => a - b);
     return {
       engine: "duckdb",
-      rowCount,
+      rowCount: safeRowCount,
       p50Ms: Math.round(samples[1]! * 100) / 100,
       p95Ms: Math.round(samples[2]! * 100) / 100,
       rssDeltaMb: Math.round(((rssAfter - rssBefore) / (1024 * 1024)) * 100) / 100,

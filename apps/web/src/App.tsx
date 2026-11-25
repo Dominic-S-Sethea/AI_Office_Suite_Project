@@ -1,8 +1,9 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ChangeEvent, type FormEvent } from "react";
 import type {
   ActorContext,
   AuditEvent,
   DocumentVersion,
+  PageLayoutConfig,
   StudioDocument,
   WorkspaceRole,
 } from "@ai-office-suite/shared-contracts";
@@ -10,7 +11,7 @@ import { PLANNED_FUTURE_STUDIOS } from "@ai-office-suite/shared-contracts";
 import { fromTiptapJson, toTiptapJson, type TiptapNode } from "@ai-office-suite/document-engine/tiptap-codec";
 import { DocumentEditor, type EditorSelectionState } from "./components/DocumentEditor.tsx";
 import { AiVoicePanel } from "./components/AiVoicePanel.tsx";
-import { VersionAuditDrawer } from "./components/VersionAuditDrawer.tsx";
+import { VersionAuditDrawer, type RevisionDiffPayload } from "./components/VersionAuditDrawer.tsx";
 
 type AuthMode = "provisional-local" | "jwt-pg";
 
@@ -21,6 +22,25 @@ async function safeReadJson(res: Response): Promise<Record<string, unknown>> {
     return { error: `Request failed with HTTP ${res.status}` };
   }
 }
+
+function arrayBufferToBase64(buffer: ArrayBuffer): string {
+  const bytes = new Uint8Array(buffer);
+  const chunkSize = 0x8000;
+  let binary = "";
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
+  }
+  return btoa(binary);
+}
+
+const DEFAULT_PAGE_LAYOUT: PageLayoutConfig = {
+  size: "A4",
+  orientation: "portrait",
+  marginsMm: { top: 20, right: 20, bottom: 20, left: 20 },
+  headerText: "AI Office Suite",
+  footerText: "Confidential",
+  showPageNumbers: true,
+};
 
 export function App() {
   const [authMode, setAuthMode] = useState<AuthMode>("provisional-local");
@@ -35,11 +55,32 @@ export function App() {
   const [loginWorkspaceId, setLoginWorkspaceId] = useState("");
   const [isAuthenticating, setIsAuthenticating] = useState(false);
 
+  // Documents & filters
   const [docs, setDocs] = useState<StudioDocument[]>([]);
+  const [totalDocs, setTotalDocs] = useState(0);
+  const [searchQuery, setSearchQuery] = useState("");
+  const [languageFilter, setLanguageFilter] = useState<"" | "en" | "km" | "bilingual">("");
   const [activeDoc, setActiveDoc] = useState<StudioDocument | null>(null);
   const activeDocIdRef = useRef<string | null>(null);
+
+  // Draft edits (content + metadata/layout)
   const [draftBlocks, setDraftBlocks] = useState<StudioDocument["blocks"] | null>(null);
+  const [draftTitle, setDraftTitle] = useState<string | null>(null);
+  const [draftLanguage, setDraftLanguage] = useState<StudioDocument["language"] | null>(null);
+  const [draftLayout, setDraftLayout] = useState<PageLayoutConfig | null>(null);
   const [selection, setSelection] = useState<EditorSelectionState>({ selectedText: "" });
+
+  // New blank document modal state
+  const [newDocModalOpen, setNewDocModalOpen] = useState(false);
+  const [newDocTitle, setNewDocTitle] = useState("");
+  const [newDocLanguage, setNewDocLanguage] = useState<"en" | "km" | "bilingual">("bilingual");
+  const [newDocSize, setNewDocSize] = useState<"A4" | "Letter">("A4");
+  const [newDocOrientation, setNewDocOrientation] = useState<"portrait" | "landscape">("portrait");
+  const [isCreatingDoc, setIsCreatingDoc] = useState(false);
+
+  // DOCX import state
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const [isImportingDocx, setIsImportingDocx] = useState(false);
 
   const [panelOpen, setPanelOpen] = useState(true);
   const [historyOpen, setHistoryOpen] = useState(false);
@@ -61,6 +102,15 @@ export function App() {
   const readOnly = effectiveRole === "viewer" || effectiveRole === "reviewer";
   const canExport = effectiveRole !== "viewer";
   const isAuthenticated = authMode === "provisional-local" || sessionActor !== null;
+  const hasUnsavedChanges =
+    draftBlocks !== null || draftTitle !== null || draftLanguage !== null || draftLayout !== null;
+
+  const clearDrafts = useCallback(() => {
+    setDraftBlocks(null);
+    setDraftTitle(null);
+    setDraftLanguage(null);
+    setDraftLayout(null);
+  }, []);
 
   // In jwt-pg mode, rely exclusively on HttpOnly `aios_session` cookie (never send spoofable prototype headers)
   const apiHeaders = useMemo((): Record<string, string> => {
@@ -124,18 +174,24 @@ export function App() {
     if (authMode === "jwt-pg") {
       setSessionActor(null);
       setDocs([]);
+      setTotalDocs(0);
       setActiveDoc(null);
-      setDraftBlocks(null);
+      clearDrafts();
       setErrorBanner("Session expired or revoked. Please sign in again.");
       setStatusMessage("Authentication required");
     }
-  }, [authMode]);
+  }, [authMode, clearDrafts]);
 
   const loadDocuments = useCallback(async () => {
     if (!authInitialized || !isAuthenticated) return;
     setIsLoadingDocs(true);
     try {
-      const res = await fetch("/api/documents", {
+      const qs = new URLSearchParams();
+      if (searchQuery.trim()) qs.set("q", searchQuery.trim());
+      if (languageFilter) qs.set("language", languageFilter);
+      qs.set("limit", "50");
+      const queryStr = qs.toString();
+      const res = await fetch(`/api/documents${queryStr ? `?${queryStr}` : ""}`, {
         credentials: "include",
         headers: apiHeaders,
       });
@@ -150,6 +206,7 @@ export function App() {
       }
       const list = (data.documents ?? []) as StudioDocument[];
       setDocs(list);
+      setTotalDocs(typeof data.total === "number" ? data.total : list.length);
       setErrorBanner(null);
 
       const currentId = activeDocIdRef.current;
@@ -158,17 +215,20 @@ export function App() {
       } else if (currentId) {
         const refreshed = list.find((d) => d.documentId === currentId);
         if (refreshed) setActiveDoc(refreshed);
-        else setActiveDoc(list[0] ?? null);
+        else if (!searchQuery.trim() && !languageFilter) setActiveDoc(list[0] ?? null);
       }
     } catch {
       setErrorBanner("Network error while loading workspace documents.");
     } finally {
       setIsLoadingDocs(false);
     }
-  }, [apiHeaders, authInitialized, isAuthenticated, handleUnauthorized]);
+  }, [apiHeaders, authInitialized, isAuthenticated, handleUnauthorized, searchQuery, languageFilter]);
 
   useEffect(() => {
-    void loadDocuments();
+    const timer = window.setTimeout(() => {
+      void loadDocuments();
+    }, 150);
+    return () => window.clearTimeout(timer);
   }, [loadDocuments]);
 
   async function handleLogin(e: FormEvent) {
@@ -212,8 +272,9 @@ export function App() {
     } finally {
       setSessionActor(null);
       setDocs([]);
+      setTotalDocs(0);
       setActiveDoc(null);
-      setDraftBlocks(null);
+      clearDrafts();
       setConflictMessage(null);
       setStatusMessage(revokeAll ? "All sessions revoked." : "Signed out.");
     }
@@ -238,12 +299,108 @@ export function App() {
       }
       const latest = data.document as StudioDocument;
       setActiveDoc(latest);
-      setDraftBlocks(null);
+      clearDrafts();
       setConflictMessage(null);
       setDocs((prev) => prev.map((d) => (d.documentId === latest.documentId ? latest : d)));
       setStatusMessage(`Reloaded latest revision ${latest.revision}.`);
     } catch {
       setErrorBanner("Network error reloading latest revision.");
+    }
+  }
+
+  async function handleCreateBlankDocument(e: FormEvent) {
+    e.preventDefault();
+    if (readOnly || isCreatingDoc || !newDocTitle.trim()) return;
+    setErrorBanner(null);
+    setIsCreatingDoc(true);
+    try {
+      const res = await fetch("/api/documents", {
+        method: "POST",
+        credentials: "include",
+        headers: { "Content-Type": "application/json", ...apiHeaders },
+        body: JSON.stringify({
+          title: newDocTitle.trim().normalize("NFC"),
+          language: newDocLanguage,
+          layout: {
+            ...DEFAULT_PAGE_LAYOUT,
+            size: newDocSize,
+            orientation: newDocOrientation,
+          },
+        }),
+      });
+      if (res.status === 401) {
+        setNewDocModalOpen(false);
+        handleUnauthorized();
+        return;
+      }
+      const data = await safeReadJson(res);
+      if (!res.ok) {
+        setErrorBanner(String(data.error ?? "Failed to create document."));
+        return;
+      }
+      const created = data.document as StudioDocument;
+      setActiveDoc(created);
+      clearDrafts();
+      setConflictMessage(null);
+      setNewDocModalOpen(false);
+      setNewDocTitle("");
+      await loadDocuments();
+      setStatusMessage(`Created '${created.title}' (${created.layout.size} ${created.layout.orientation}).`);
+    } catch {
+      setErrorBanner("Network error creating new document.");
+    } finally {
+      setIsCreatingDoc(false);
+    }
+  }
+
+  async function handleDocxFileSelected(e: ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0];
+    e.target.value = "";
+    if (!file || readOnly || isImportingDocx) return;
+    if (!file.name.toLowerCase().endsWith(".docx")) {
+      setErrorBanner("Only .docx files are supported for Document Studio import (.docm macros are blocked).");
+      return;
+    }
+    if (file.size > 15 * 1024 * 1024) {
+      setErrorBanner("DOCX file exceeds 15 MB safety limit.");
+      return;
+    }
+    setErrorBanner(null);
+    setConflictMessage(null);
+    setIsImportingDocx(true);
+    try {
+      const buf = await file.arrayBuffer();
+      const contentBase64 = arrayBufferToBase64(buf);
+      const res = await fetch("/api/documents/import/docx", {
+        method: "POST",
+        credentials: "include",
+        headers: { "Content-Type": "application/json", ...apiHeaders },
+        body: JSON.stringify({ filename: file.name, contentBase64 }),
+      });
+      if (res.status === 401) {
+        handleUnauthorized();
+        return;
+      }
+      const data = await safeReadJson(res);
+      if (!res.ok) {
+        setErrorBanner(String(data.error ?? "DOCX import failed."));
+        setStatusMessage("DOCX import rejected.");
+        return;
+      }
+      const created = data.document as StudioDocument;
+      const diagnostics = data.diagnostics as { originalSha256?: string; warnings?: string[] } | undefined;
+      setActiveDoc(created);
+      clearDrafts();
+      await loadDocuments();
+      const shaPrefix = diagnostics?.originalSha256?.slice(0, 10) ?? "verified";
+      const warnCount = diagnostics?.warnings?.length ?? 0;
+      setStatusMessage(
+        `Imported DOCX '${file.name}' (SHA-256 ${shaPrefix}${warnCount > 0 ? `, ${warnCount} warning(s)` : ""}).`,
+      );
+    } catch {
+      setErrorBanner("Network or read error importing DOCX file.");
+    } finally {
+      setIsImportingDocx(false);
     }
   }
 
@@ -266,7 +423,7 @@ export function App() {
       if (res.ok) {
         const created = data.document as StudioDocument;
         setActiveDoc(created);
-        setDraftBlocks(null);
+        clearDrafts();
         await loadDocuments();
         setStatusMessage("Loaded bilingual English/Khmer management report fixture.");
       } else {
@@ -281,8 +438,8 @@ export function App() {
     }
   }
 
-  async function handleSave() {
-    if (!activeDoc || !draftBlocks || readOnly || isSaving) return;
+  const handleSave = useCallback(async () => {
+    if (!activeDoc || !hasUnsavedChanges || readOnly || isSaving) return;
     setErrorBanner(null);
     setIsSaving(true);
     try {
@@ -292,7 +449,10 @@ export function App() {
         headers: { "Content-Type": "application/json", ...apiHeaders },
         body: JSON.stringify({
           expectedRevision: activeDoc.revision,
-          blocks: draftBlocks,
+          title: (draftTitle ?? activeDoc.title).trim().normalize("NFC"),
+          language: draftLanguage ?? activeDoc.language,
+          layout: draftLayout ?? activeDoc.layout,
+          blocks: draftBlocks ?? activeDoc.blocks,
           summary: "Manual editor save",
         }),
       });
@@ -313,7 +473,7 @@ export function App() {
       if (res.ok) {
         const saved = data.document as StudioDocument;
         setActiveDoc(saved);
-        setDraftBlocks(null);
+        clearDrafts();
         setConflictMessage(null);
         await loadDocuments();
         setStatusMessage(`Saved revision ${saved.revision}.`);
@@ -327,7 +487,32 @@ export function App() {
     } finally {
       setIsSaving(false);
     }
-  }
+  }, [
+    activeDoc,
+    hasUnsavedChanges,
+    readOnly,
+    isSaving,
+    apiHeaders,
+    draftTitle,
+    draftLanguage,
+    draftLayout,
+    draftBlocks,
+    handleUnauthorized,
+    clearDrafts,
+    loadDocuments,
+  ]);
+
+  // Keyboard shortcut: Ctrl+S / Cmd+S to save current document
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "s") {
+        e.preventDefault();
+        void handleSave();
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [handleSave]);
 
   async function handleExport(kind: "docx" | "pdf") {
     if (!activeDoc || !canExport || isExporting) return;
@@ -404,6 +589,30 @@ export function App() {
     }
   }
 
+  async function handleCompareRevision(fromRev: number, toRev: number): Promise<RevisionDiffPayload | null> {
+    if (!activeDoc) return null;
+    try {
+      const res = await fetch(
+        `/api/documents/${encodeURIComponent(activeDoc.documentId)}/versions/${fromRev}/diff/${toRev}`,
+        { credentials: "include", headers: apiHeaders },
+      );
+      if (res.status === 401) {
+        setHistoryOpen(false);
+        handleUnauthorized();
+        return null;
+      }
+      const data = await safeReadJson(res);
+      if (!res.ok) {
+        setErrorBanner(String(data.error ?? "Failed to compute revision diff."));
+        return null;
+      }
+      return (data.diff ?? null) as RevisionDiffPayload | null;
+    } catch {
+      setErrorBanner("Network error loading revision diff.");
+      return null;
+    }
+  }
+
   async function handleRestore(revision: number) {
     if (!activeDoc || readOnly || restoringRevision !== null) return;
     setErrorBanner(null);
@@ -426,7 +635,7 @@ export function App() {
       if (res.ok) {
         const restored = data.document as StudioDocument;
         setActiveDoc(restored);
-        setDraftBlocks(null);
+        clearDrafts();
         setConflictMessage(null);
         setHistoryOpen(false);
         await loadDocuments();
@@ -442,6 +651,27 @@ export function App() {
       setRestoringRevision(null);
     }
   }
+
+  function handleSelectDocument(nextDoc: StudioDocument) {
+    if (activeDoc?.documentId === nextDoc.documentId) return;
+    if (hasUnsavedChanges) {
+      const confirmed = window.confirm("You have unsaved changes on the current document. Discard and switch?");
+      if (!confirmed) return;
+    }
+    setActiveDoc(nextDoc);
+    clearDrafts();
+    setConflictMessage(null);
+  }
+
+  const effectiveActiveDoc = useMemo((): StudioDocument | null => {
+    if (!activeDoc) return null;
+    return {
+      ...activeDoc,
+      title: draftTitle ?? activeDoc.title,
+      language: draftLanguage ?? activeDoc.language,
+      layout: draftLayout ?? activeDoc.layout,
+    };
+  }, [activeDoc, draftTitle, draftLanguage, draftLayout]);
 
   const tiptapContent = useMemo(() => {
     return activeDoc
@@ -613,18 +843,42 @@ export function App() {
             <button
               type="button"
               className="btn primary"
-              disabled={readOnly || isSeeding}
-              onClick={() => void handleSeedBilingual()}
+              disabled={readOnly}
+              onClick={() => setNewDocModalOpen(true)}
             >
-              {isSeeding ? "Creating..." : "+ Bilingual EN/KM Report"}
+              + New Document
             </button>
             <button
               type="button"
               className="btn"
-              disabled={readOnly || !draftBlocks || isSaving}
+              disabled={readOnly || isSeeding}
+              onClick={() => void handleSeedBilingual()}
+            >
+              {isSeeding ? "Creating..." : "+ Bilingual EN/KM Sample"}
+            </button>
+            <button
+              type="button"
+              className="btn"
+              disabled={readOnly || isImportingDocx}
+              onClick={() => fileInputRef.current?.click()}
+            >
+              {isImportingDocx ? "Importing DOCX..." : "Import DOCX"}
+            </button>
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept=".docx"
+              style={{ display: "none" }}
+              onChange={(e) => void handleDocxFileSelected(e)}
+            />
+            <button
+              type="button"
+              className="btn"
+              disabled={readOnly || !hasUnsavedChanges || isSaving}
+              title="Save current changes (Ctrl+S / Cmd+S)"
               onClick={() => void handleSave()}
             >
-              {isSaving ? "Saving..." : `Save${draftBlocks ? " *" : ""}`}
+              {isSaving ? "Saving..." : `Save${hasUnsavedChanges ? " *" : ""}`}
             </button>
             <button type="button" className="btn" disabled={!activeDoc} onClick={() => void openHistory()}>
               Versions &amp; Audit
@@ -652,7 +906,7 @@ export function App() {
           <div className={`workspace-body ${panelOpen ? "" : "panel-collapsed"}`}>
             <aside className="sidebar" aria-label="Workspace Documents">
               <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-                <strong style={{ fontSize: 12 }}>Workspace Documents</strong>
+                <strong style={{ fontSize: 12 }}>Documents ({totalDocs})</strong>
                 <button
                   type="button"
                   className="btn"
@@ -663,6 +917,29 @@ export function App() {
                   {isLoadingDocs ? "..." : "Refresh"}
                 </button>
               </div>
+              <div className="sidebar-filters">
+                <input
+                  type="search"
+                  className="input-field"
+                  style={{ padding: "5px 8px", fontSize: 12 }}
+                  placeholder="Search title..."
+                  aria-label="Search documents by title"
+                  value={searchQuery}
+                  onChange={(e) => setSearchQuery(e.target.value)}
+                />
+                <select
+                  className="input-field"
+                  style={{ padding: "4px 8px", fontSize: 12 }}
+                  aria-label="Filter documents by language"
+                  value={languageFilter}
+                  onChange={(e) => setLanguageFilter(e.target.value as "" | "en" | "km" | "bilingual")}
+                >
+                  <option value="">All Languages</option>
+                  <option value="bilingual">Bilingual (EN/KM)</option>
+                  <option value="en">English</option>
+                  <option value="km">ខ្មែរ (Khmer)</option>
+                </select>
+              </div>
               {isLoadingDocs && docs.length === 0 && (
                 <div style={{ fontSize: 12, color: "#64748b" }} role="status">
                   Loading documents...
@@ -670,7 +947,9 @@ export function App() {
               )}
               {!isLoadingDocs && docs.length === 0 && (
                 <div style={{ fontSize: 12, color: "#64748b" }}>
-                  No documents yet. Click &ldquo;+ Bilingual EN/KM Report&rdquo; to begin.
+                  {searchQuery || languageFilter
+                    ? "No matching documents found."
+                    : 'No documents yet. Click "+ New Document" or "+ Bilingual EN/KM Sample".'}
                 </div>
               )}
               {docs.map((d) => (
@@ -678,35 +957,85 @@ export function App() {
                   key={d.documentId}
                   type="button"
                   className={`doc-item ${activeDoc?.documentId === d.documentId ? "selected" : ""}`}
-                  onClick={() => {
-                    setActiveDoc(d);
-                    setDraftBlocks(null);
-                    setConflictMessage(null);
-                  }}
+                  onClick={() => handleSelectDocument(d)}
                 >
                   <div style={{ fontWeight: 600 }}>{d.title}</div>
                   <div style={{ fontSize: 11, color: "#64748b" }}>
-                    Rev {d.revision} · {d.language}
+                    Rev {d.revision} · {d.language} · {d.layout.size}
                   </div>
                 </button>
               ))}
             </aside>
 
             <main className="canvas-area">
-              {activeDoc ? (
-                <DocumentEditor
-                  document={activeDoc}
-                  tiptapContent={tiptapContent}
-                  readOnly={readOnly}
-                  onDocChange={(json) => setDraftBlocks(fromTiptapJson(json as unknown as TiptapNode, activeDoc.blocks))}
-                  onSelectionChange={setSelection}
-                />
+              {effectiveActiveDoc && activeDoc ? (
+                <>
+                  <div className="doc-meta-bar" aria-label="Document Settings">
+                    <input
+                      type="text"
+                      className="input-field"
+                      disabled={readOnly}
+                      aria-label="Document title"
+                      value={effectiveActiveDoc.title}
+                      onChange={(e) => setDraftTitle(e.target.value)}
+                    />
+                    <select
+                      className="btn"
+                      disabled={readOnly}
+                      aria-label="Document language"
+                      value={effectiveActiveDoc.language}
+                      onChange={(e) => setDraftLanguage(e.target.value as StudioDocument["language"])}
+                    >
+                      <option value="bilingual">Bilingual</option>
+                      <option value="en">English</option>
+                      <option value="km">ខ្មែរ</option>
+                    </select>
+                    <select
+                      className="btn"
+                      disabled={readOnly}
+                      aria-label="Page size"
+                      value={effectiveActiveDoc.layout.size}
+                      onChange={(e) =>
+                        setDraftLayout({
+                          ...effectiveActiveDoc.layout,
+                          size: e.target.value as "A4" | "Letter",
+                        })
+                      }
+                    >
+                      <option value="A4">A4</option>
+                      <option value="Letter">Letter</option>
+                    </select>
+                    <select
+                      className="btn"
+                      disabled={readOnly}
+                      aria-label="Page orientation"
+                      value={effectiveActiveDoc.layout.orientation}
+                      onChange={(e) =>
+                        setDraftLayout({
+                          ...effectiveActiveDoc.layout,
+                          orientation: e.target.value as "portrait" | "landscape",
+                        })
+                      }
+                    >
+                      <option value="portrait">Portrait</option>
+                      <option value="landscape">Landscape</option>
+                    </select>
+                  </div>
+                  <DocumentEditor
+                    document={effectiveActiveDoc}
+                    tiptapContent={tiptapContent}
+                    readOnly={readOnly}
+                    onDocChange={(json) => setDraftBlocks(fromTiptapJson(json as unknown as TiptapNode, activeDoc.blocks))}
+                    onSelectionChange={setSelection}
+                  />
+                </>
               ) : (
                 <div className="preview-card" style={{ maxWidth: 460, marginTop: 60 }}>
                   <strong>Welcome to AI Office Suite</strong>
                   <span>
-                    Create a bilingual English &amp; Khmer document to test Tiptap editing, controlled AI operations,
-                    mock voice commands (<code>isMock: true</code>), DOCX round-trip, and HarfBuzz PDF export.
+                    Create a new document, import a <code>.docx</code> file, or load the bilingual English &amp; Khmer
+                    fixture to test Tiptap editing, controlled AI operations, mock voice commands (<code>isMock: true</code>),
+                    revision diffs, and HarfBuzz PDF export.
                   </span>
                 </div>
               )}
@@ -737,6 +1066,78 @@ export function App() {
         </span>
       </footer>
 
+      {newDocModalOpen && (
+        <div
+          className="modal-backdrop"
+          role="dialog"
+          aria-modal="true"
+          aria-label="Create New Document"
+          onClick={(e) => {
+            if (e.target === e.currentTarget) setNewDocModalOpen(false);
+          }}
+        >
+          <form className="modal-card" onSubmit={(e) => void handleCreateBlankDocument(e)}>
+            <h3 style={{ margin: 0 }}>Create New Document</h3>
+            <label>
+              Title
+              <input
+                type="text"
+                required
+                maxLength={200}
+                className="input-field"
+                value={newDocTitle}
+                onChange={(e) => setNewDocTitle(e.target.value)}
+                placeholder="e.g. របាយការណ៍ហិរញ្ញវត្ថុ Q4 / Q4 Finance Brief"
+              />
+            </label>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 8 }}>
+              <label>
+                Language
+                <select
+                  className="input-field"
+                  value={newDocLanguage}
+                  onChange={(e) => setNewDocLanguage(e.target.value as "en" | "km" | "bilingual")}
+                >
+                  <option value="bilingual">Bilingual</option>
+                  <option value="en">English</option>
+                  <option value="km">ខ្មែរ</option>
+                </select>
+              </label>
+              <label>
+                Page Size
+                <select
+                  className="input-field"
+                  value={newDocSize}
+                  onChange={(e) => setNewDocSize(e.target.value as "A4" | "Letter")}
+                >
+                  <option value="A4">A4</option>
+                  <option value="Letter">Letter</option>
+                </select>
+              </label>
+              <label>
+                Orientation
+                <select
+                  className="input-field"
+                  value={newDocOrientation}
+                  onChange={(e) => setNewDocOrientation(e.target.value as "portrait" | "landscape")}
+                >
+                  <option value="portrait">Portrait</option>
+                  <option value="landscape">Landscape</option>
+                </select>
+              </label>
+            </div>
+            <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginTop: 6 }}>
+              <button type="button" className="btn" onClick={() => setNewDocModalOpen(false)}>
+                Cancel
+              </button>
+              <button type="submit" className="btn primary" disabled={isCreatingDoc || !newDocTitle.trim()}>
+                {isCreatingDoc ? "Creating..." : "Create Document"}
+              </button>
+            </div>
+          </form>
+        </div>
+      )}
+
       {historyOpen && (
         <VersionAuditDrawer
           versions={versions}
@@ -746,6 +1147,7 @@ export function App() {
           isLoading={isLoadingHistory}
           restoringRevision={restoringRevision}
           onRestore={handleRestore}
+          onCompareRevision={handleCompareRevision}
           onClose={() => setHistoryOpen(false)}
         />
       )}
