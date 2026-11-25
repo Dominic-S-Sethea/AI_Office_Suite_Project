@@ -1,13 +1,16 @@
 import { spawn } from "node:child_process";
 
+const isWindows = process.platform === "win32";
+const npmCmd = isWindows ? "npm.cmd" : "npm";
+
 const children = [
   spawn(process.execPath, ["./node_modules/tsx/dist/cli.mjs", "apps/api/src/server.ts"], {
     stdio: "inherit",
     env: process.env,
   }),
-  spawn("npm.cmd", ["run", "dev", "--workspace=@ai-office-suite/web"], {
+  spawn(npmCmd, ["run", "dev", "--workspace=@ai-office-suite/web"], {
     stdio: "inherit",
-    shell: true,
+    shell: isWindows,
     env: process.env,
   }),
 ];

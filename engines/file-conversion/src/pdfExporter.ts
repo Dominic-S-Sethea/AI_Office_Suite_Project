@@ -2,7 +2,7 @@ import { execFile } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import type { DocumentBlock, StudioDocument, TextRun } from "@ai-office-suite/shared-contracts";
 
@@ -20,19 +20,76 @@ export class PdfExportError extends Error {
   }
 }
 
+function findInSystemPath(binaryNames: string[]): string | null {
+  const rawPath = process.env.PATH ?? "";
+  const dirs = rawPath.split(path.delimiter).filter(Boolean);
+  for (const dir of dirs) {
+    for (const name of binaryNames) {
+      const candidate = path.join(dir, name);
+      if (existsSync(candidate)) return candidate;
+    }
+  }
+  return null;
+}
+
 export function detectChromiumBinary(): string | null {
-  const envPath = process.env.CHROMIUM_PATH?.trim();
+  for (const envKey of ["CHROMIUM_PATH", "CHROME_PATH", "PUPPETEER_EXECUTABLE_PATH"] as const) {
+    const envPath = process.env[envKey]?.trim();
+    if (envPath && existsSync(envPath)) return envPath;
+  }
+
+  const candidates =
+    process.platform === "win32"
+      ? [
+          "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe",
+          "C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe",
+          "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+          "C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe",
+        ]
+      : process.platform === "darwin"
+        ? [
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+            "/Applications/Chromium.app/Contents/MacOS/Chromium",
+          ]
+        : [
+            "/usr/bin/chromium",
+            "/usr/bin/chromium-browser",
+            "/usr/bin/google-chrome",
+            "/usr/bin/google-chrome-stable",
+            "/usr/bin/microsoft-edge",
+            "/usr/bin/microsoft-edge-stable",
+            "/snap/bin/chromium",
+          ];
+
+  const fixedMatch = candidates.find((p) => existsSync(p));
+  if (fixedMatch) return fixedMatch;
+
+  const pathNames =
+    process.platform === "win32"
+      ? ["msedge.exe", "chrome.exe", "chromium.exe"]
+      : ["chromium", "chromium-browser", "google-chrome", "google-chrome-stable", "microsoft-edge"];
+  return findInSystemPath(pathNames);
+}
+
+export function detectLibreOfficeBinary(): string | null {
+  const envPath = process.env.LIBREOFFICE_PATH?.trim();
   if (envPath && existsSync(envPath)) return envPath;
 
-  const candidates = [
-    "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe",
-    "C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe",
-    "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
-    "/usr/bin/chromium",
-    "/usr/bin/chromium-browser",
-    "/usr/bin/google-chrome",
-  ];
-  return candidates.find((p) => existsSync(p)) ?? null;
+  const candidates =
+    process.platform === "win32"
+      ? [
+          "C:\\Program Files\\LibreOffice\\program\\soffice.exe",
+          "C:\\Program Files (x86)\\LibreOffice\\program\\soffice.exe",
+        ]
+      : process.platform === "darwin"
+        ? ["/Applications/LibreOffice.app/Contents/MacOS/soffice"]
+        : ["/usr/bin/soffice", "/usr/bin/libreoffice", "/usr/local/bin/soffice"];
+
+  const fixedMatch = candidates.find((p) => existsSync(p));
+  if (fixedMatch) return fixedMatch;
+
+  return findInSystemPath(process.platform === "win32" ? ["soffice.exe"] : ["soffice", "libreoffice"]);
 }
 
 function escapeHtml(text: string): string {
@@ -241,7 +298,7 @@ export async function exportToPdfBuffer(doc: StudioDocument): Promise<PdfExportR
 
   try {
     writeFileSync(htmlPath, buildPrintableHtml(doc), "utf8");
-    const fileUrl = `file:///${htmlPath.replace(/\\/g, "/")}`;
+    const fileUrl = pathToFileURL(htmlPath).href;
 
     await execFileAsync(
       browserPath,
@@ -299,7 +356,7 @@ export async function renderDocumentScreenshot(
 
   try {
     writeFileSync(htmlPath, buildPrintableHtml(doc), "utf8");
-    const fileUrl = `file:///${htmlPath.replace(/\\/g, "/")}`;
+    const fileUrl = pathToFileURL(htmlPath).href;
     await execFileAsync(
       browserPath,
       [

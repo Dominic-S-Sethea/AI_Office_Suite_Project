@@ -2,6 +2,7 @@ import { execFile } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import type {
   ChartSpec,
@@ -144,7 +145,7 @@ export async function exportPresentationPdf(deck: StudioPresentation): Promise<{
   const pdfPath = path.join(tmpDir, "deck.pdf");
   try {
     writeFileSync(htmlPath, buildPresentationHtml(deck), "utf8");
-    const fileUrl = `file:///${htmlPath.replace(/\\/g, "/")}`;
+    const fileUrl = pathToFileURL(htmlPath).href;
     await execFileAsync(
       browserPath,
       [
@@ -181,7 +182,7 @@ export async function renderPresentationSlideScreenshot(
   const htmlPath = path.join(tmpDir, "slide.html");
   try {
     writeFileSync(htmlPath, buildPresentationHtml(deck, slideIndex), "utf8");
-    const fileUrl = `file:///${htmlPath.replace(/\\/g, "/")}`;
+    const fileUrl = pathToFileURL(htmlPath).href;
     await execFileAsync(
       browserPath,
       [

@@ -25,10 +25,18 @@ const ALLOWED_EXACT = new Set([
 
 // Verified permissive transitive packages with non-SPDX metadata strings:
 // - buffers@0.1.1: pre-SPDX MIT/X11 package via exceljs -> unzipper -> binary
-// - nodejs-polars-win32-x64-msvc@0.26.2: MIT (parent nodejs-polars LICENSE verified MIT)
+// - nodejs-polars-*@0.26.2: MIT (parent nodejs-polars@0.26.2 LICENSE verified MIT;
+//   platform native packages declare "SEE LICENSE IN LICENSE")
 const VERIFIED_LEGACY_TRANSITIVE = new Set([
   "buffers@0.1.1",
   "nodejs-polars-win32-x64-msvc@0.26.2",
+  "nodejs-polars-linux-x64-gnu@0.26.2",
+  "nodejs-polars-linux-x64-musl@0.26.2",
+  "nodejs-polars-linux-arm64-gnu@0.26.2",
+  "nodejs-polars-linux-arm64-musl@0.26.2",
+  "nodejs-polars-darwin-x64@0.26.2",
+  "nodejs-polars-darwin-arm64@0.26.2",
+  "nodejs-polars-android-arm64@0.26.2",
 ]);
 
 const DISALLOWED_PATTERNS = [

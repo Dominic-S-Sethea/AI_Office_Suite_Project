@@ -5,7 +5,7 @@ import { describe, expect, it } from "vitest";
 import { zipSync, unzipSync } from "fflate";
 import type { ActorContext, ChartSpec, LinkedMetricReference } from "@ai-office-suite/shared-contracts";
 import { AuthorizationError } from "@ai-office-suite/authorization";
-import { countPdfPages } from "@ai-office-suite/file-conversion";
+import { countPdfPages, detectChromiumBinary } from "@ai-office-suite/file-conversion";
 import {
   CORPORATE_THEME_SLATE_V2,
   createGoldenManagementDeck,
@@ -374,15 +374,20 @@ describe("FR-06 PS-00 — Presentation Studio Feasibility, PPTX/PDF Round-Trip &
     expect(reimported.presentation.slides[0]!.title).toContain("របាយការណ៍គ្រប់គ្រងប្រចាំខែ");
 
     // PPT-T09 & PPT-T10: Render searchable 6-page HarfBuzz PDF + visual PNG screenshots (16:9)
-    const pdfRes = await exportPresentationPdf(sanitizedDeck);
-    expect(pdfRes.pdfBuffer.subarray(0, 5).toString("latin1")).toBe("%PDF-");
-    expect(countPdfPages(pdfRes.pdfBuffer)).toBe(6);
-    writeFileSync(path.join(artifactsDir, "management-review-deck.pdf"), pdfRes.pdfBuffer);
+    if (detectChromiumBinary()) {
+      const pdfRes = await exportPresentationPdf(sanitizedDeck);
+      expect(pdfRes.pdfBuffer.subarray(0, 5).toString("latin1")).toBe("%PDF-");
+      expect(countPdfPages(pdfRes.pdfBuffer)).toBe(6);
+      writeFileSync(path.join(artifactsDir, "management-review-deck.pdf"), pdfRes.pdfBuffer);
 
-    const shot1 = await renderPresentationSlideScreenshot(sanitizedDeck, 0, path.join(artifactsDir, "management-review-slide1.png"));
-    const shot2 = await renderPresentationSlideScreenshot(sanitizedDeck, 2, path.join(artifactsDir, "management-review-slide3-chart.png"));
-    expect(shot1.byteLength).toBeGreaterThan(5_000);
-    expect(shot2.byteLength).toBeGreaterThan(5_000);
+      const shot1 = await renderPresentationSlideScreenshot(sanitizedDeck, 0, path.join(artifactsDir, "management-review-slide1.png"));
+      const shot2 = await renderPresentationSlideScreenshot(sanitizedDeck, 2, path.join(artifactsDir, "management-review-slide3-chart.png"));
+      expect(shot1.byteLength).toBeGreaterThan(5_000);
+      expect(shot2.byteLength).toBeGreaterThan(5_000);
+    } else {
+      console.warn("DISCLOSURE: Skipping presentation HarfBuzz PDF/PNG render — no Chromium/Chrome/Edge binary detected on host.");
+      await expect(exportPresentationPdf(sanitizedDeck)).rejects.toMatchObject({ code: "PDF_RENDERER_UNAVAILABLE" });
+    }
 
     // Negative OOXML & PPT-T16 security tests: .pptm, OLE2 encrypted, ZIP path traversal, vbaProject.bin, prompt injection
     expect(() =>

@@ -22,17 +22,32 @@ export function resolveLocalSpeechPython(): string | null {
   const configured = process.env.FASTER_WHISPER_PYTHON?.trim();
   if (configured && existsSync(configured)) return configured;
 
-  const venvPy = path.join(repoRoot, ".venv-speech", "Scripts", "python.exe");
-  if (existsSync(venvPy)) return venvPy;
+  const venvCandidates =
+    process.platform === "win32"
+      ? [
+          path.join(repoRoot, ".venv-speech", "Scripts", "python.exe"),
+          path.join(repoRoot, ".venv-speech", "bin", "python3"),
+          path.join(repoRoot, ".venv-speech", "bin", "python"),
+        ]
+      : [
+          path.join(repoRoot, ".venv-speech", "bin", "python3"),
+          path.join(repoRoot, ".venv-speech", "bin", "python"),
+          path.join(repoRoot, ".venv-speech", "Scripts", "python.exe"),
+        ];
+  for (const candidate of venvCandidates) {
+    if (existsSync(candidate)) return candidate;
+  }
 
-  const winLocalPy = path.join(
-    process.env.LOCALAPPDATA ?? "",
-    "Programs",
-    "Python",
-    "Python312",
-    "python.exe",
-  );
-  if (winLocalPy && existsSync(winLocalPy)) return winLocalPy;
+  if (process.platform === "win32" && process.env.LOCALAPPDATA) {
+    const winLocalPy = path.join(
+      process.env.LOCALAPPDATA,
+      "Programs",
+      "Python",
+      "Python312",
+      "python.exe",
+    );
+    if (existsSync(winLocalPy)) return winLocalPy;
+  }
 
   return null;
 }
