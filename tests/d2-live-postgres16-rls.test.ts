@@ -86,6 +86,7 @@ describeLivePg("Phase 1 — Real PostgreSQL 16 Verification (RLS, Pooled Isolati
         xi_artifact_revisions,
         xi_artifacts,
         migration_batches,
+        ai_applied_operations,
         audit_logs,
         idempotency_keys,
         document_versions,
@@ -197,6 +198,7 @@ describeLivePg("Phase 1 — Real PostgreSQL 16 Verification (RLS, Pooled Isolati
       "document_versions",
       "idempotency_keys",
       "audit_logs",
+      "ai_applied_operations",
       "xi_artifacts",
       "xi_artifact_revisions",
       "xi_dependency_edges",
@@ -221,6 +223,12 @@ describeLivePg("Phase 1 — Real PostgreSQL 16 Verification (RLS, Pooled Isolati
       expect(row.relrowsecurity, `RLS enabled on ${row.relname}`).toBe(true);
       expect(row.relforcerowsecurity, `FORCE RLS enabled on ${row.relname}`).toBe(true);
     }
+
+    const readyRes = await fetch(`${baseUrl}/api/ready`);
+    expect(readyRes.status).toBe(200);
+    const readyJson = (await readyRes.json()) as { status: string; checks: { coreForceRlsEnabled: boolean } };
+    expect(readyJson.status).toBe("ready");
+    expect(readyJson.checks.coreForceRlsEnabled).toBe(true);
   });
 
   it("enforces FORCE RLS across reads, joins, cross-tenant writes, pooled transactions, and revokes audit/version tampering", async () => {

@@ -20,6 +20,7 @@ import { AuthorizationError, assertCanPerform, isWorkspaceRole } from "@ai-offic
 import {
   DatabaseConflictError,
   PostgreSqlDocumentRepository,
+  verifyDatabaseRlsReadiness,
   type PgDatabaseAdapter,
 } from "@ai-office-suite/database";
 import {
@@ -60,12 +61,15 @@ import { getSpeechAdapter, SpeechProviderError } from "@ai-office-suite/speech-e
 import { DocumentService } from "@ai-office-suite/documents-module";
 import { AiDocumentExecutor, AiPlanningError, planDocumentOperation } from "@ai-office-suite/ai-module";
 import { createSlidingWindowRateLimiter } from "./rateLimit.ts";
+import { createApiObservability } from "./observability.ts";
 
 export interface CreateApiAppOptions {
   storageDir?: string;
   inMemory?: boolean;
   authMode?: "provisional-local" | "jwt-pg";
   db?: PgDatabaseAdapter;
+  enableStructuredLogs?: boolean;
+  logSink?: (line: string) => void;
   rateLimit?: {
     enabled?: boolean;
     windowMs?: number;
@@ -96,7 +100,6 @@ export function createApiApp(options: CreateApiAppOptions = {}): Express {
   }
   const useJwtPg = authMode === "jwt-pg";
   const pgRepo = options.db ? new PostgreSqlDocumentRepository(options.db) : null;
-  const pgAppliedAiOps = new Map<string, StudioDocument>();
 
   const storageDir = options.storageDir ?? path.resolve(process.cwd(), process.env.LOCAL_STORAGE_DIR ?? ".local-data");
   const storage: DocumentStorageAdapter = options.inMemory
@@ -131,9 +134,14 @@ export function createApiApp(options: CreateApiAppOptions = {}): Express {
     windowMs: options.rateLimit?.windowMs ?? 60_000,
     maxRequests: options.rateLimit?.apiMaxPerWindow ?? 300,
   });
+  const observability = createApiObservability({
+    enableStructuredLogs: options.enableStructuredLogs,
+    sink: options.logSink,
+  });
 
   const app = express();
   app.disable("x-powered-by");
+  app.use(observability.middleware);
   app.use(
     helmet({
       contentSecurityPolicy: {
@@ -159,7 +167,8 @@ export function createApiApp(options: CreateApiAppOptions = {}): Express {
     if (
       req.path.startsWith("/api/auth") ||
       req.path.startsWith("/api/documents") ||
-      req.path.startsWith("/api/data-prep")
+      req.path.startsWith("/api/data-prep") ||
+      req.path.startsWith("/api/metrics")
     ) {
       res.setHeader("Cache-Control", "no-store, max-age=0");
       res.setHeader("Pragma", "no-cache");
@@ -183,6 +192,24 @@ export function createApiApp(options: CreateApiAppOptions = {}): Express {
     });
   });
 
+  app.get("/api/ready", async (_req, res) => {
+    if (!useJwtPg || !options.db) {
+      res.json({
+        status: "ready",
+        authMode,
+        checks: { storage: options.inMemory ? "in-memory" : "local-fs" },
+      });
+      return;
+    }
+    const report = await verifyDatabaseRlsReadiness(options.db);
+    res.status(report.ready ? 200 : 503).json({
+      status: report.ready ? "ready" : "degraded",
+      authMode,
+      engine: report.engine,
+      checks: report.checks,
+    });
+  });
+
   if (useJwtPg && options.db) {
     const db = options.db;
     const jwtMiddleware = createJwtAuthMiddleware(db, allowedOrigins);
@@ -190,6 +217,28 @@ export function createApiApp(options: CreateApiAppOptions = {}): Express {
     if (rateLimitEnabled) {
       app.use("/api/auth/login", loginLimiter.middleware);
     }
+
+    app.get("/api/metrics", jwtMiddleware, (req, res) => {
+      const authReq = req as AuthenticatedRequest;
+      if (authReq.actor?.role !== "owner" && authReq.actor?.role !== "administrator") {
+        res.status(403).json({
+          error: "Metrics endpoint requires owner or administrator role.",
+          code: "FORBIDDEN_ROLE",
+        });
+        return;
+      }
+      res.json({
+        service: "ai-office-suite-api",
+        authMode,
+        metrics: observability.getMetrics(),
+        rateLimits: {
+          enabled: rateLimitEnabled,
+          login: loginLimiter.getStats(),
+          api: apiLimiter.getStats(),
+        },
+        ...(db.getPoolStats ? { dbPool: db.getPoolStats() } : {}),
+      });
+    });
 
     app.post("/api/auth/login", async (req, res, next) => {
       try {
@@ -242,6 +291,24 @@ export function createApiApp(options: CreateApiAppOptions = {}): Express {
     app.use("/api/documents", jwtMiddleware);
     app.use("/api/speech", jwtMiddleware);
     app.use("/api/data-prep", jwtMiddleware);
+  } else {
+    app.get("/api/metrics", (req, res) => {
+      const actor = resolvePrototypeActor(req);
+      if (actor.role !== "owner" && actor.role !== "administrator") {
+        res.status(403).json({ error: "Metrics endpoint requires owner or administrator role.", code: "FORBIDDEN_ROLE" });
+        return;
+      }
+      res.json({
+        service: "ai-office-suite-api",
+        authMode,
+        metrics: observability.getMetrics(),
+        rateLimits: {
+          enabled: rateLimitEnabled,
+          login: loginLimiter.getStats(),
+          api: apiLimiter.getStats(),
+        },
+      });
+    });
   }
 
   const getActor = (req: Request): ActorContext => {
@@ -482,50 +549,26 @@ export function createApiApp(options: CreateApiAppOptions = {}): Express {
             "Explicit user approval is required before applying an AI or voice operation.",
           );
         }
-        const idemKey = `${actor.tenantId}::${actor.workspaceId}::${req.params.id}::${parsed.data.proposal.operationId}`;
-        const cached = pgAppliedAiOps.get(idemKey);
-        if (cached) {
-          res.json({
-            document: structuredClone(cached),
-            deduplicated: true,
-            appliedOperationId: parsed.data.proposal.operationId,
-          });
-          return;
-        }
-        const currentDoc = await pgRepo.getDocument(actor, req.params.id);
-        const prior =
-          parsed.data.proposal.action === "undo_last" && currentDoc.revision > 1
-            ? await pgRepo.getVersion(actor, req.params.id, currentDoc.revision - 1)
-            : null;
-        const { nextDoc, preview } = previewDocumentOperation(
-          currentDoc,
-          parsed.data.proposal,
-          prior?.snapshot ?? null,
-        );
-        const saved = await pgRepo.updateDocument(
+        const result = await pgRepo.applyAiOperationIdempotent({
           actor,
-          req.params.id,
-          parsed.data.proposal.expectedRevision,
-          (_cur, nextRevision) => ({
-            ...nextDoc,
-            revision: nextRevision,
-          }),
-          {
-            source: parsed.data.proposal.source === "voice_command" ? "voice_command" : "typed_ai",
-            action: "document.ai_applied",
-            summary: `[${parsed.data.proposal.source}] ${parsed.data.proposal.action}: ${preview.summary}`,
+          documentId: req.params.id,
+          operationId: parsed.data.proposal.operationId,
+          expectedRevision: parsed.data.proposal.expectedRevision,
+          source: parsed.data.proposal.source === "voice_command" ? "voice_command" : "typed_ai",
+          loadPriorForUndo: parsed.data.proposal.action === "undo_last",
+          buildNext: (currentDoc, priorSnapshot, nextRevision) => {
+            const { nextDoc, preview } = previewDocumentOperation(
+              currentDoc,
+              parsed.data.proposal,
+              priorSnapshot,
+            );
+            return {
+              updatedDoc: { ...nextDoc, revision: nextRevision },
+              summary: `[${parsed.data.proposal.source}] ${parsed.data.proposal.action}: ${preview.summary}`,
+            };
           },
-        );
-        if (pgAppliedAiOps.size >= 1000) {
-          const oldest = pgAppliedAiOps.keys().next().value;
-          if (oldest !== undefined) pgAppliedAiOps.delete(oldest);
-        }
-        pgAppliedAiOps.set(idemKey, structuredClone(saved));
-        res.json({
-          document: saved,
-          deduplicated: false,
-          appliedOperationId: parsed.data.proposal.operationId,
         });
+        res.json(result);
         return;
       }
       const result = await aiExecutor.applyProposal({
