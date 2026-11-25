@@ -34,6 +34,7 @@ engines/document          engines/file-conversion       engines/speech   engines
 [FR-05 AN-00 Spike]:  engines/analytics    (BusinessMetricRegistry, BigInt FIN-POL-V1, DuckDB exact analytics)
 [FR-06 PS-00 Spike]:  engines/presentation (StudioPresentation, PptxGenJS native PPTX, fflate import, HarfBuzz PDF/PNG)
 [FR-07 BI-00 Spike]:  engines/intelligence (Apache ECharts SSR SVG, Vega-Lite comparison, DataScopePolicy, FR-05 sync)
+[FR-08 XI-00 Spike]:  engines/integration  (Artifact Registry, LinkedObjectBinding, Dependency/Impact, Workflow Orchestrator, Reporting Package Manifest + PG RLS outbox)
 ```
 
 ## 3. Architectural Invariants
@@ -42,3 +43,4 @@ engines/document          engines/file-conversion       engines/speech   engines
 2. **Grid ≠ Corporate Database (FR-03 §13):** Spreadsheet cells are modeled separately from governed datasets (`LinkedMetricReference` carries `datasetId`, `datasetVersion`, `metricVersion`, and `mode: 'live_draft' | 'published_snapshot'`).
 3. **Adapter Replaceability:** Document editor, speech provider, AI planner, and storage backend sit behind explicit TypeScript interfaces so Phase D2+ infrastructure choices (e.g., PostgreSQL + S3 + live STT/LLM) swap cleanly without rewriting domain logic.
 4. **Heavy Worker Readiness:** DOCX/XLSX parsing and Chromium PDF rendering are stateless buffer-in/buffer-out functions in `engines/file-conversion` and `engines/calculation`, ready to move into `apps/workers` in D2.
+5. **One-Directional Linked Sync & Two-Stage Atomic Publication (`FR-08`):** Linked objects synchronize strictly `source -> target` unless explicitly detached, and multi-module Reporting Packages stage artifacts out-of-transaction before committing publication state, artifact revisions, `audit_logs`, and `xi_outbox_events` in one short PostgreSQL RLS transaction.

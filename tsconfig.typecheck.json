@@ -16,6 +16,7 @@
       "@ai-office-suite/analytics-engine": ["./engines/analytics/src/index.ts"],
       "@ai-office-suite/presentation-engine": ["./engines/presentation/src/index.ts"],
       "@ai-office-suite/intelligence-engine": ["./engines/intelligence/src/index.ts"],
+      "@ai-office-suite/integration-engine": ["./engines/integration/src/index.ts"],
       "@ai-office-suite/document-engine": ["./engines/document/src/index.ts"],
       "@ai-office-suite/document-engine/tiptap-codec": ["./engines/document/src/tiptapCodec.ts"],
       "@ai-office-suite/calculation-engine": ["./engines/calculation/src/index.ts"],

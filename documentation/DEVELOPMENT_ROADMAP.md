@@ -59,3 +59,11 @@
 | **BI-00** | `ChartSpec` adapter (`echarts@6.1.0` + Vega-Lite comparison), `DataScopePolicy` RLS/cache, Section 12 FR-05 sync, refresh/snapshot, deck bridge | **Complete (Local Feasibility Verified)** | Verified `BI-T01..T32` & `X-VIS-01..08`; `BI-T33..T34` pending P1 |
 | **ENG-BI-01 – ENG-BI-10** | Report model & D2 persistence, visual builder, FR-04/05 queries, drill-through, snapshots, AI/voice, presentation bridge, QA, Alpha | **Gated Pending BI-00 Review** | Production BI authoring requires founder sign-off |
 | **ENG-BI-11** | Expansion: governed alerts (`BI-T33`), scheduled refresh (`BI-T34`), advanced visuals | **Pending P1 Authorization** | Out of P0 MVP scope |
+
+## 7. Cross-Module Integration Workstream (`XI-00` .. `XI-10`, FR-08 §34)
+
+| Phase | Deliverable | Status | Notes |
+| :--- | :--- | :--- | :--- |
+| **XI-00** | Cross-module integration feasibility, PG RLS/outbox commit, shared `ArtifactReference`/`LinkedObjectBinding`/`ReportingPackageManifest`, EN/KM planner & `INT-T01..T24` | **Complete (Local Feasibility Verified)** | Verified `3/3` integration test blocks (`INT-T01..T24`) + `12/12` workspace suites |
+| **XI-01 – XI-09** | Production Artifact Registry, Linked Object Intelligence UI, dependency/impact explorer, refresh previews, durable worker workflows, Reporting Package Manager, live EN/KM AI & voice workflows, full QA/security audit | **Gated Pending XI-00 Review & Module/FR-09/FR-10 Gates** | Requires production studios (`D3`, `SS-01`, `DP-01`, `AN-01`, `PS-01`, `ENG-BI-01`) + hosted PostgreSQL/object storage |
+| **XI-10** | Advanced automation (`INT-04.01` scheduled refresh, `INT-04.02` visual builder, `INT-04.03` external connectors) | **Pending P1 Authorization** | Out of P0 MVP scope |

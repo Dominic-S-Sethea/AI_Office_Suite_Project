@@ -1,5 +1,12 @@
 # Changelog — AI Office Suite
 
+## [0.5.0-xi00] — 2026-11-26 (FR-08 XI-00 Cross-Module Integration Feasibility)
+
+### Added & Verified
+- **Cross-Module Integration Layer (`engines/integration`, `XI-00`):** Added shared `ArtifactReference`, `ArtifactRevisionReference`, `DatasetVersionReference`, `MetricReference`, `AnalyticalResultReference`, `LinkedObjectBinding` (one-way `source -> target`, `independent_copy | refreshable_link | pinned_snapshot`), `ReportingContext`, `DependencyEdge`, `WorkflowRun`, `RefreshProposal`, `ReportingPackageManifest`, and `PublicationApproval`, extending `LinkedMetricReference` cleanly in place.
+- **PostgreSQL RLS & Transactional Outbox (`engines/integration/src/pgPersistence.ts`):** Added tenant-isolated `xi_artifacts`, `xi_artifact_revisions`, `xi_dependency_edges`, `xi_workflow_runs`, `xi_reporting_packages`, `xi_package_approvals`, and `xi_outbox_events` tables under `app_runtime` RLS with atomic short publication transactions, rollback verification, and worker-restart workflow rehydration.
+- **Full `INT-T01..T24` & EN/KM Parity Verification (`tests/g1-xi00-cross-module-integration.test.ts`):** Verified cross-module synchronization across Workbook (`recalculateWorkbook`), Document (`DocumentService`), Dashboard (`IntelligenceStudioEngine`), Presentation (`PresentationWorkspaceStore` + `pptxgenjs`), V1/V2/V3 schema/metric lifecycle, dependency redaction, mid-workflow revocation, disclosure PPTX export, policy cache invalidation, and bilingual EN/KM `planCrossModuleWorkflow()`.
+
 ## [0.4.0-ps00-bi00] — 2026-11-26 (FR-06 PS-00 Presentation & FR-07 BI-00 Intelligence Studio Feasibility)
 
 ### Added & Verified

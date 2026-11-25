@@ -14,6 +14,7 @@ export default defineConfig({
       "@ai-office-suite/analytics-engine": path.resolve(__dirname, "engines/analytics/src/index.ts"),
       "@ai-office-suite/presentation-engine": path.resolve(__dirname, "engines/presentation/src/index.ts"),
       "@ai-office-suite/intelligence-engine": path.resolve(__dirname, "engines/intelligence/src/index.ts"),
+      "@ai-office-suite/integration-engine": path.resolve(__dirname, "engines/integration/src/index.ts"),
       "@ai-office-suite/document-engine": path.resolve(__dirname, "engines/document/src/index.ts"),
       "@ai-office-suite/calculation-engine": path.resolve(__dirname, "engines/calculation/src/index.ts"),
       "@ai-office-suite/data-processing": path.resolve(__dirname, "engines/data-processing/src/index.ts"),

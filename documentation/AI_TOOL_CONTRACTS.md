@@ -92,3 +92,8 @@ Validates all typed/mock English & Khmer commands in `PresentationWorkspaceStore
 
 - **`planBiDashboardCommand` (`isMockPlanner: true`):** Bounded EN/KM operation resolution (`set_department_filter`, `set_chart_type`, `query_metric`, `create_presentation_draft`) sanitized via `scanForUnsafeAnalyticalInput()`.
 - **`ChartSpec` & `ChartDataBinding`:** Shared chart payload validated via `validateChartSpecSafety()` (no `<script>`, URLs, or JS callbacks) and compiled uniformly by Apache ECharts SSR (`engines/intelligence/src/chartAdapters.ts`), Vega-Lite comparison JSON, and `PptxGenJS` native OOXML chart generation (`engines/presentation/src/pptxExporter.ts`).
+
+## 6. Cross-Module Integration & Workflow Operation Registry (`FR-08 XI-00`)
+
+- **`planCrossModuleWorkflow()` (`engines/integration/src/aiWorkflowPlanner.ts`, `isMockPlanner: true`):** Parses equivalent English and Khmer multi-module instructions (FR-08 §14 & §16), requests clarification when reporting period/context is missing, enforces `requiresApproval: true`, and refuses unapproved direct package publication (`blockedDirectExecution: true`).
+- **Allowlisted Cross-Module Tool Targets:** `find_artifacts`, `get_artifact_metadata`, `resolve_reporting_context`, `execute_metric_query`, `get_verified_result`, `insert_linked_metric`, `insert_linked_chart`, `check_source_updates`, `preview_refresh`, `create_workflow_plan`, `run_workflow_step`, `reconcile_artifact_metrics`, `validate_package`, `request_package_review`, `publish_approved_package` (requires matching digest-bound `PublicationApproval`), `cancel_workflow`, `resume_workflow`, `restore_revision`.

@@ -1,0 +1,23 @@
+{
+  "name": "@ai-office-suite/integration-engine",
+  "version": "0.1.0-xi00",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "@ai-office-suite/analytics-engine": "*",
+    "@ai-office-suite/audit": "*",
+    "@ai-office-suite/authorization": "*",
+    "@ai-office-suite/calculation-engine": "*",
+    "@ai-office-suite/database": "*",
+    "@ai-office-suite/document-engine": "*",
+    "@ai-office-suite/documents-module": "*",
+    "@ai-office-suite/intelligence-engine": "*",
+    "@ai-office-suite/presentation-engine": "*",
+    "@ai-office-suite/shared-contracts": "*",
+    "@ai-office-suite/storage": "*",
+    "@ai-office-suite/validation": "*"
+  }
+}

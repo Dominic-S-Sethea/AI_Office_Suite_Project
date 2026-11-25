@@ -824,16 +824,28 @@ export class PresentationWorkspaceStore {
     actor: ActorContext,
     presentationId: string,
     updatedRefsByMetricId: Record<string, LinkedMetricReference>,
+    opts?: {
+      scopeLabel?: string;
+      chartSpecBySlideId?: Record<string, ChartSpec>;
+      tableRowsBySlideId?: Record<string, string[][]>;
+    },
   ): StudioPresentation {
     assertCanPerform(actor, "document", "write");
     const deck = this.getDeck(actor, presentationId);
     deck.status = "draft";
     deck.publishedSnapshotHash = undefined;
+    if (opts?.scopeLabel) {
+      deck.scopeLabel = opts.scopeLabel;
+    }
     for (const slide of deck.slides) {
       slide.sourceRefs = slide.sourceRefs.map((ref) => updatedRefsByMetricId[ref.metricId] ?? ref);
       for (const el of slide.elements) {
         if (el.type === "metric" && updatedRefsByMetricId[el.metricRef.metricId]) {
           el.metricRef = structuredClone(updatedRefsByMetricId[el.metricRef.metricId]!);
+        } else if (el.type === "chart" && opts?.chartSpecBySlideId?.[slide.slideId]) {
+          el.chartSpec = structuredClone(opts.chartSpecBySlideId[slide.slideId]!);
+        } else if (el.type === "table" && opts?.tableRowsBySlideId?.[slide.slideId]) {
+          el.rows = structuredClone(opts.tableRowsBySlideId[slide.slideId]!);
         }
       }
     }

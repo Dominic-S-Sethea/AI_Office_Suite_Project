@@ -316,6 +316,10 @@ export class IntelligenceStudioEngine {
     this.revokedPrincipals.add(`${tenantId}::${userId}`);
   }
 
+  invalidatePolicyCache(): void {
+    this.policyResultCache.clear();
+  }
+
   private assertNotRevoked(actor: ActorContext): void {
     if (this.revokedPrincipals.has(`${actor.tenantId}::${actor.userId}`)) {
       throw new IntelligenceEngineError(403, "ACCESS_REVOKED", "User access has been revoked; historical and live retrieval denied.");

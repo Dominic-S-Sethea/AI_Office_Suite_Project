@@ -1,5 +1,9 @@
 import { z } from "zod";
-import type { DocumentOperationProposal, StudioDocument } from "@ai-office-suite/shared-contracts";
+import type {
+  DocumentOperationProposal,
+  ReportingPackageManifest,
+  StudioDocument,
+} from "@ai-office-suite/shared-contracts";
 
 export const workspaceRoleSchema = z.enum([
   "owner",
@@ -447,6 +451,33 @@ export function validateChartSpecSafety(spec: {
   return {
     safe: reasons.length === 0,
     reasons: Array.from(new Set(reasons)),
+  };
+}
+
+export function validateReportingManifestSafety(manifest: ReportingPackageManifest): {
+  valid: boolean;
+  errors: string[];
+} {
+  const errors: string[] = [];
+  const titleSafety = scanForPromptInjection(manifest.title, manifest.audiencePolicy);
+  if (!titleSafety.safe) {
+    errors.push(...titleSafety.reasons);
+  }
+  if (!/^[a-f0-9]{64}$/i.test(manifest.manifestDigestSha256)) {
+    errors.push("Manifest digest must be a 64-character hex SHA-256 hash.");
+  }
+  if (manifest.artifactRevisions.length === 0) {
+    errors.push("Reporting package manifest must reference at least one artifact revision.");
+  }
+  if (Object.keys(manifest.fileChecksums).length === 0) {
+    errors.push("Reporting package manifest must include file integrity checksums.");
+  }
+  if (manifest.approval && manifest.approval.manifestDigestSha256 !== manifest.manifestDigestSha256) {
+    errors.push("Publication approval digest does not match current manifest digest.");
+  }
+  return {
+    valid: errors.length === 0,
+    errors,
   };
 }
 

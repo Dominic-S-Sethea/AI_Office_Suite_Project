@@ -43,6 +43,12 @@
    - **Export Disclosure:** `ExportDisclosurePolicy` strips hidden slides & speaker notes when prohibited by policy, and BI detail export is blocked (`403 UNDERLYING_EXPORT_DENIED`) when `canExportUnderlyingDetail = false`.
    - **DataScopePolicy, Cache Keying & Chart Sanitization:** Every BI query intersects requested filters with server `DataScopePolicy` (`allowedDepartments`, `allowedColumns`), includes `policyId:policyVersion` + scope in cache keys (`BI-T18`), revokes historical snapshot access immediately (`BI-T19`), and rejects unsafe `<script`/URI/callback payloads via `validateChartSpecSafety()`.
 
+9. **FR-08 Cross-Module Integration Controls (`XI-00`):**
+   - **BOLA & Linked-Object Authorization (`INT-T10`, `INT-T11`):** Creating or refreshing linked objects checks both source-read (dataset/columns/departments) and destination-write permissions; workflows re-evaluate actor revocation & RBAC before every step.
+   - **Confidentiality Redaction in Dependency Graphs (`INT-T20`):** `inspectDependencies()` filters edges against classification, department, and column scope, omitting restricted artifact IDs and titles completely.
+   - **Policy-Keyed Cache Invalidation (`INT-T24`):** Policy narrowing immediately evicts stale cached results so prior broader scopes never leak across policy versions.
+   - **Digest-Bound Approval & Complete-File Export Disclosure (`INT-T17`, `INT-T19`, `INT-T21`, `INT-T22`):** Post-approval manifest edits invalidate approvals (`409 APPROVAL_INVALIDATED`); atomic PostgreSQL publication commits `xi_reporting_packages`, `xi_artifacts`, `audit_logs`, and `xi_outbox_events` together under `app_runtime` RLS; external PPTX exports verify scoped chart series only (`$80k`, zero unauthorized departments/invoice IDs/speaker notes).
+
 ## 2. Known Remaining Risks (Honest Disclosure)
 
 - Prototype `.local-data/` header auth (`provisional-local`) remains loopback-only when used for legacy D1 tests; production paths must run exclusively under `authMode: "jwt-pg"`.
