@@ -515,4 +515,40 @@ export function validateReportingManifestSafety(manifest: ReportingPackageManife
   };
 }
 
+export const listDocumentsQuerySchema = z.object({
+  q: z.string().trim().max(120).optional(),
+  language: z.enum(["en", "km", "bilingual"]).optional(),
+  limit: z.coerce.number().int().min(1).max(100).optional(),
+  offset: z.coerce.number().int().min(0).max(100_000).optional(),
+});
+
+export const dataPrepStageProfileSchema = z.object({
+  filename: z.string().trim().min(1).max(200),
+  csvText: z.string().min(1).max(5_000_000),
+  delimiter: z.enum([",", ";", "\t", "auto"]).optional(),
+  profileScope: z.enum(["sample", "full"]).default("full"),
+  sampleSize: z.number().int().min(1).max(200).optional(),
+  expectedColumns: z.array(z.string().min(1).max(120)).max(200).optional(),
+  steps: z
+    .array(
+      z.object({
+        stepId: z.string().min(1).max(80),
+        op: z.enum([
+          "trim_normalize",
+          "normalize_khmer_numerals",
+          "parse_date_locale",
+          "quarantine_missing_required",
+          "validate_schema_contract",
+          "mask_pii_columns",
+          "map_bilingual_dictionary",
+          "deduplicate_composite_key",
+        ]),
+        params: z.record(z.string(), z.unknown()),
+      }),
+    )
+    .max(30)
+    .optional(),
+});
+
 export type ValidatedStudioDocument = StudioDocument;
+

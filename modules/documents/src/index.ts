@@ -188,6 +188,29 @@ export class DocumentService {
     return this.storage.listDocuments(actor.tenantId, actor.workspaceId);
   }
 
+  async listDocumentsFiltered(
+    actor: ActorContext,
+    filter: { q?: string; language?: "en" | "km" | "bilingual"; limit?: number; offset?: number } = {},
+  ): Promise<{ documents: StudioDocument[]; total: number; limit: number; offset: number }> {
+    assertCanPerform(actor, "document", "read");
+    const limit = Math.max(1, Math.min(100, Math.trunc(filter.limit ?? 50)));
+    const offset = Math.max(0, Math.trunc(filter.offset ?? 0));
+    const qLower = filter.q?.trim().toLowerCase() ?? "";
+
+    const all = await this.storage.listDocuments(actor.tenantId, actor.workspaceId);
+    const filtered = all.filter((doc) => {
+      if (filter.language && doc.language !== filter.language) return false;
+      if (qLower && !doc.title.toLowerCase().includes(qLower)) return false;
+      return true;
+    });
+    return {
+      documents: filtered.slice(offset, offset + limit),
+      total: filtered.length,
+      limit,
+      offset,
+    };
+  }
+
   async getDocument(actor: ActorContext, documentId: string): Promise<StudioDocument> {
     assertCanPerform(actor, "document", "read");
     const doc = await this.storage.getDocument(documentId);

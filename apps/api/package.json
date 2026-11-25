@@ -17,6 +17,7 @@
     "@ai-office-suite/storage": "*",
     "@ai-office-suite/audit": "*",
     "@ai-office-suite/document-engine": "*",
+    "@ai-office-suite/data-processing": "*",
     "@ai-office-suite/file-conversion": "*",
     "@ai-office-suite/speech-engine": "*",
     "@ai-office-suite/documents-module": "*",

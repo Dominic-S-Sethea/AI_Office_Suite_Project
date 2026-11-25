@@ -134,18 +134,59 @@ export class PostgreSqlDocumentRepository {
   }
 
   async listDocuments(actor: ActorContext): Promise<StudioDocument[]> {
+    const res = await this.listDocumentsFiltered(actor, { limit: 100, offset: 0 });
+    return res.documents;
+  }
+
+  async listDocumentsFiltered(
+    actor: ActorContext,
+    filter: { q?: string; language?: "en" | "km" | "bilingual"; limit?: number; offset?: number } = {},
+  ): Promise<{ documents: StudioDocument[]; total: number; limit: number; offset: number }> {
     assertCanPerform(actor, "document", "read");
+    const limit = Math.max(1, Math.min(100, Math.trunc(filter.limit ?? 50)));
+    const offset = Math.max(0, Math.trunc(filter.offset ?? 0));
+    const qTrim = filter.q?.trim();
+    const escapedLike = qTrim
+      ? `%${qTrim.replace(/[\\%_]/g, (m) => `\\${m}`)}%`
+      : null;
+
     return withTenantTransaction(this.db, actor.tenantId, async (tx) => {
+      const conditions: string[] = ["d.workspace_id = $1::uuid"];
+      const params: unknown[] = [actor.workspaceId];
+
+      if (filter.language) {
+        params.push(filter.language);
+        conditions.push(`d.language = $${params.length}`);
+      }
+      if (escapedLike) {
+        params.push(escapedLike);
+        conditions.push(`d.title ILIKE $${params.length} ESCAPE '\\'`);
+      }
+
+      const whereSql = conditions.join(" AND ");
+      const countRes = await tx.query<{ total: string }>(
+        `SELECT COUNT(*)::text AS total FROM documents d WHERE ${whereSql}`,
+        params,
+      );
+      const total = Number(countRes.rows[0]?.total ?? 0);
+
+      const pageParams = [...params, limit, offset];
       const res = await tx.query<{ snapshot_json: StudioDocument | string }>(
         `SELECT v.snapshot_json
          FROM documents d
          JOIN document_versions v
            ON v.tenant_id = d.tenant_id AND v.document_id = d.document_id AND v.revision = d.current_revision
-         WHERE d.workspace_id = $1::uuid
-         ORDER BY d.updated_at DESC`,
-        [actor.workspaceId],
+         WHERE ${whereSql}
+         ORDER BY d.updated_at DESC
+         LIMIT $${pageParams.length - 1} OFFSET $${pageParams.length}`,
+        pageParams,
       );
-      return res.rows.map((r) => parseSnapshot(r.snapshot_json));
+      return {
+        documents: res.rows.map((r) => parseSnapshot(r.snapshot_json)),
+        total,
+        limit,
+        offset,
+      };
     });
   }
 
