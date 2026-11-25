@@ -50,12 +50,19 @@ import {
 import { getSpeechAdapter, SpeechProviderError } from "@ai-office-suite/speech-engine";
 import { DocumentService } from "@ai-office-suite/documents-module";
 import { AiDocumentExecutor, AiPlanningError, planDocumentOperation } from "@ai-office-suite/ai-module";
+import { createSlidingWindowRateLimiter } from "./rateLimit.ts";
 
 export interface CreateApiAppOptions {
   storageDir?: string;
   inMemory?: boolean;
   authMode?: "provisional-local" | "jwt-pg";
   db?: PgDatabaseAdapter;
+  rateLimit?: {
+    enabled?: boolean;
+    windowMs?: number;
+    loginMaxPerWindow?: number;
+    apiMaxPerWindow?: number;
+  };
 }
 
 function safeDownloadFilename(raw: string): string {
@@ -98,10 +105,37 @@ export function createApiApp(options: CreateApiAppOptions = {}): Express {
     .map((s) => s.trim())
     .filter(Boolean);
 
+  const rateLimitEnabled = options.rateLimit?.enabled ?? process.env.NODE_ENV !== "test";
+  const loginLimiter = createSlidingWindowRateLimiter({
+    windowMs: options.rateLimit?.windowMs ?? 60_000,
+    maxRequests: options.rateLimit?.loginMaxPerWindow ?? 15,
+    keyGenerator: (req) => {
+      const ip = req.ip || req.socket?.remoteAddress || "unknown";
+      const email =
+        typeof req.body === "object" && req.body !== null && typeof (req.body as { email?: unknown }).email === "string"
+          ? (req.body as { email: string }).email.trim().toLowerCase().slice(0, 120)
+          : "";
+      return `login:${ip}:${email}`;
+    },
+  });
+  const apiLimiter = createSlidingWindowRateLimiter({
+    windowMs: options.rateLimit?.windowMs ?? 60_000,
+    maxRequests: options.rateLimit?.apiMaxPerWindow ?? 300,
+  });
+
   const app = express();
+  app.disable("x-powered-by");
   app.use(
     helmet({
-      contentSecurityPolicy: false,
+      contentSecurityPolicy: {
+        directives: {
+          defaultSrc: ["'none'"],
+          frameAncestors: ["'none'"],
+          baseUri: ["'none'"],
+          formAction: ["'none'"],
+        },
+      },
+      referrerPolicy: { policy: "no-referrer" },
     }),
   );
   app.use(
@@ -111,10 +145,19 @@ export function createApiApp(options: CreateApiAppOptions = {}): Express {
     }),
   );
   app.use(express.json({ limit: "25mb" }));
-  app.use((_req, res, next) => {
+  app.use((req, res, next) => {
     res.setHeader("X-Auth-Mode", useJwtPg ? "jwt-postgresql-rls" : "provisional-local-prototype");
+    if (req.path.startsWith("/api/auth") || req.path.startsWith("/api/documents")) {
+      res.setHeader("Cache-Control", "no-store, max-age=0");
+      res.setHeader("Pragma", "no-cache");
+    }
     next();
   });
+
+  if (rateLimitEnabled) {
+    app.use("/api/documents", apiLimiter.middleware);
+    app.use("/api/speech", apiLimiter.middleware);
+  }
 
   app.get("/api/health", (_req, res) => {
     res.json({
@@ -129,6 +172,10 @@ export function createApiApp(options: CreateApiAppOptions = {}): Express {
   if (useJwtPg && options.db) {
     const db = options.db;
     const jwtMiddleware = createJwtAuthMiddleware(db, allowedOrigins);
+
+    if (rateLimitEnabled) {
+      app.use("/api/auth/login", loginLimiter.middleware);
+    }
 
     app.post("/api/auth/login", async (req, res, next) => {
       try {
@@ -421,6 +468,10 @@ export function createApiApp(options: CreateApiAppOptions = {}): Express {
             summary: `[${parsed.data.proposal.source}] ${parsed.data.proposal.action}: ${preview.summary}`,
           },
         );
+        if (pgAppliedAiOps.size >= 1000) {
+          const oldest = pgAppliedAiOps.keys().next().value;
+          if (oldest !== undefined) pgAppliedAiOps.delete(oldest);
+        }
         pgAppliedAiOps.set(idemKey, structuredClone(saved));
         res.json({
           document: saved,

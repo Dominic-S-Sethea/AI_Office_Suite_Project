@@ -215,6 +215,9 @@ export function verifySessionToken(token: string): SessionTokenClaims | null {
   }
 }
 
+// Constant-time sentinel bcrypt hash (cost 10, matches hashPassword) to prevent user-enumeration timing side-channels.
+const DUMMY_BCRYPT_HASH = "$2b$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy";
+
 export async function authenticateUserWithPassword(params: {
   db: PgDatabaseAdapter;
   email: string;
@@ -233,7 +236,8 @@ export async function authenticateUserWithPassword(params: {
     [params.email.trim()],
   );
   const user = userRes.rows[0];
-  if (!user || !(await verifyPassword(params.password, user.password_hash))) {
+  const passwordOk = await verifyPassword(params.password, user ? user.password_hash : DUMMY_BCRYPT_HASH);
+  if (!user || !passwordOk) {
     throw new AuthenticationError(401, "INVALID_CREDENTIALS", "Invalid email or password.");
   }
   if (user.status !== "active") {

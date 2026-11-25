@@ -92,12 +92,96 @@ export function detectLibreOfficeBinary(): string | null {
   return findInSystemPath(process.platform === "win32" ? ["soffice.exe"] : ["soffice", "libreoffice"]);
 }
 
+const SAFE_CSS_NAMED_COLORS = new Set([
+  "black",
+  "white",
+  "red",
+  "blue",
+  "green",
+  "yellow",
+  "gray",
+  "grey",
+  "navy",
+  "teal",
+  "orange",
+  "purple",
+  "silver",
+  "maroon",
+  "olive",
+  "lime",
+  "aqua",
+  "fuchsia",
+  "transparent",
+  "inherit",
+  "currentcolor",
+]);
+
+export const PDF_RENDER_CSP_META =
+  `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; font-src data: file:; img-src data:;" />`;
+
+export const HARDENED_CHROMIUM_BASE_ARGS: readonly string[] = [
+  "--headless=new",
+  "--disable-gpu",
+  "--no-sandbox",
+  "--no-first-run",
+  "--disable-extensions",
+  "--disable-background-networking",
+  "--disable-sync",
+  "--disable-default-apps",
+  "--disable-component-update",
+  "--metrics-recording-only",
+];
+
+export function sanitizeCssColor(raw: unknown): string | null {
+  if (typeof raw !== "string") return null;
+  const trimmed = raw.trim();
+  if (!trimmed || trimmed.length > 40) return null;
+  if (/^#([0-9a-f]{3}|[0-9a-f]{4}|[0-9a-f]{6}|[0-9a-f]{8})$/i.test(trimmed)) {
+    return trimmed;
+  }
+  if (
+    /^rgba?\(\s*(?:25[0-5]|2[0-4]\d|1?\d?\d)\s*,\s*(?:25[0-5]|2[0-4]\d|1?\d?\d)\s*,\s*(?:25[0-5]|2[0-4]\d|1?\d?\d)(?:\s*,\s*(?:0|1|0?\.\d{1,4}))?\s*\)$/i.test(
+      trimmed,
+    )
+  ) {
+    return trimmed;
+  }
+  if (SAFE_CSS_NAMED_COLORS.has(trimmed.toLowerCase())) {
+    return trimmed.toLowerCase();
+  }
+  return null;
+}
+
+export function sanitizeCssFontFamily(raw: unknown): string | null {
+  if (typeof raw !== "string") return null;
+  const cleaned = raw.trim().replace(/\s+/g, " ");
+  if (!cleaned || cleaned.length > 64) return null;
+  if (!/^[A-Za-z0-9 _-]+$/.test(cleaned)) return null;
+  return cleaned;
+}
+
+export function sanitizeSafeImageDataUri(raw: unknown): string | null {
+  if (typeof raw !== "string") return null;
+  const trimmed = raw.trim();
+  // Strictly permit raster base64 data URIs only; reject http(s), file, javascript, and svg+xml
+  if (!/^data:image\/(png|jpeg|jpg|webp|gif);base64,[A-Za-z0-9+/=\s]+$/i.test(trimmed)) {
+    return null;
+  }
+  return trimmed;
+}
+
+function sanitizeAlignment(raw: unknown): "left" | "center" | "right" | "justify" {
+  if (raw === "center" || raw === "right" || raw === "justify") return raw;
+  return "left";
+}
+
 function escapeHtml(text: string): string {
   return text
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;");
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
 }
 
 function renderRunsHtml(runs: TextRun[]): string {
@@ -106,10 +190,20 @@ function renderRunsHtml(runs: TextRun[]): string {
       let content = escapeHtml(run.text).replace(/\n/g, "<br/>");
       if (!content) return "";
       const styles: string[] = [];
-      if (run.marks?.fontFamily) styles.push(`font-family: '${escapeHtml(run.marks.fontFamily)}', 'Noto Sans Khmer', 'Inter', sans-serif`);
-      if (run.marks?.fontSizePt) styles.push(`font-size: ${run.marks.fontSizePt}pt`);
-      if (run.marks?.color) styles.push(`color: ${escapeHtml(run.marks.color)}`);
-      if (run.marks?.highlight) styles.push(`background-color: ${escapeHtml(run.marks.highlight)}`);
+      const safeFont = sanitizeCssFontFamily(run.marks?.fontFamily);
+      if (safeFont) styles.push(`font-family: '${safeFont}', 'Noto Sans Khmer', 'Inter', sans-serif`);
+      if (
+        typeof run.marks?.fontSizePt === "number" &&
+        Number.isFinite(run.marks.fontSizePt) &&
+        run.marks.fontSizePt >= 6 &&
+        run.marks.fontSizePt <= 144
+      ) {
+        styles.push(`font-size: ${run.marks.fontSizePt}pt`);
+      }
+      const safeColor = sanitizeCssColor(run.marks?.color);
+      if (safeColor) styles.push(`color: ${safeColor}`);
+      const safeHighlight = sanitizeCssColor(run.marks?.highlight);
+      if (safeHighlight) styles.push(`background-color: ${safeHighlight}`);
       if (run.marks?.underline) styles.push("text-decoration: underline");
       if (run.marks?.bold) content = `<strong>${content}</strong>`;
       if (run.marks?.italic) content = `<em>${content}</em>`;
@@ -122,11 +216,12 @@ function renderBlockHtml(block: DocumentBlock): string {
   switch (block.type) {
     case "paragraph": {
       const inner = renderRunsHtml(block.runs) || "&nbsp;";
-      return `<p style="text-align:${block.alignment ?? "left"};">${inner}</p>`;
+      return `<p style="text-align:${sanitizeAlignment(block.alignment)};">${inner}</p>`;
     }
     case "heading": {
+      const level = block.level === 1 || block.level === 2 || block.level === 3 ? block.level : 2;
       const inner = renderRunsHtml(block.runs) || "&nbsp;";
-      return `<h${block.level} style="text-align:${block.alignment ?? "left"};">${inner}</h${block.level}>`;
+      return `<h${level} style="text-align:${sanitizeAlignment(block.alignment)};">${inner}</h${level}>`;
     }
     case "bullet_list":
     case "ordered_list": {
@@ -198,17 +293,21 @@ export function buildPrintableHtml(doc: StudioDocument): string {
   const fontCss = resolveLocalFontFacesCss();
   const bodyHtml = doc.blocks.map(renderBlockHtml).join("\n");
   const { size, orientation, marginsMm, headerText, footerText } = doc.layout;
+  const safeSize = size === "Letter" ? "Letter" : "A4";
+  const safeOrientation = orientation === "landscape" ? "landscape" : "portrait";
+  const clampMargin = (m: number) => (Number.isFinite(m) ? Math.min(100, Math.max(0, m)) : 20);
 
   return `<!DOCTYPE html>
 <html lang="km">
 <head>
   <meta charset="UTF-8" />
+  ${PDF_RENDER_CSP_META}
   <title>${escapeHtml(doc.title)}</title>
   <style>
     ${fontCss}
     @page {
-      size: ${size} ${orientation};
-      margin: ${marginsMm.top}mm ${marginsMm.right}mm ${marginsMm.bottom}mm ${marginsMm.left}mm;
+      size: ${safeSize} ${safeOrientation};
+      margin: ${clampMargin(marginsMm.top)}mm ${clampMargin(marginsMm.right)}mm ${clampMargin(marginsMm.bottom)}mm ${clampMargin(marginsMm.left)}mm;
     }
     body {
       font-family: 'Inter', 'Noto Sans Khmer', 'Khmer OS Battambang', 'Leelawadee UI', sans-serif;
@@ -303,11 +402,7 @@ export async function exportToPdfBuffer(doc: StudioDocument): Promise<PdfExportR
     await execFileAsync(
       browserPath,
       [
-        "--headless=new",
-        "--disable-gpu",
-        "--no-sandbox",
-        "--no-first-run",
-        "--disable-extensions",
+        ...HARDENED_CHROMIUM_BASE_ARGS,
         `--user-data-dir=${userDataDir}`,
         "--no-pdf-header-footer",
         `--print-to-pdf=${pdfPath}`,
@@ -360,11 +455,7 @@ export async function renderDocumentScreenshot(
     await execFileAsync(
       browserPath,
       [
-        "--headless=new",
-        "--disable-gpu",
-        "--no-sandbox",
-        "--no-first-run",
-        "--disable-extensions",
+        ...HARDENED_CHROMIUM_BASE_ARGS,
         `--user-data-dir=${userDataDir}`,
         "--window-size=960,1360",
         `--screenshot=${path.resolve(outputPngPath)}`,

@@ -371,14 +371,27 @@ export interface DataPrepExecutionParams {
 export class DataPreparationPipeline {
   private readonly committedByIdempotencyKey = new Map<string, CertifiedDatasetArtifact>();
   private readonly certifiedHistory = new Map<string, CertifiedDatasetArtifact[]>();
+  private static readonly MAX_IDEMPOTENCY_CACHE = 1000;
+
+  private scopeKey(tenantId: string, workspaceId: string, key: string): string {
+    return `${tenantId}::${workspaceId}::${key}`;
+  }
 
   getHistory(actor: ActorContext, datasetId: string): CertifiedDatasetArtifact[] {
     assertCanPerform(actor, "document", "read");
-    const list = this.certifiedHistory.get(datasetId) ?? [];
-    for (const item of list) {
-      assertTenantWorkspaceAccess(actor, item.tenantId, item.workspaceId);
+    const ownKey = this.scopeKey(actor.tenantId, actor.workspaceId, datasetId);
+    const list = this.certifiedHistory.get(ownKey);
+    if (list) {
+      return structuredClone(list);
     }
-    return structuredClone(list);
+    // Check if another tenant owns this datasetId to preserve explicit 403 TENANT_ISOLATION_DENIED
+    for (const items of this.certifiedHistory.values()) {
+      const sample = items[0];
+      if (sample && sample.datasetId === datasetId) {
+        assertTenantWorkspaceAccess(actor, sample.tenantId, sample.workspaceId);
+      }
+    }
+    return [];
   }
 
   planDataPrepCommand(params: {
@@ -418,7 +431,8 @@ export class DataPreparationPipeline {
     assertCanPerform(actor, "document", "write");
     assertTenantWorkspaceAccess(actor, recipe.tenantId, recipe.workspaceId);
 
-    const existingIdem = this.committedByIdempotencyKey.get(recipe.idempotencyKey);
+    const idemCacheKey = this.scopeKey(actor.tenantId, actor.workspaceId, recipe.idempotencyKey);
+    const existingIdem = this.committedByIdempotencyKey.get(idemCacheKey);
     if (existingIdem) {
       return structuredClone(existingIdem);
     }
@@ -741,7 +755,8 @@ export class DataPreparationPipeline {
     };
 
     const datasetId = `ds_${recipe.recipeId}`;
-    const existingVersions = this.certifiedHistory.get(datasetId) ?? [];
+    const historyKey = this.scopeKey(actor.tenantId, actor.workspaceId, datasetId);
+    const existingVersions = this.certifiedHistory.get(historyKey) ?? [];
     const nextVersion = existingVersions.length + 1;
 
     // Canonical semantic sort for reproducible output SHA-256 across reruns
@@ -783,8 +798,12 @@ export class DataPreparationPipeline {
 
     // Atomic commit only on non-cancelled runs
     existingVersions.push(artifact);
-    this.certifiedHistory.set(datasetId, existingVersions);
-    this.committedByIdempotencyKey.set(recipe.idempotencyKey, artifact);
+    this.certifiedHistory.set(historyKey, existingVersions);
+    if (this.committedByIdempotencyKey.size >= DataPreparationPipeline.MAX_IDEMPOTENCY_CACHE) {
+      const oldest = this.committedByIdempotencyKey.keys().next().value;
+      if (oldest !== undefined) this.committedByIdempotencyKey.delete(oldest);
+    }
+    this.committedByIdempotencyKey.set(idemCacheKey, artifact);
 
     return structuredClone(artifact);
   }

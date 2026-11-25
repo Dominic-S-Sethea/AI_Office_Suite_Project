@@ -1566,10 +1566,12 @@ export class CrossModuleIntegrationEngine {
     this.assertPrincipalActive(actor);
     assertCanPerform(actor, "document", "create");
 
-    const existingRunId = this.runByIdempotency.get(`${actor.tenantId}::${params.idempotencyKey}`);
+    const runIdemKey = `${actor.tenantId}::${actor.workspaceId}::${params.idempotencyKey}`;
+    const existingRunId = this.runByIdempotency.get(runIdemKey);
     if (existingRunId) {
       const existing = this.workflowRuns.get(existingRunId);
       if (existing) {
+        assertTenantWorkspaceAccess(actor, existing.tenantId, existing.workspaceId);
         return { run: structuredClone(existing), deduplicated: true };
       }
     }
@@ -1598,7 +1600,7 @@ export class CrossModuleIntegrationEngine {
     };
 
     this.workflowRuns.set(run.runId, structuredClone(run));
-    this.runByIdempotency.set(`${actor.tenantId}::${params.idempotencyKey}`, run.runId);
+    this.runByIdempotency.set(runIdemKey, run.runId);
     if (this.db) await persistWorkflowRunRow(this.db, run);
 
     return this.executeWorkflowFromCurrentStep(actor, policy, run, {
@@ -1612,6 +1614,7 @@ export class CrossModuleIntegrationEngine {
     if (!this.db) {
       const local = this.workflowRuns.get(runId);
       if (!local) throw new IntegrationError(404, "WORKFLOW_NOT_FOUND", `Run '${runId}' not found.`);
+      assertTenantWorkspaceAccess(actor, local.tenantId, local.workspaceId);
       return structuredClone(local);
     }
     const row = await loadWorkflowRunRow(this.db, actor.tenantId, runId);
