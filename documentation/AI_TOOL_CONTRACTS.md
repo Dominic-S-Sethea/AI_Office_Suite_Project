@@ -72,3 +72,12 @@ Validated by Zod schema in `packages/validation/src/index.ts` and executed deter
 - **Formula over hardcoded values:** Calculation proposals insert editable formulas evaluated by `recalculateWorkbook()`.
 - **Protected cells:** Targets marked `protected: true` fail with `403 PROTECTED_CELL`.
 - **Format vs Conversion:** `"Format as USD"` changes `numberFormat` only; `"Convert to USD"` returns `blockedReason: "EXCHANGE_RATE_REQUIRED"` until rate, source, and effective date are supplied.
+
+## 3. Analytical Operation & Result Contracts (`AnalyticalQuery`, `AnalyticalResult`, `LinkedMetricReference`, FR-05 AN-00)
+
+Validates all natural-language analytical plans via `scanForUnsafeAnalyticalInput()` and deterministic `planAnalyticalCommand()` (`isMockPlanner: true`), compiling only allowlisted operations executed by `BusinessAnalysisEngine` (`engines/analytics/src/analyticalEngine.ts`):
+
+- **Supported Allowlisted Operations:** `calculate_metric`, `compare_metrics`, `group_by_dimension`, `budget_vs_actual`, `period_comparison`, `distinct_count`, `descriptive_stats`, `contribution_ranking`, `historical_trend`, `basic_anomaly`.
+- **Clarification Gate:** Ambiguous `"Calculate profit"` / `"គណនាប្រាក់ចំណេញ"` resolves to `clarificationRequired: true` rather than guessing `FIN-GROSS-PROFIT` vs `FIN-OPERATING-PROFIT`.
+- **Observed Facts vs AI Interpretation:** Every `AnalyticalResult` populates `observedFacts` strictly from executed BigInt/DuckDB numbers and marks optional narrative commentary with `aiInterpretation.isObservedFact = false`.
+- **Cross-Module Extension:** `LinkedMetricReference` adds `provenanceId`, `calculationEngineVersion`, `precisionPolicyId`, `status`, and `unavailableReason` cleanly in place across Document Studio, Spreadsheet Studio, Presentation Studio, and Intelligence Studio.

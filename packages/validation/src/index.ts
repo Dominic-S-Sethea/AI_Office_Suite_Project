@@ -80,6 +80,11 @@ export const documentBlockSchema = z.discriminatedUnion("type", [
       mode: z.enum(["live_draft", "published_snapshot"]),
       displayLabel: z.string().min(1),
       cachedFormattedValue: z.string(),
+      provenanceId: z.string().min(1).optional(),
+      calculationEngineVersion: z.string().min(1).optional(),
+      precisionPolicyId: z.string().min(1).optional(),
+      status: z.enum(["available", "unavailable"]).optional(),
+      unavailableReason: z.string().optional(),
     }),
   }),
 ]);
@@ -304,6 +309,50 @@ export function validateDocxUploadBytes(
     };
   }
   return { ok: true };
+}
+
+export const loginRequestSchema = z.object({
+  email: z.string().trim().email().max(255),
+  password: z.string().min(8).max(200),
+  tenantId: z.string().uuid(),
+  workspaceId: z.string().uuid(),
+});
+
+const UNSAFE_ANALYTICAL_PATTERNS: ReadonlyArray<{ id: string; pattern: RegExp; reason: string }> = [
+  {
+    id: "duckdb_file_or_copy",
+    pattern: /\b(read_csv|read_csv_auto|read_parquet|read_json|copy\s+|attach\s+|pragma\s+)/i,
+    reason: "Disallowed SQL file, extension, or pragma directive detected.",
+  },
+  {
+    id: "sql_ddl_dml_injection",
+    pattern: /(;\s*--|;\s*(drop|delete|alter|insert|update|create|attach)\b|\bunion\s+select\b|\bselect\s+\*\s+from\b)/i,
+    reason: "Raw SQL statement or DDL/DML injection pattern detected.",
+  },
+  {
+    id: "external_uri_scheme",
+    pattern: /(https?:\/\/|file:\/\/|s3:\/\/|gs:\/\/)/i,
+    reason: "Arbitrary external URI scheme is not permitted in analytical commands.",
+  },
+  {
+    id: "python_or_eval_exec",
+    pattern: /(\beval\s*\(|\bexec\s*\(|__import__|\bos\.system\b|\bsubprocess\b|\bchild_process\b)/i,
+    reason: "Arbitrary script/code execution payload rejected.",
+  },
+];
+
+export function scanForUnsafeAnalyticalInput(input: string): PromptSafetyScanResult {
+  const base = scanForPromptInjection(input);
+  const reasons = [...base.reasons];
+  for (const rule of UNSAFE_ANALYTICAL_PATTERNS) {
+    if (rule.pattern.test(input)) {
+      reasons.push(rule.reason);
+    }
+  }
+  return {
+    safe: reasons.length === 0,
+    reasons,
+  };
 }
 
 export type ValidatedStudioDocument = StudioDocument;

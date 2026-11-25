@@ -1,35 +1,30 @@
 # Development Status & Engineering Checkpoint Report (§20)
 
 **Date:** 26 November 2026  
-**Active Phases:** Gates **G0** (Reproducible Baseline) and **G1** (D1-R Document/Speech Closure, SS-00 Controlled Benchmarks, and FR-04 DP-00 Data Preparation Feasibility) + **G2 Design Only** (`D2_POSTGRESQL_DESIGN.md`).
+**Active Phases:** Gates **G0/G1** preserved; **Founder Approvals #1–#4** (`Git.MinGit` baseline, **Phase D2 / G2** PostgreSQL RLS + hardened JWT auth, Vendor RFP briefs, Local Faster-Whisper runtime) & **FR-05 `AN-00` Business Analysis Engine Feasibility** completed locally.
 
-## 4. Verification Results (Verified After Final Code Edit — Run `task-355`)
+## 1. Completed Milestones Summary
 
-- `node scripts/check-licenses.mjs`: **PASS** — scanned `430` installed third-party package versions (`39` direct dependencies); `0` disallowed licenses detected.
-- `npm.cmd audit --omit=dev --audit-level=high`: **PASS (high+)**; **2 moderate** advisories reported (`uuid <11.1.1` via `exceljs@4.4.0`, `GHSA-w5hq-g745-h8pq`).
+| Milestone | Scope | Key Deliverables |
+| :--- | :--- | :--- |
+| **Approval #1 — Git (`TD-GIT-01`)** | Portable `Git.MinGit v2.56.1` inside `ai-office-suite/` only | Initial commit `87f9508`, tag `v0.2.0-g1-baseline`, follow-up D2/AN-00 commit (`v0.3.0-d2-an00`); zero files outside `ai-office-suite/` touched |
+| **Approval #2 — Phase D2 (`G2`)** | PostgreSQL RLS + hardened Auth/RBAC + migration drills | `platform/database` (`@electric-sql/pglite@0.6.0`, `pg@8.23.1`, `app_runtime`, `FORCE ROW LEVEL SECURITY`, `REVOKE UPDATE/DELETE ON audit_logs`, atomic `409` concurrency, `.local-data/` dry-run/apply/rollback, SQL backup/restore), `platform/identity` (`aios_session` HttpOnly cookie, HS256 JWT, `token_version` epoch revocation, CSRF checks — zero legacy naming), `apps/api` `authMode: "jwt-pg"` |
+| **Approval #3 — Vendor Outreach** | Commercial licensing RFP questionnaires | `documentation/VENDOR_OUTREACH_BRIEFS.md` (Tiptap Pages, Univer Pro, Handsontable + HyperFormula Commercial, optional ONLYOFFICE Developer) |
+| **Approval #4 — Local Speech** | Local `FasterWhisperLocalAdapter` + `.venv-speech` (`faster-whisper==1.2.1`) | `engines/speech/src/fasterWhisper.ts`, `scripts/faster_whisper_worker.py` (`wave` + `numpy`), offline English SAPI TTS eval (`2.1–2.4 s` CPU `int8`) |
+| **FR-05 `AN-00` Analytics Spike** | Shared metric registry, exact precision & DuckDB execution | `engines/analytics` (`precision.ts` BigInt `FIN-POL-V1` + 10-decimal FX conversion, `BusinessMetricRegistry`, hardened DuckDB `enable_external_access=false`, granularity-safe budget vs actual, EN/KM deterministic mock planner, `ANA-T01..T18`, `10k`/`50k` stress benchmarks) |
+
+## 2. Verification Results (Latest Run `task-594`)
+
+- `node scripts/check-licenses.mjs`: **PASS** — scanned `460` installed third-party package versions (`45` direct dependencies); `0` disallowed licenses detected (`jszip@3.10.2` permissive `MIT` branch selected).
+- `npm.cmd audit --omit=dev --audit-level=high`: **PASS (high+)** — exit `0` (`0` high/critical production advisories; `2` moderate `uuid <11.1.1` advisories via `exceljs@4.4.0`). Full `npm.cmd audit` also notes dev-only `vitest` / `tinypool <=2.1.1` / `@vitest/mocker` advisories.
 - `npm.cmd run typecheck`: **PASS** — `tsc -p tsconfig.typecheck.json --noEmit` exited `0` (`0` errors).
-- `npm.cmd run build`: **PASS** — `build:api` (`tsc -p apps/api/tsconfig.build.json`) and `build:web` (`107` modules transformed including `@fontsource/noto-sans-khmer`, `@fontsource/kantumruy-pro`, and `@fontsource/inter` `.woff2` bundles).
-- `npm.cmd test`: **PASS** — Vitest `v3.2.7` ran **7 test files, 19/19 tests passed** in `28.74s`:
-  - `tests/d1-speech-adapter.test.ts` (3/3 passed)
-  - `tests/d1-khmer-typography.test.ts` (3/3 passed)
-  - `tests/d1-ai-operations.test.ts` (2/2 passed)
-  - `tests/g1-dp00-data-preparation.test.ts` (3/3 passed)
-  - `tests/d1-vertical-slice-api.test.ts` (1/1 passed)
-  - `tests/d1-spreadsheet-feasibility.test.ts` (4/4 passed)
-  - `tests/d1-docx-pdf-roundtrip.test.ts` (3/3 passed)
-- **Generated Inspection Artifacts & SHA-256 Checksums:** See `documentation/G0_G1_EVIDENCE_PACKET.md`.
-- **Legacy Naming Hygiene Scan:** `0` legacy project name matches across `ai-office-suite/`.
+- `npm.cmd run build`: **PASS** — `build:api` + `build:web` (`107` modules including Khmer `.woff2` bundles).
+- `npm.cmd test`: **PASS** — **9/9 test files, 24/24 tests passed** in `24.38s` (`tests/d1-*`, `tests/g1-dp00-data-preparation.test.ts`, `tests/g1-an00-analytics-feasibility.test.ts`, `tests/d2-platform-pg-auth.test.ts`).
+- **Legacy Naming Hygiene Scan:** **`0` matches** across `ai-office-suite/`.
+- **`package-lock.json` SHA-256:** `0BDD0931F648642CB7C10A1A40FB94E9B9DF59CC50C548563DCF55E4E3EBBEAD`.
 
-## 5. Known Limitations, Security Findings & Technical Debt
+## 3. Open Gates & Blockers
 
-- **Provisional D1 Auth:** `apps/api` uses prototype header roles (`x-workspace-role`, `x-tenant-id`) — safe ONLY on `127.0.0.1`; **must** be replaced in D2 with HttpOnly JWT/cookie auth + `token_version` revocation extracted from the preserved parent repository.
-- **Live Speech Recognition:** `MockSpeechAdapter` verified the pipeline; live `km-KH` and `en-US` acoustic WER benchmarks remain **PENDING founder authorization**.
-- **Document Studio Pagination:** Tiptap MIT core shows a single A4/Letter page frame; true automatic multi-page visual pagination requires evaluating Tiptap Pro vs. custom ProseMirror pagination in D3.
-- **Git Not Installed:** `git` CLI is absent on this workstation; initialize a clean Git repository before Phase D2.
-
-## 6. Decisions Requiring Founder Approval Before Phase D2 / SS-01
-
-1. **Document Engine Gate (D1.01):** Confirm Tiptap/ProseMirror MIT core as baseline, and decide whether to license **Tiptap Pro** (`@tiptap-pro/extension-pages`) for multi-page visual pagination or invest in custom ProseMirror pagination in D3.
-2. **Bilingual Speech Gate (D1.02):** Authorize live benchmark testing of **Google Cloud STT V2 (`km-KH`)**, **Azure AI Speech (`km-KH`)**, and/or self-hosted **Faster-Whisper (Khmer CT2)** with consented EN/KM audio samples.
-3. **Spreadsheet Engine Gate (SS-00):** Review commercial licensing terms for **Univer Pro** vs. **Handsontable + HyperFormula** before starting SS-01.
-4. **D2 Database Selection:** Approve **PostgreSQL** (recommended for multi-tenant SaaS + workers) vs. SQLite for Phase D2 platform extraction.
+1. **Vendor Commercial Quotes Pending:** Tiptap Pages, Univer Pro, Handsontable + HyperFormula, and ONLYOFFICE Developer quotes are needed before D3/SS-01 commitment.
+2. **Native Khmer (`km-KH`) Live Speech Corpus:** External cloud STT (`google-cloud-stt-v2`, `azure-speech`) remains fail-closed (`423`); local Faster-Whisper synthetic English TTS passed locally, but real Khmer speaker WER/CER evaluation awaits a consented audio corpus.
+3. **Production Phase Gates:** `D3` (Document Studio), `SS-01` (Spreadsheet production), `DP-01` (Data Prep production), `AN-01` (Analytics production), forecasting (`ANA-04.03`), and advanced statistics (`ANA-04.04`) remain gated pending review of `documentation/G2_D2_AND_AN00_EVIDENCE_PACKET.md`.

@@ -8,8 +8,8 @@
 | :--- | :--- | :--- | :--- |
 | **D0** | Engineering Foundation | Complete (Prototype Baseline) | Repo layout, TS strictness, license gate, CI, governance docs |
 | **D1** | Technical Feasibility | Complete (Ready for Review) | Document engine, Khmer typography, DOCX/PDF round-trip, mock EN/KM speech, 7 AI ops |
-| **D2** | Shared Platform Foundation | Pending Founder Review | Extract hardened auth/RBAC/audit/telemetry from preserved parent repo; select PostgreSQL vs SQLite |
-| **D3** | Document Studio Core | Pending D2 | Full formatting, images, hyperlinks, TOC, pagination strategy decision (Tiptap MIT vs Pro vs ONLYOFFICE) |
+| **D2** | Shared Platform Foundation | Complete (Verified Locally in G2) | PostgreSQL RLS (`platform/database`), HttpOnly `aios_session` + HS256 JWT + `token_version` + CSRF (`platform/identity`), reversible `.local-data/` migrator, and `jwt-pg` API mode |
+| **D3** | Document Studio Core | Pending Commercial Outreach Review | Full formatting, images, hyperlinks, TOC, pagination strategy decision (`VENDOR_OUTREACH_BRIEFS.md`) |
 | **D4** | AI Document Intelligence | Pending D3 | Live LLM adapter via ModelRouter, conflict resolution, budget enforcement |
 | **D5** | Bilingual Voice Intelligence | Pending D1.02 Live Eval | Live `km-KH` + `en-US` STT benchmark & adapter wiring (Google STT v2 / Azure / Faster-Whisper) |
 | **D6** | Corporate Automation | Pending D3–D5 | Official letters, memos, meeting minutes, reports, EN/KM terminology dictionary |
@@ -34,4 +34,11 @@
 | Phase | Deliverable | Status | Notes |
 | :--- | :--- | :--- | :--- |
 | **DP-00** | Data preparation feasibility & DuckDB vs. Polars spike | Complete (Ready for Review) | Verified `DAT-T01..T18` + DuckDB `v1.4.5` vs Polars `0.26.2` |
-| **DP-01 – DP-12** | Ingestion, typed staging, profiling, op registry, joins, recipes, reconciliation, AI, voice, certification, integration, hardening | Pending Founder Review | Blocked until G1 acceptance & FR-05 arithmetic rules |
+| **DP-01 – DP-12** | Ingestion, typed staging, profiling, op registry, joins, recipes, reconciliation, AI, voice, certification, integration, hardening | Pending Founder Review | Synchronized with AN-00 arithmetic policy; DP-01 gated |
+
+## 4. Business Analysis Workstream (`AN-00` .. `AN-09`, FR-05 §28)
+
+| Phase | Deliverable | Status | Notes |
+| :--- | :--- | :--- | :--- |
+| **AN-00** | Analytical engine feasibility, precision policy & reference fixtures | **Complete (Verified)** | Reuses DuckDB + BigInt minor units (`FIN-POL-V1`); `ANA-T01..T18` & cross-module reconciliation passing |
+| **AN-01 – AN-09** | Production metric registry, statistical/forecasting models, Business Scenario Lab, cross-module BI, security hardening | **Gated Pending AN-00 Review** | P1 forecasting (`ANA-04.03`) and advanced stats (`ANA-04.04`) remain out of AN-00 scope |

@@ -44,6 +44,18 @@ describe("D1.02 & TD-VOICE-01 — Bilingual Speech Adapter & WER/CER Benchmark H
         code: "LIVE_SPEECH_PROVIDER_NOT_AUTHORIZED",
       } satisfies Partial<SpeechProviderError>);
     }
+
+    // With local Faster-Whisper enabled, missing audio payload still fails cleanly before spawning Python
+    process.env.ALLOW_LOCAL_FASTER_WHISPER = "true";
+    try {
+      await expect(
+        getSpeechAdapter("faster-whisper").transcribe({ language: "en-US", mode: "command" }),
+      ).rejects.toMatchObject({
+        code: "MISSING_AUDIO_PAYLOAD",
+      } satisfies Partial<SpeechProviderError>);
+    } finally {
+      delete process.env.ALLOW_LOCAL_FASTER_WHISPER;
+    }
   });
 
   it("computes English WER, Khmer grapheme CER, Khmer segmented WER, and mock-flagged benchmark summaries", () => {

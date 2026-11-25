@@ -5,8 +5,10 @@ import type {
   SpeechRecognitionRequest,
   SpeechRecognitionResult,
 } from "@ai-office-suite/shared-contracts";
+import { FasterWhisperLocalAdapter } from "./fasterWhisper.ts";
 
 export * from "./benchmark.ts";
+export * from "./fasterWhisper.ts";
 
 export class SpeechProviderError extends Error {
   readonly statusCode: number;
@@ -161,6 +163,6 @@ export function getSpeechAdapter(providerId: SpeechProviderId = "mock"): SpeechR
     case "azure-speech":
       return new FailClosedLiveSpeechAdapter("azure-speech", "AZURE_SPEECH_KEY + AZURE_SPEECH_REGION");
     case "faster-whisper":
-      return new FailClosedLiveSpeechAdapter("faster-whisper", "FASTER_WHISPER_ENDPOINT");
+      return new FasterWhisperLocalAdapter();
   }
 }

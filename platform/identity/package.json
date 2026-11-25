@@ -1,0 +1,16 @@
+{
+  "name": "@ai-office-suite/identity",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "@ai-office-suite/authorization": "*",
+    "@ai-office-suite/database": "*",
+    "@ai-office-suite/shared-contracts": "*",
+    "bcryptjs": "^3.0.3",
+    "jsonwebtoken": "^9.0.3"
+  }
+}

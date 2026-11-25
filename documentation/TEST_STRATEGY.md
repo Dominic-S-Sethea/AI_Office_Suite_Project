@@ -16,9 +16,11 @@
 | **FR-03 Spreadsheet Spike** | `tests/d1-spreadsheet-feasibility.test.ts` | SS-00 / `SHT-T01..T18` subset: multi-sheet calc recalc, `$G$1` absolute refs, leading-zero `"001245"`, USD/KHR separation, `#CYCLE!` / `#DIV/0!` / `#NAME?`, macro block, EN/KM Formula Intelligence, multi-input invariance, protected cell `403`, cell prompt-injection block, intact-row sort, OWASP CSV escaping, 20k/200k cell benchmark |
 
 | **FR-04 Data Preparation** | `tests/g1-dp00-data-preparation.test.ts` | DP-00 / `DAT-T01..T18`: reordered XLSX+CSV, Khmer/IDs, ambiguous date refusal, null≠0, composite dedupe, §5.4 golden duplicate-key join block & reconciliation, unmatched `C999`, cancel/rerun/drift/EN-KM/injection/cross-tenant/idempotency + DuckDB vs Polars parity & 10k/100k benchmarks |
+| **FR-05 Business Analytics** | `tests/g1-an00-analytics-feasibility.test.ts` | AN-00 / `ANA-T01..T18`: golden financial dataset (`$150k/$90k/$60k/$20k/$40k`, `40.00%`/`26.67%`/`20.00%`), combined ratios, zero-denom unavailable, distinct customers, granularity-aligned budget vs actual, fiscal YTD, partial warnings, multi-currency FX, rounding (`HALF_UP`/`HALF_EVEN`), missing-amount block, V1/V2 versioning, EN/KM parity, ambiguous clarification, tenant/cache isolation, SQL injection rejection, cross-module sync, retry idempotency, snapshot immutability, 10k/50k DuckDB stress |
+| **Phase D2 Platform (PG/Auth)** | `tests/d2-platform-pg-auth.test.ts` | Real `@electric-sql/pglite` PostgreSQL schema + non-superuser `app_runtime` RLS fail-closed negative tests, `REVOKE UPDATE/DELETE ON audit_logs`, HTTP `aios_session` HttpOnly cookie, CSRF `403`, RBAC `403`, concurrent `409 REVISION_CONFLICT`, `token_version` revocation `401`, `.local-data/` dry-run/apply/rollback, logical SQL dump/restore |
 
 ## 2. Pending Test Suites (Future Phases)
 
-- Live acoustic English + Khmer WER benchmark (`D1.02` live audio / `D5`).
+- Live native Khmer (`km-KH`) & English (`en-US`) consented multi-speaker WER/CER evaluation (`D5`).
 - Playwright browser UI E2E & WCAG 2.2 AA accessibility audit (`D3` / `D8`).
-- Full PostgreSQL RLS & backup/restore RPO/RTO drills (`D2` / `D8`).
+- Managed PostgreSQL failover & P1 forecasting backtest coverage (`AN-08` / `D8`).

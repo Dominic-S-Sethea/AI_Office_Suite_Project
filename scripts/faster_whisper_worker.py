@@ -1,0 +1,77 @@
+import argparse
+import json
+import sys
+import time
+import wave
+import numpy as np
+
+
+def load_pcm_wav_16k(path: str) -> np.ndarray:
+    with wave.open(path, "rb") as wf:
+        channels = wf.getnchannels()
+        sampwidth = wf.getsampwidth()
+        sample_rate = wf.getframerate()
+        n_frames = wf.getnframes()
+        raw = wf.readframes(n_frames)
+
+    if sampwidth == 2:
+        audio = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+    elif sampwidth == 4:
+        audio = np.frombuffer(raw, dtype=np.int32).astype(np.float32) / 2147483648.0
+    elif sampwidth == 1:
+        audio = (np.frombuffer(raw, dtype=np.uint8).astype(np.float32) - 128.0) / 128.0
+    else:
+        raise ValueError(f"Unsupported WAV sample width: {sampwidth} bytes")
+
+    if channels > 1:
+        audio = audio.reshape(-1, channels).mean(axis=1)
+
+    if sample_rate != 16000 and len(audio) > 0:
+        target_len = int(round(len(audio) * 16000.0 / float(sample_rate)))
+        x_old = np.linspace(0.0, 1.0, num=len(audio), endpoint=False)
+        x_new = np.linspace(0.0, 1.0, num=target_len, endpoint=False)
+        audio = np.interp(x_new, x_old, audio).astype(np.float32)
+
+    return audio
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Local Faster-Whisper speech worker for AI Office Suite")
+    parser.add_argument("--audio", required=True, help="Path to local PCM WAV file")
+    parser.add_argument("--language", default="en", help="ISO language code (en or km)")
+    parser.add_argument("--model", default="tiny", help="Whisper model size (tiny, base, small)")
+    args = parser.parse_args()
+
+    try:
+        from faster_whisper import WhisperModel
+    except ImportError as exc:
+        sys.stderr.write(f"faster_whisper_import_error: {exc}\n")
+        return 2
+
+    t0 = time.perf_counter()
+    audio_16k = load_pcm_wav_16k(args.audio)
+    model = WhisperModel(args.model, device="cpu", compute_type="int8")
+    segments, info = model.transcribe(audio_16k, language=args.language, beam_size=1)
+    text_parts = []
+    avg_prob_sum = 0.0
+    count = 0
+    for seg in segments:
+        text_parts.append(seg.text.strip())
+        avg_prob_sum += float(getattr(seg, "avg_logprob", -0.5))
+        count += 1
+    elapsed_ms = round((time.perf_counter() - t0) * 1000, 2)
+    confidence = round(min(0.99, max(0.05, 1.0 + (avg_prob_sum / count if count else -0.5))), 3)
+
+    payload = {
+        "transcript": " ".join(p for p in text_parts if p),
+        "language": getattr(info, "language", args.language),
+        "duration_ms": elapsed_ms,
+        "confidence": confidence,
+        "model": args.model,
+    }
+    sys.stdout.write(json.dumps(payload, ensure_ascii=False))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

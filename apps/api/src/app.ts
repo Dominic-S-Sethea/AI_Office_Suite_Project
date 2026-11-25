@@ -1,21 +1,37 @@
+import { randomUUID } from "node:crypto";
 import path from "node:path";
 import express, { type Express, type NextFunction, type Request, type Response } from "express";
 import cors from "cors";
 import helmet from "helmet";
-import type { ActorContext } from "@ai-office-suite/shared-contracts";
+import type { ActorContext, StudioDocument } from "@ai-office-suite/shared-contracts";
 import { PLANNED_FUTURE_STUDIOS } from "@ai-office-suite/shared-contracts";
 import {
   aiApplyRequestSchema,
   aiPlanRequestSchema,
   createDocumentSchema,
   importDocxRequestSchema,
+  loginRequestSchema,
   speechTranscribeRequestSchema,
   updateDocumentSchema,
 } from "@ai-office-suite/validation";
 import { AuthorizationError, isWorkspaceRole } from "@ai-office-suite/authorization";
+import {
+  DatabaseConflictError,
+  PostgreSqlDocumentRepository,
+  type PgDatabaseAdapter,
+} from "@ai-office-suite/database";
+import {
+  AuthenticationError,
+  authenticateUserWithPassword,
+  clearSessionCookie,
+  createJwtAuthMiddleware,
+  revokeUserSessions,
+  setSessionCookie,
+  type AuthenticatedRequest,
+} from "@ai-office-suite/identity";
 import { InMemoryAuditStore, LocalJsonlAuditStore, type AuditStore } from "@ai-office-suite/audit";
 import { InMemoryStorageAdapter, LocalFilesystemStorageAdapter, type DocumentStorageAdapter } from "@ai-office-suite/storage";
-import { DocumentEngineError } from "@ai-office-suite/document-engine";
+import { DocumentEngineError, createEmptyDocument, normalizeDocumentText } from "@ai-office-suite/document-engine";
 import { DocxImportError, PdfExportError } from "@ai-office-suite/file-conversion";
 import { getSpeechAdapter, SpeechProviderError } from "@ai-office-suite/speech-engine";
 import { DocumentService } from "@ai-office-suite/documents-module";
@@ -24,6 +40,8 @@ import { AiDocumentExecutor, AiPlanningError, planDocumentOperation } from "@ai-
 export interface CreateApiAppOptions {
   storageDir?: string;
   inMemory?: boolean;
+  authMode?: "provisional-local" | "jwt-pg";
+  db?: PgDatabaseAdapter;
 }
 
 function resolvePrototypeActor(req: Request): ActorContext {
@@ -37,6 +55,13 @@ function resolvePrototypeActor(req: Request): ActorContext {
 }
 
 export function createApiApp(options: CreateApiAppOptions = {}): Express {
+  const authMode = options.authMode ?? "provisional-local";
+  if (authMode === "jwt-pg" && !options.db) {
+    throw new Error("CreateApiAppOptions.db is required when authMode is 'jwt-pg'.");
+  }
+  const useJwtPg = authMode === "jwt-pg";
+  const pgRepo = options.db ? new PostgreSqlDocumentRepository(options.db) : null;
+
   const storageDir = options.storageDir ?? path.resolve(process.cwd(), process.env.LOCAL_STORAGE_DIR ?? ".local-data");
   const storage: DocumentStorageAdapter = options.inMemory
     ? new InMemoryStorageAdapter()
@@ -48,6 +73,11 @@ export function createApiApp(options: CreateApiAppOptions = {}): Express {
   const documents = new DocumentService(storage, audit);
   const aiExecutor = new AiDocumentExecutor(documents, audit);
 
+  const allowedOrigins = (process.env.CORS_ORIGIN ?? "http://localhost:5174,http://127.0.0.1:5174")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+
   const app = express();
   app.use(
     helmet({
@@ -56,16 +86,13 @@ export function createApiApp(options: CreateApiAppOptions = {}): Express {
   );
   app.use(
     cors({
-      origin: (process.env.CORS_ORIGIN ?? "http://localhost:5174,http://127.0.0.1:5174")
-        .split(",")
-        .map((s) => s.trim())
-        .filter(Boolean),
-      credentials: false,
+      origin: allowedOrigins,
+      credentials: useJwtPg,
     }),
   );
   app.use(express.json({ limit: "25mb" }));
   app.use((_req, res, next) => {
-    res.setHeader("X-Auth-Mode", "provisional-local-prototype");
+    res.setHeader("X-Auth-Mode", useJwtPg ? "jwt-postgresql-rls" : "provisional-local-prototype");
     next();
   });
 
@@ -73,15 +100,77 @@ export function createApiApp(options: CreateApiAppOptions = {}): Express {
     res.json({
       status: "ok",
       service: "ai-office-suite-api",
-      phase: "D0/D1-feasibility-prototype",
+      phase: useJwtPg ? "D2-platform-foundation" : "D0/D1-feasibility-prototype",
+      authMode,
       plannedStudios: PLANNED_FUTURE_STUDIOS,
     });
   });
 
+  if (useJwtPg && options.db) {
+    const db = options.db;
+    const jwtMiddleware = createJwtAuthMiddleware(db, allowedOrigins);
+
+    app.post("/api/auth/login", async (req, res, next) => {
+      try {
+        const parsed = loginRequestSchema.safeParse(req.body);
+        if (!parsed.success) {
+          res.status(400).json({ error: "Invalid login credentials payload", code: "VALIDATION_ERROR", issues: parsed.error.issues });
+          return;
+        }
+        const session = await authenticateUserWithPassword({
+          db,
+          email: parsed.data.email,
+          password: parsed.data.password,
+          tenantId: parsed.data.tenantId,
+          workspaceId: parsed.data.workspaceId,
+        });
+        setSessionCookie(req, res, session.token);
+        res.json({ token: session.token, actor: session.actor });
+      } catch (err) {
+        next(err);
+      }
+    });
+
+    app.post("/api/auth/logout", (req, res) => {
+      clearSessionCookie(req, res);
+      res.json({ ok: true });
+    });
+
+    app.get("/api/auth/me", jwtMiddleware, (req, res) => {
+      const authReq = req as AuthenticatedRequest;
+      res.json({ actor: authReq.actor, authSource: authReq.authSource });
+    });
+
+    app.post("/api/auth/revoke-sessions", jwtMiddleware, async (req, res, next) => {
+      try {
+        const authReq = req as AuthenticatedRequest;
+        const nextVersion = await revokeUserSessions(db, authReq.actor!.userId);
+        clearSessionCookie(req, res);
+        res.json({ revoked: true, tokenVersion: nextVersion });
+      } catch (err) {
+        next(err);
+      }
+    });
+
+    // Enforce JWT + PostgreSQL RLS live membership check on all document routes
+    app.use("/api/documents", jwtMiddleware);
+  }
+
+  const getActor = (req: Request): ActorContext => {
+    if (useJwtPg) {
+      const authReq = req as AuthenticatedRequest;
+      if (!authReq.actor) {
+        throw new AuthenticationError(401, "MISSING_TOKEN", "Authentication required.");
+      }
+      return authReq.actor;
+    }
+    return resolvePrototypeActor(req);
+  };
+
   app.get("/api/documents", async (req, res, next) => {
     try {
-      const actor = resolvePrototypeActor(req);
-      const list = await documents.listDocuments(actor);
+      const actor = getActor(req);
+      const list = pgRepo ? await pgRepo.listDocuments(actor) : await documents.listDocuments(actor);
       res.json({ documents: list });
     } catch (err) {
       next(err);
@@ -90,10 +179,25 @@ export function createApiApp(options: CreateApiAppOptions = {}): Express {
 
   app.post("/api/documents", async (req, res, next) => {
     try {
-      const actor = resolvePrototypeActor(req);
+      const actor = getActor(req);
       const parsed = createDocumentSchema.safeParse(req.body);
       if (!parsed.success) {
         res.status(400).json({ error: "Invalid document payload", code: "VALIDATION_ERROR", issues: parsed.error.issues });
+        return;
+      }
+      if (pgRepo) {
+        const doc = createEmptyDocument({
+          documentId: randomUUID(),
+          tenantId: actor.tenantId,
+          workspaceId: actor.workspaceId,
+          title: parsed.data.title,
+          language: parsed.data.language,
+          createdBy: actor.userId,
+        });
+        if (parsed.data.layout) doc.layout = parsed.data.layout;
+        if (parsed.data.blocks) doc.blocks = parsed.data.blocks;
+        const created = await pgRepo.createDocument(actor, doc);
+        res.status(201).json({ document: created });
         return;
       }
       const created = await documents.createDocument(actor, parsed.data);
@@ -105,7 +209,7 @@ export function createApiApp(options: CreateApiAppOptions = {}): Express {
 
   app.post("/api/documents/seed-bilingual-fixture", async (req, res, next) => {
     try {
-      const actor = resolvePrototypeActor(req);
+      const actor = getActor(req);
       const created = await documents.seedBilingualSample(actor);
       res.status(201).json({ document: created });
     } catch (err) {
@@ -115,8 +219,8 @@ export function createApiApp(options: CreateApiAppOptions = {}): Express {
 
   app.get("/api/documents/:id", async (req, res, next) => {
     try {
-      const actor = resolvePrototypeActor(req);
-      const doc = await documents.getDocument(actor, req.params.id);
+      const actor = getActor(req);
+      const doc = pgRepo ? await pgRepo.getDocument(actor, req.params.id) : await documents.getDocument(actor, req.params.id);
       res.json({ document: doc });
     } catch (err) {
       next(err);
@@ -125,10 +229,28 @@ export function createApiApp(options: CreateApiAppOptions = {}): Express {
 
   app.put("/api/documents/:id", async (req, res, next) => {
     try {
-      const actor = resolvePrototypeActor(req);
+      const actor = getActor(req);
       const parsed = updateDocumentSchema.safeParse(req.body);
       if (!parsed.success) {
         res.status(400).json({ error: "Invalid update payload", code: "VALIDATION_ERROR", issues: parsed.error.issues });
+        return;
+      }
+      if (pgRepo) {
+        const updated = await pgRepo.updateDocument(
+          actor,
+          req.params.id,
+          parsed.data.expectedRevision,
+          (current, nextRevision): StudioDocument => ({
+            ...current,
+            title: parsed.data.title ? normalizeDocumentText(parsed.data.title) : current.title,
+            language: parsed.data.language ?? current.language,
+            layout: parsed.data.layout ?? current.layout,
+            blocks: parsed.data.blocks,
+            revision: nextRevision,
+            updatedAt: new Date().toISOString(),
+          }),
+        );
+        res.json({ document: updated });
         return;
       }
       const updated = await documents.updateDocument(actor, req.params.id, parsed.data);
@@ -140,7 +262,7 @@ export function createApiApp(options: CreateApiAppOptions = {}): Express {
 
   app.get("/api/documents/:id/versions", async (req, res, next) => {
     try {
-      const actor = resolvePrototypeActor(req);
+      const actor = getActor(req);
       const versions = await documents.listVersions(actor, req.params.id);
       res.json({ versions });
     } catch (err) {
@@ -150,7 +272,7 @@ export function createApiApp(options: CreateApiAppOptions = {}): Express {
 
   app.post("/api/documents/:id/versions/:revision/restore", async (req, res, next) => {
     try {
-      const actor = resolvePrototypeActor(req);
+      const actor = getActor(req);
       const rev = Number(req.params.revision);
       if (!Number.isInteger(rev) || rev < 1) {
         res.status(400).json({ error: "Invalid revision number", code: "VALIDATION_ERROR" });
@@ -165,7 +287,7 @@ export function createApiApp(options: CreateApiAppOptions = {}): Express {
 
   app.post("/api/documents/:id/ai/plan", async (req, res, next) => {
     try {
-      const actor = resolvePrototypeActor(req);
+      const actor = getActor(req);
       const parsed = aiPlanRequestSchema.safeParse(req.body);
       if (!parsed.success) {
         res.status(400).json({ error: "Invalid AI plan request", code: "VALIDATION_ERROR", issues: parsed.error.issues });
@@ -188,7 +310,7 @@ export function createApiApp(options: CreateApiAppOptions = {}): Express {
 
   app.post("/api/documents/:id/ai/apply", async (req, res, next) => {
     try {
-      const actor = resolvePrototypeActor(req);
+      const actor = getActor(req);
       const parsed = aiApplyRequestSchema.safeParse(req.body);
       if (!parsed.success) {
         res.status(400).json({ error: "Invalid AI apply request", code: "VALIDATION_ERROR", issues: parsed.error.issues });
@@ -226,7 +348,7 @@ export function createApiApp(options: CreateApiAppOptions = {}): Express {
 
   app.post("/api/documents/import/docx", async (req, res, next) => {
     try {
-      const actor = resolvePrototypeActor(req);
+      const actor = getActor(req);
       const parsed = importDocxRequestSchema.safeParse(req.body);
       if (!parsed.success) {
         res.status(400).json({ error: "Invalid DOCX import payload", code: "VALIDATION_ERROR", issues: parsed.error.issues });
@@ -242,7 +364,7 @@ export function createApiApp(options: CreateApiAppOptions = {}): Express {
 
   app.post("/api/documents/:id/export/docx", async (req, res, next) => {
     try {
-      const actor = resolvePrototypeActor(req);
+      const actor = getActor(req);
       const { buffer, filename } = await documents.exportDocx(actor, req.params.id);
       res.setHeader(
         "Content-Type",
@@ -257,7 +379,7 @@ export function createApiApp(options: CreateApiAppOptions = {}): Express {
 
   app.post("/api/documents/:id/export/pdf", async (req, res, next) => {
     try {
-      const actor = resolvePrototypeActor(req);
+      const actor = getActor(req);
       const result = await documents.exportPdf(actor, req.params.id);
       res.setHeader("Content-Type", "application/pdf");
       res.setHeader("Content-Disposition", `attachment; filename="${result.filename}"`);
@@ -270,7 +392,7 @@ export function createApiApp(options: CreateApiAppOptions = {}): Express {
 
   app.get("/api/documents/:id/audit", async (req, res, next) => {
     try {
-      const actor = resolvePrototypeActor(req);
+      const actor = getActor(req);
       const events = await documents.listAuditEvents(actor, req.params.id);
       res.json({ events });
     } catch (err) {
@@ -280,7 +402,9 @@ export function createApiApp(options: CreateApiAppOptions = {}): Express {
 
   app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
     if (
+      err instanceof AuthenticationError ||
       err instanceof AuthorizationError ||
+      err instanceof DatabaseConflictError ||
       err instanceof DocumentEngineError ||
       err instanceof DocxImportError ||
       err instanceof PdfExportError ||

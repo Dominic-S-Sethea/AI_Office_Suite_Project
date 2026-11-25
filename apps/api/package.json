@@ -12,6 +12,8 @@
     "@ai-office-suite/shared-contracts": "*",
     "@ai-office-suite/validation": "*",
     "@ai-office-suite/authorization": "*",
+    "@ai-office-suite/database": "*",
+    "@ai-office-suite/identity": "*",
     "@ai-office-suite/storage": "*",
     "@ai-office-suite/audit": "*",
     "@ai-office-suite/document-engine": "*",

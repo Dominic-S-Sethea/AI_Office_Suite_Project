@@ -1,7 +1,17 @@
 # Bilingual Voice Benchmark & Provider Evaluation — AI Office Suite
 
-**Phase:** D1.02 Baseline  
-**Live Audio Testing Status:** **PENDING FOUNDER AUTHORIZATION** (No live audio was transmitted to external cloud providers in D1; all runtime speech calls in D1 execute against `MockSpeechAdapter` with `isMock: true`).
+**Phase:** D1.02 Baseline + Local Faster-Whisper Bench (Approval #4)  
+**Live Audio Testing Status:** **LOCAL ENGLISH SYNTHETIC BENCHMARK COMPLETED; NATIVE KHMER (`km-KH`) & CLOUD STT BENCHMARKS PENDING.** External cloud providers (`google-cloud-stt-v2`, `azure-speech`) remain fail-closed (`423`) with zero audio transmitted externally.
+
+## 1.5 Local Faster-Whisper Bench Observations (`faster-whisper==1.2.1`, Python `3.12.10`, CPU `int8`, `tiny` model)
+
+- **Compatibility finding fixed:** `faster-whisper==1.2.1` invokes `av.open(..., metadata_errors="ignore")` when given a file path, which raised `TypeError` against the installed PyAV wheel in `.venv-speech`. Updating `scripts/faster_whisper_worker.py` to decode PCM WAV via Python stdlib `wave` + `numpy` (mono `float32`, resampled to `16 kHz`) bypassed `av.open` cleanly.
+- **Measured Synthetic English TTS (`Windows System.Speech`) Results (offline, zero external network audio):**
+  - `"make bold"` -> `"Make bold."` (`2242.30 ms`)
+  - `"make heading 1"` -> `"Make heading one."` (`2138.29 ms` — confirms Whisper spells small digits as words and appends punctuation, requiring spoken-number normalization before intent matching)
+  - `"calculate total revenue for this month"` -> `"Calculate Total Revenue for this month."` (`2262.04 ms`)
+  - `"show operating profit by department"` -> `"Show operating profit by department."` (`2403.47 ms`)
+- **Disclosure:** Synthetic TTS audio does **not** represent live human corporate speakers, accented English, or Khmer (`km-KH`) acoustic WER/CER. `km-KH` evaluation requires consented native Khmer speakers per §3.
 
 ## 1. Candidate Speech Recognition Providers (English `en-US` & Khmer `km-KH`)
 

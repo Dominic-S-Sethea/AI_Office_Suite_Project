@@ -14,21 +14,22 @@
 | CR-001 | Product Development Plan V1.0 (§2, §11) | Supersedes English-only MVP voice assumption (`VOC-01/02`) to require **English (`en-US`) and Khmer (`km-KH`)** voice capture, transcript review, and independent input/UI/output language routing. | Extends `VOC-01`, `VOC-02`, and `DOC-01..04` with Khmer typography, `Intl.Segmenter` grapheme safety, and `km-KH` speech benchmarks. |
 | CR-002 | Stage 3 — FR-03 (§23, §24) | Expands `SHT-01..06` into detailed testable requirements (`SHT-01.01..SHT-06.03`, `SHT-AI-01..10`, `SHT-VOICE-01..08`) and adds `SHT-T01..T18`. | Extends D1 feasibility scope with isolated SS-00 spreadsheet engine & licensing evaluation without authorizing full production buildout. |
 | CR-003 | Handover V1.1 — FR-04 (§5) | Expands `DAT-01..06` into 30 detailed requirements (`DAT-01.01..DAT-06.05`), `DAT-AI-01..07`, `DAT-VOICE-01..04`, and `DAT-T01..T18`. | Authorizes bounded local `DP-00` feasibility spike comparing DuckDB vs. Polars without starting DP-01 production buildout. |
+| CR-004 | Stage 3 — FR-05 (§23–§29) & Founder Approvals #1–#4 | Expands `ANA-01..04` into 24 detailed requirements (`ANA-01.01..ANA-04.05`), `ANA-AI-01..08`, `ANA-VOICE-01..05`, and `ANA-T01..T18`; approves Git baseline, Phase D2 PostgreSQL/auth extraction, vendor RFP outreach, and Faster-Whisper setup. | Authorizes isolated `AN-00` analytical feasibility prototype (`engines/analytics`) + Phase D2 PostgreSQL/JWT RLS foundation (`platform/database`, `platform/identity`) while gating `AN-01` production and P1 forecasting/stats. |
 
 ## 1. Shared Workspace Refinements (`WS-01` .. `WS-15`)
 
 | ID | Priority | Requirement | Phase Target | Status in D1 |
 | :--- | :--- | :--- | :--- | :--- |
-| WS-01 | P0 | Unified organization workspace (`PLT-01`) | D2 | Provisional shell + tenant/workspace headers |
-| WS-02 | P0 | Single sign-in across modules (`PLT-01`) | D2 | Deferred to D2 auth extraction |
-| WS-03 | P0 | Common user and role management (`PLT-01`, `NFR-01`) | D2 | Provisional RBAC matrix (`owner..viewer`) tested |
-| WS-04 | P0 | Central artifact and file catalog (`PLT-03`) | D2 | Local document list implemented |
+| WS-01 | P0 | Unified organization workspace (`PLT-01`) | D2 | PostgreSQL RLS + `apps/api` `jwt-pg` tenant scoping implemented |
+| WS-02 | P0 | Single sign-in across modules (`PLT-01`) | D2 | Extracted HttpOnly `aios_session` + HS256 JWT + `token_version` epoch revocation (`platform/identity`) |
+| WS-03 | P0 | Common user and role management (`PLT-01`, `NFR-01`) | D2 | PostgreSQL `memberships` RBAC + live role re-read tested (`tests/d2-platform-pg-auth.test.ts`) |
+| WS-04 | P0 | Central artifact and file catalog (`PLT-03`) | D2 | PostgreSQL `documents`/`document_versions` atomic pointers + reversible `.local-data/` migrator |
 | WS-05 | P0 | Shared dataset catalog (`DAT-01`, `ANA-01`) | D7 / FR-04 | Interface placeholder only |
 | WS-06 | P0 | Cross-module navigation and context (`AI-01`) | D2 | Shell routes + planned studio badges |
 | WS-07 | P0 | Linked reports, sheets, slides, dashboards (`INT-01`) | D7 | `LinkedMetricPlaceholderBlock` contract defined |
 | WS-08 | P0 | Version history and recovery (`PLT-02`) | D2/D3 | Append-only revisions + restore-as-new-rev verified |
 | WS-09 | P0 | Central AI assistant and voice (`AI-01`, `VOC-01/02`) | D4/D5 | Prototype EN/KM panel + mock speech verified |
-| WS-10 | P0 | Shared permissions and audit history (`AI-05/06`, `NFR-01`) | D2 | Append-only JSONL audit + redaction verified |
+| WS-10 | P0 | Shared permissions and audit history (`AI-05/06`, `NFR-01`) | D2 | Append-only JSONL + PostgreSQL `audit_logs` with `REVOKE UPDATE, DELETE` verified |
 | WS-11 | P0 | Multi-step workflow execution (`AI-04/07`, `PLT-05`) | D4+ | Single-step preview/apply/idempotency verified |
 | WS-12 | P0 | Corporate templates and branding (`DOC-02`, `PPT-02`) | D6 | Bilingual report fixture implemented |
 | WS-13 | P1 | Advanced real-time collaboration | Expansion | Deferred |
@@ -61,7 +62,9 @@
 ## 4. Remaining V0.1 Register Families (Preserved for Stages 3–13)
 
 - **Data Preparation (`DAT-01`..`06` P0/P1, refined into 30 details `DAT-01.01..DAT-06.05` + `DAT-AI-01..07` + `DAT-VOICE-01..04`):** `DP-00` feasibility spike (`engines/data-processing`) verified all 18 scenarios `DAT-T01..DAT-T18` against synthetic CSV/XLSX fixtures and DuckDB vs. Polars parity (`tests/g1-dp00-data-preparation.test.ts`). Production `DP-01` gated pending G1 review.
-- **Analytics (`ANA-01`..`03` P0, `ANA-04` P1):** Pending FR-05 research.
+- **Analytics (`ANA-01`..`04` P0/P1, refined into `ANA-01.01..ANA-01.06`, `ANA-02.01..ANA-02.07`, `ANA-03.01..ANA-03.06`, `ANA-04.01..ANA-04.05`, `ANA-AI-01..08`, `ANA-VOICE-01..05`):**
+  - *P0 Core Registry, Execution & Traceability (`AN-00` verified):* `ANA-01.01` (metric registry versions), `ANA-01.02` (reusable financial defs), `ANA-01.03` (units/currency/periods), `ANA-01.04` (aggregation & missing-value policies), `ANA-01.05` (exact minor-unit precision `FIN-POL-V1`), `ANA-01.06` (ownership/approval), `ANA-02.01..07` (grouped summaries, period/fiscal comparisons, granularity-safe budget vs actual, ranking, descriptive stats, historical trends, IQR anomaly checks), `ANA-03.01..06` (provenance, inspectable assumptions, reconciliation validation, observed facts vs AI interpretation separation, cross-module sync, warning/exception reporting), `ANA-AI-01..07` (EN/KM analytical planning, ambiguity clarification, safe validated execution), `ANA-VOICE-01..04`. All 18 acceptance scenarios `ANA-T01..ANA-T18` verified in `tests/g1-an00-analytics-feasibility.test.ts`.
+  - *P1 Expansion (Gated):* `ANA-04.01..05`, `ANA-AI-08`, `ANA-VOICE-05` (advanced semantic models, Business Scenario Lab, forecasting & backtesting, multiple regression/hypothesis tests, real-time conversational voice).
 - **Presentations (`PPT-01`..`03` P0):** Pending FR-06 research; route placeholder `/presentations` registered.
 - **Business Intelligence (`BI-01`..`03` P0):** Pending FR-07 research; route placeholder `/analytics` registered.
 - **Integration (`INT-01`..`03` P0, `INT-04` P1):** Forward contract `LinkedMetricReference` implemented.

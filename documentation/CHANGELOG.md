@@ -1,5 +1,13 @@
 # Changelog — AI Office Suite
 
+## [0.3.0-d2-an00] — 2026-11-26 (Phase D2 Platform Foundation, FR-05 AN-00 & Founder Approvals #1–#4)
+
+### Added
+- **Local Git Baseline (`TD-GIT-01`):** Installed portable `Git.MinGit v2.56.1` and initialized local Git repository inside `ai-office-suite/` (`v0.2.0-g1-baseline`).
+- **Phase D2 Platform Foundation (`platform/database`, `platform/identity`):** Implemented PostgreSQL RLS schema (`app_runtime` non-superuser role, fail-closed `tenant_isolation_*` policies, `REVOKE UPDATE/DELETE ON audit_logs`), `PgliteDatabaseAdapter` + `NodePgDatabaseAdapter`, atomic revision-pointer concurrency updates (`409`), reversible `.local-data/` migrator + logical SQL backup/restore, `aios_session` HttpOnly cookie + HS256 JWT + live `token_version` epoch revocation, CSRF origin validation, and `authMode: "jwt-pg"` in `apps/api`. Zero legacy naming carried over.
+- **FR-05 `AN-00` Business Analysis Engine (`engines/analytics`):** Extended `LinkedMetricReference` in place; added `BusinessMetricRegistry`, exact `BigInt` minor-unit engine (`FIN-POL-V1` with `HALF_UP`/`HALF_EVEN`, zero-denominator unavailable, overflow guard, 10-decimal FX conversion), hardened DuckDB analytical execution (`enable_external_access=false`), granularity-safe budget vs. actual, combined departmental ratios, bilingual EN/KM deterministic planner, and `tests/g1-an00-analytics-feasibility.test.ts` covering `ANA-T01..T18` + 10k/50k stress benchmarks.
+- **Vendor Briefs & Speech Runtime:** Added `VENDOR_OUTREACH_BRIEFS.md` and local `FasterWhisperLocalAdapter` + `scripts/faster_whisper_worker.py`.
+
 ## [0.2.0-g1] — 2026-11-26 (Gates G0, G1 & FR-04 DP-00)
 
 ### Added & Hardened

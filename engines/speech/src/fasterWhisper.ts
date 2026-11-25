@@ -1,0 +1,119 @@
+import { execFile } from "node:child_process";
+import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { randomUUID } from "node:crypto";
+import { promisify } from "node:util";
+import { fileURLToPath } from "node:url";
+import type {
+  SpeechProviderId,
+  SpeechRecognitionAdapter,
+  SpeechRecognitionRequest,
+  SpeechRecognitionResult,
+} from "@ai-office-suite/shared-contracts";
+import { SpeechProviderError } from "./index.ts";
+
+const execFileAsync = promisify(execFile);
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const repoRoot = path.resolve(__dirname, "..", "..", "..");
+
+export function resolveLocalSpeechPython(): string | null {
+  const configured = process.env.FASTER_WHISPER_PYTHON?.trim();
+  if (configured && existsSync(configured)) return configured;
+
+  const venvPy = path.join(repoRoot, ".venv-speech", "Scripts", "python.exe");
+  if (existsSync(venvPy)) return venvPy;
+
+  const winLocalPy = path.join(
+    process.env.LOCALAPPDATA ?? "",
+    "Programs",
+    "Python",
+    "Python312",
+    "python.exe",
+  );
+  if (winLocalPy && existsSync(winLocalPy)) return winLocalPy;
+
+  return null;
+}
+
+export class FasterWhisperLocalAdapter implements SpeechRecognitionAdapter {
+  readonly providerId: SpeechProviderId = "faster-whisper";
+  readonly isMock = false;
+
+  async transcribe(request: SpeechRecognitionRequest): Promise<SpeechRecognitionResult> {
+    if (process.env.ALLOW_LOCAL_FASTER_WHISPER !== "true" && process.env.ALLOW_LIVE_SPEECH_PROVIDERS !== "true") {
+      throw new SpeechProviderError(
+        423,
+        "LIVE_SPEECH_PROVIDER_NOT_AUTHORIZED",
+        "Local Faster-Whisper requires ALLOW_LOCAL_FASTER_WHISPER=true (local Python .venv-speech runtime).",
+      );
+    }
+
+    if (!request.audioBase64) {
+      throw new SpeechProviderError(
+        400,
+        "MISSING_AUDIO_PAYLOAD",
+        "Faster-Whisper requires base64-encoded WAV/PCM audio input.",
+      );
+    }
+
+    const pythonPath = resolveLocalSpeechPython();
+    if (!pythonPath) {
+      throw new SpeechProviderError(
+        503,
+        "FASTER_WHISPER_RUNTIME_UNAVAILABLE",
+        "Local Python (.venv-speech) runtime for Faster-Whisper was not found on this workstation.",
+      );
+    }
+
+    const workerScript = path.join(repoRoot, "scripts", "faster_whisper_worker.py");
+    if (!existsSync(workerScript)) {
+      throw new SpeechProviderError(500, "MISSING_SPEECH_WORKER", "scripts/faster_whisper_worker.py not found.");
+    }
+
+    const scratchDir = path.join(tmpdir(), `aios-speech-${randomUUID()}`);
+    mkdirSync(scratchDir, { recursive: true });
+    const wavPath = path.join(scratchDir, "input.wav");
+    writeFileSync(wavPath, Buffer.from(request.audioBase64, "base64"));
+
+    try {
+      const modelSize = process.env.FASTER_WHISPER_MODEL?.trim() || "tiny";
+      const langCode = request.language === "km-KH" ? "km" : "en";
+      const { stdout } = await execFileAsync(
+        pythonPath,
+        [workerScript, "--audio", wavPath, "--language", langCode, "--model", modelSize],
+        { timeout: 120_000, maxBuffer: 4 * 1024 * 1024 },
+      );
+
+      const parsed = JSON.parse(stdout.trim()) as {
+        transcript: string;
+        language: string;
+        duration_ms: number;
+        confidence: number;
+        model: string;
+      };
+
+      return {
+        transcript: parsed.transcript.trim(),
+        language: request.language,
+        confidence: parsed.confidence,
+        provider: "faster-whisper",
+        isMock: false,
+        durationMs: parsed.duration_ms,
+        warnings: [
+          `Local Faster-Whisper (${parsed.model}) CPU execution — zero audio sent to external cloud APIs.`,
+        ],
+      };
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      throw new SpeechProviderError(
+        503,
+        "FASTER_WHISPER_EXECUTION_FAILED",
+        `Local Faster-Whisper execution failed: ${msg}`,
+      );
+    } finally {
+      rmSync(scratchDir, { recursive: true, force: true });
+    }
+  }
+}

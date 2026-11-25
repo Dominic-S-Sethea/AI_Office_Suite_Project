@@ -4,35 +4,34 @@
 
 ## 1. D0.01 Environment & Preserved Parent Codebase Assessment
 
-- **Workspace status:** The parent directory contains an earlier, unrelated application built with Express + TypeScript + React 19 + Vite + `node:sqlite`. Git CLI is not installed on this host (`git` unavailable; no `.git` directory present inside the workspace root), and Node.js `v24.22.3` with `npm 11.19.1` is active.
+- **Workspace status:** The parent directory preserves the earlier unrelated application unmodified. Inside `ai-office-suite/`, official portable Git (`Git.MinGit v2.56.1`) is initialized with local commits/tags (`v0.2.0-g1-baseline`), and Node.js `v24.22.3` with `npm 11.19.1` is active.
 - **Preservation rule:** Per D0.01, zero existing files outside `ai-office-suite/` were altered or deleted.
-- **Reusable Platform Assets Identified for Phase D2 Selective Extraction:**
-  - *Security & Auth Middleware:* Strict Helmet CSP, fail-closed `TRUST_PROXY`, CSRF origin validation, SSE-safe compression filter, HttpOnly cookie + HS256 JWT with `token_version` epoch revocation.
-  - *Governance & AI Control Plane:* Multi-provider `ModelRouter` with failover, `modelTelemetry` cost tracking, `projectAiBudget` CAS reservation/kill-switch, append-only `audit_logs` triggers, `redaction.service.ts` (note: finance key redaction rules must be tailored so corporate financial numbers are not stripped from legitimate reports), and `urlSecurity.service.ts` SSRF + DNS-rebinding defense.
-- **Non-Reusable Legacy Code (Not Extracted):** Legacy project/task/board/kanban/git/canvas/3D routes, shell-execution gateway (`shellGateway`), headless browser GUI automation (`guiAudit`), and legacy MCP server packages.
+- **Extracted Phase D2 Platform Assets (`platform/database` + `platform/identity`):**
+  - Cleanly extracted & modernized HttpOnly cookie (`aios_session`), fail-closed `JWT_SECRET`, HS256 JWT with live `token_version` epoch revocation, CSRF origin check (`Sec-Fetch-Site` + `Origin`/`Referer`), PostgreSQL RLS schema with `app_runtime` non-superuser role + `REVOKE UPDATE, DELETE ON audit_logs`, atomic version-pointer commits, and reversible `.local-data/` migration (zero legacy naming carried over).
+- **Non-Reusable Legacy Code (Never Extracted):** Legacy project/task/board/kanban/git/canvas/3D routes, shell-execution gateway, headless GUI automation, and legacy MCP packages.
 
 ## 2. Modular Monolith Architecture (ADR-001)
 
 `ai-office-suite/` implements a strict **modular monolith** with enforced package boundaries:
 
 ```
-apps/web (React 19 + Vite + Tiptap v3)  ──HTTP/JSON──▶  apps/api (Express 4 + Helmet)
+apps/web (React 19 + Vite + Tiptap v3)  ──HTTP/JSON──▶  apps/api (Express 4 + Helmet + JWT/PG RLS)
                                                                │
                     ┌──────────────────────────────────────────┼──────────────────────────────────┐
                     ▼                                          ▼                                  ▼
            modules/documents                              modules/ai                        platform/*
-      (CRUD, versions, restore,                      (EN/KM NL -> validated              (authorization,
-       DOCX/PDF export, audit)                        DocumentOperationProposal,          immutable storage,
-                    │                                 idempotency, prompt safety)         redacted audit)
+      (CRUD, versions, restore,                      (EN/KM NL -> validated              (identity JWT/CSRF,
+       DOCX/PDF export, audit)                        DocumentOperationProposal,          database Pg/PGlite RLS,
+                    │                                 idempotency, prompt safety)         authorization, storage, audit)
                     ▼                                          │
-      ┌─────────────┴─────────────┐                            │
-      ▼                           ▼                            ▼
-engines/document          engines/file-conversion       engines/speech
-(Canonical AST,           (DOCX export/import +         (Provider-independent
- Khmer Intl.Segmenter,     macro block, Chromium         SpeechRecognitionAdapter)
- deterministic ops)        HarfBuzz PDF renderer)
+      ┌─────────────┴─────────────┬────────────────────────────┼───────────────┐
+      ▼                           ▼                            ▼               ▼
+engines/document          engines/file-conversion       engines/speech   engines/data-processing
+(Canonical AST,           (DOCX export/import +         (Mock + local    (FR-04 DP-00 DuckDB
+ Khmer Intl.Segmenter)     HarfBuzz PDF renderer)        Faster-Whisper)  ETL & Polars parity)
 
-[Isolated FR-03 SS-00 Spike]: engines/calculation (Formula dependency graph, exceljs XLSX, OWASP CSV safety)
+[FR-03 SS-00 Spike]:  engines/calculation (Formula dependency graph, exceljs XLSX, OWASP CSV safety)
+[FR-05 AN-00 Spike]:  engines/analytics   (BusinessMetricRegistry, BigInt FIN-POL-V1, DuckDB exact analytics)
 ```
 
 ## 3. Architectural Invariants
