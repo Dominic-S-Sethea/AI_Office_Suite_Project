@@ -235,6 +235,28 @@ export async function rollbackMigrationBatch(
       "UPDATE migration_batches SET status = 'rolled_back', rolled_back_at = now() WHERE batch_id = $1::uuid",
       [batchId],
     );
+
+    const auditActorRes = await tx.query<{ user_id: string }>(
+      "SELECT user_id::text FROM memberships WHERE tenant_id = $1::uuid AND workspace_id = $2::uuid LIMIT 1",
+      [row.target_tenant_id, row.target_workspace_id],
+    );
+    const systemActorId = auditActorRes.rows[0]?.user_id ?? "00000000-0000-4000-8000-000000000000";
+    await tx.query(
+      `INSERT INTO audit_logs (
+         audit_id, tenant_id, workspace_id, actor_id, actor_role, source, action, outcome,
+         target_type, target_id, summary, metadata
+       ) VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, 'owner', 'system', 'migration.batch_rolled_back', 'success', 'migration_batch', $5, $6, $7::jsonb)`,
+      [
+        randomUUID(),
+        row.target_tenant_id,
+        row.target_workspace_id,
+        systemActorId,
+        batchId,
+        `Rolled back migration batch ${batchId} (${manifest.length} document(s) removed).`,
+        JSON.stringify({ batchId, removedDocuments: manifest.length }),
+      ],
+    );
+
     return { batchId, removedDocuments: manifest.length };
   });
 }
@@ -523,11 +545,13 @@ export async function restoreLogicalBackupSnapshot(
         "content_sha256",
         "source_import_sha256",
         "restored_from_revision",
+        "source",
+        "summary",
         "snapshot_json",
         "created_by",
         "created_at",
       ],
-      ["::uuid", "::uuid", "", "", "", "", "", "::jsonb", "::uuid", "::timestamptz"],
+      ["::uuid", "::uuid", "", "", "", "", "", "", "", "::jsonb", "::uuid", "::timestamptz"],
       (snapshot.documentVersions as Array<Record<string, unknown>>).map((v) => [
         v.tenant_id,
         v.document_id,
@@ -536,6 +560,8 @@ export async function restoreLogicalBackupSnapshot(
         v.content_sha256,
         v.source_import_sha256 ?? null,
         v.restored_from_revision ?? null,
+        typeof v.source === "string" ? v.source : "manual",
+        typeof v.summary === "string" ? v.summary : "",
         toJsonText(v.snapshot_json),
         v.created_by,
         v.created_at,
@@ -560,9 +586,10 @@ export async function restoreLogicalBackupSnapshot(
         "revision_before",
         "revision_after",
         "summary",
+        "metadata",
         "created_at",
       ],
-      ["::uuid", "::uuid", "::uuid", "::uuid", "", "", "", "", "", "", "", "", "", "::timestamptz"],
+      ["::uuid", "::uuid", "::uuid", "::uuid", "", "", "", "", "", "", "", "", "", "::jsonb", "::timestamptz"],
       (snapshot.auditLogs as Array<Record<string, unknown>>).map((a) => [
         a.audit_id,
         a.tenant_id,
@@ -577,6 +604,7 @@ export async function restoreLogicalBackupSnapshot(
         a.revision_before ?? null,
         a.revision_after ?? null,
         a.summary,
+        a.metadata !== undefined && a.metadata !== null ? toJsonText(a.metadata) : null,
         a.created_at,
       ]),
       onConflict,

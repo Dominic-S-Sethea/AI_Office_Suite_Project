@@ -1,5 +1,14 @@
 import { createHash, randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  linkSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
 import path from "node:path";
 import type { DocumentVersion, StudioDocument } from "@ai-office-suite/shared-contracts";
 
@@ -15,7 +24,7 @@ export interface DocumentStorageAdapter {
 /**
  * Local filesystem adapter for Phase D1 feasibility prototypes.
  * - Imported binaries are written once by SHA-256 hash (immutable original archive).
- * - Document versions are append-only JSON files written atomically via temp-file rename; restoring creates a new revision.
+ * - Document versions are append-only JSON files published atomically via temp-file + hardlink (`linkSync` fails with EEXIST on race).
  */
 export class LocalFilesystemStorageAdapter implements DocumentStorageAdapter {
   private readonly baseDir: string;
@@ -47,8 +56,12 @@ export class LocalFilesystemStorageAdapter implements DocumentStorageAdapter {
     const safeExt = extension.replace(/[^a-z0-9]/gi, "").toLowerCase().slice(0, 12) || "bin";
     const filePath = this.assertContainedPath(path.join(this.baseDir, "originals", `${sha256}.${safeExt}`));
     // Write-once: never overwrite an existing original binary with the same SHA-256.
-    if (!existsSync(filePath)) {
+    try {
       writeFileSync(filePath, bytes, { flag: "wx" });
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "EEXIST") {
+        throw err;
+      }
     }
     return { sha256, path: filePath };
   }
@@ -67,16 +80,19 @@ export class LocalFilesystemStorageAdapter implements DocumentStorageAdapter {
     const dir = this.versionsDir(version.documentId);
     const filename = `rev-${String(version.revision).padStart(6, "0")}.json`;
     const filePath = this.assertContainedPath(path.join(dir, filename));
-    if (existsSync(filePath)) {
-      throw new Error(`Immutable version conflict: revision ${version.revision} already exists for ${version.documentId}.`);
-    }
     const tmpPath = this.assertContainedPath(path.join(dir, `.${filename}.${randomUUID()}.tmp`));
     try {
       writeFileSync(tmpPath, JSON.stringify(version, null, 2), { encoding: "utf8", flag: "wx" });
-      if (existsSync(filePath)) {
-        throw new Error(`Immutable version conflict: revision ${version.revision} already exists for ${version.documentId}.`);
+      // Atomic POSIX non-overwriting publish: linkSync fails atomically with EEXIST if another writer won the race (H12)
+      try {
+        linkSync(tmpPath, filePath);
+      } catch (linkErr) {
+        if ((linkErr as NodeJS.ErrnoException).code === "EEXIST") {
+          throw new Error(`Immutable version conflict: revision ${version.revision} already exists for ${version.documentId}.`);
+        }
+        throw linkErr;
       }
-      renameSync(tmpPath, filePath);
+      unlinkSync(tmpPath);
     } catch (err) {
       if (existsSync(tmpPath)) {
         try {
@@ -109,9 +125,16 @@ export class LocalFilesystemStorageAdapter implements DocumentStorageAdapter {
   }
 
   async getDocument(documentId: string): Promise<StudioDocument | null> {
-    const versions = await this.listVersions(documentId);
-    if (versions.length === 0) return null;
-    return versions[versions.length - 1]?.snapshot ?? null;
+    const safeId = this.sanitizeDocumentId(documentId);
+    const dir = this.assertContainedPath(path.join(this.baseDir, "documents", safeId, "versions"));
+    if (!existsSync(dir)) return null;
+    const files = readdirSync(dir)
+      .filter((name) => name.endsWith(".json") && !name.startsWith("."))
+      .sort();
+    const latestFile = files[files.length - 1];
+    if (!latestFile) return null;
+    const version = JSON.parse(readFileSync(this.assertContainedPath(path.join(dir, latestFile)), "utf8")) as DocumentVersion;
+    return version.snapshot ?? null;
   }
 
   async listDocuments(tenantId: string, workspaceId: string): Promise<StudioDocument[]> {

@@ -85,8 +85,27 @@ export class NodePgDatabaseAdapter implements PgDatabaseAdapter {
   readonly engine = "node-pg" as const;
   private readonly pool: Pool;
 
-  constructor(connectionString: string, poolOptions?: Omit<PoolConfig, "connectionString">) {
-    this.pool = new Pool({ ...poolOptions, connectionString });
+  constructor(
+    connectionString: string,
+    poolOptions?: Omit<PoolConfig, "connectionString"> & { onPoolError?: (err: Error) => void },
+  ) {
+    const { onPoolError, ...pgOptions } = poolOptions ?? {};
+    this.pool = new Pool({ ...pgOptions, connectionString });
+    this.pool.on("error", (err) => {
+      if (onPoolError) {
+        onPoolError(err);
+      } else {
+        console.error(
+          JSON.stringify({
+            timestamp: new Date().toISOString(),
+            level: "error",
+            event: "db.pool_idle_client_error",
+            errorName: err.name,
+            message: err.message,
+          }),
+        );
+      }
+    });
   }
 
   async query<T extends Record<string, unknown> = Record<string, unknown>>(

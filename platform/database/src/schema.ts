@@ -1,5 +1,8 @@
 import type { PgDatabaseAdapter, PgQueryExecutor } from "./adapter.ts";
 
+export const CORE_SCHEMA_VERSION = "2026.11.v2-core";
+const CORE_SCHEMA_LOCK_KEY = 84102001;
+
 export const D2_POSTGRESQL_SCHEMA_SQL = `
 DO $$
 BEGIN
@@ -8,6 +11,11 @@ BEGIN
   END IF;
 END
 $$;
+
+CREATE TABLE IF NOT EXISTS schema_migrations (
+  version     TEXT PRIMARY KEY,
+  applied_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 
 CREATE TABLE IF NOT EXISTS organizations (
   tenant_id   UUID PRIMARY KEY,
@@ -25,21 +33,22 @@ CREATE TABLE IF NOT EXISTS users (
   created_at     TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-CREATE TABLE IF NOT EXISTS memberships (
-  tenant_id   UUID NOT NULL REFERENCES organizations(tenant_id),
-  workspace_id UUID NOT NULL,
-  user_id     UUID NOT NULL REFERENCES users(user_id),
-  role        TEXT NOT NULL CHECK (role IN ('owner', 'administrator', 'editor', 'reviewer', 'viewer')),
-  created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
-  PRIMARY KEY (tenant_id, workspace_id, user_id)
-);
-
 CREATE TABLE IF NOT EXISTS workspaces (
   tenant_id     UUID NOT NULL REFERENCES organizations(tenant_id),
   workspace_id  UUID NOT NULL,
   name          TEXT NOT NULL,
   created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
   PRIMARY KEY (tenant_id, workspace_id)
+);
+
+CREATE TABLE IF NOT EXISTS memberships (
+  tenant_id    UUID NOT NULL REFERENCES organizations(tenant_id),
+  workspace_id UUID NOT NULL,
+  user_id      UUID NOT NULL REFERENCES users(user_id),
+  role         TEXT NOT NULL CHECK (role IN ('owner', 'administrator', 'editor', 'reviewer', 'viewer')),
+  created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (tenant_id, workspace_id, user_id),
+  FOREIGN KEY (tenant_id, workspace_id) REFERENCES workspaces(tenant_id, workspace_id)
 );
 
 CREATE TABLE IF NOT EXISTS documents (
@@ -66,12 +75,17 @@ CREATE TABLE IF NOT EXISTS document_versions (
   content_sha256          CHAR(64) NOT NULL,
   source_import_sha256    CHAR(64) NULL,
   restored_from_revision  INTEGER NULL,
+  source                  TEXT NOT NULL DEFAULT 'manual',
+  summary                 TEXT NOT NULL DEFAULT '',
   snapshot_json           JSONB NOT NULL,
   created_by              UUID NOT NULL REFERENCES users(user_id),
   created_at              TIMESTAMPTZ NOT NULL DEFAULT now(),
   PRIMARY KEY (tenant_id, document_id, revision),
   FOREIGN KEY (tenant_id, document_id) REFERENCES documents(tenant_id, document_id)
 );
+
+ALTER TABLE document_versions ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'manual';
+ALTER TABLE document_versions ADD COLUMN IF NOT EXISTS summary TEXT NOT NULL DEFAULT '';
 
 CREATE TABLE IF NOT EXISTS idempotency_keys (
   tenant_id          UUID NOT NULL,
@@ -98,8 +112,11 @@ CREATE TABLE IF NOT EXISTS audit_logs (
   revision_before  INTEGER NULL,
   revision_after   INTEGER NULL,
   summary          TEXT NOT NULL,
+  metadata         JSONB NULL,
   created_at       TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS metadata JSONB NULL;
 
 CREATE TABLE IF NOT EXISTS ai_applied_operations (
   tenant_id        UUID NOT NULL,
@@ -114,18 +131,29 @@ CREATE TABLE IF NOT EXISTS ai_applied_operations (
 );
 
 CREATE TABLE IF NOT EXISTS migration_batches (
-  batch_id           UUID PRIMARY KEY,
-  target_tenant_id   UUID NOT NULL REFERENCES organizations(tenant_id),
+  batch_id            UUID PRIMARY KEY,
+  target_tenant_id    UUID NOT NULL REFERENCES organizations(tenant_id),
   target_workspace_id UUID NOT NULL,
-  source_dir         TEXT NOT NULL,
-  manifest_json      JSONB NOT NULL,
-  status             TEXT NOT NULL CHECK (status IN ('applied', 'rolled_back')),
-  created_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
-  rolled_back_at     TIMESTAMPTZ NULL
+  source_dir          TEXT NOT NULL,
+  manifest_json       JSONB NOT NULL,
+  status              TEXT NOT NULL CHECK (status IN ('applied', 'rolled_back')),
+  created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+  rolled_back_at      TIMESTAMPTZ NULL,
+  FOREIGN KEY (target_tenant_id, target_workspace_id) REFERENCES workspaces(tenant_id, workspace_id)
 );
+
+-- Secondary & case-insensitive unique indexes (H6)
+CREATE UNIQUE INDEX IF NOT EXISTS users_email_lower_uidx ON users (lower(email));
+CREATE INDEX IF NOT EXISTS memberships_user_idx ON memberships (user_id, tenant_id, workspace_id);
+CREATE INDEX IF NOT EXISTS documents_tenant_ws_updated_idx ON documents (tenant_id, workspace_id, updated_at DESC);
+CREATE INDEX IF NOT EXISTS documents_tenant_ws_lang_idx ON documents (tenant_id, workspace_id, language);
+CREATE INDEX IF NOT EXISTS audit_logs_tenant_ws_target_created_idx ON audit_logs (tenant_id, workspace_id, target_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS ai_applied_ops_doc_idx ON ai_applied_operations (tenant_id, document_id);
+CREATE INDEX IF NOT EXISTS idempotency_keys_expires_idx ON idempotency_keys (expires_at);
 
 GRANT USAGE ON SCHEMA public TO app_runtime;
 GRANT SELECT, INSERT, UPDATE ON organizations, users, memberships, workspaces, documents, idempotency_keys TO app_runtime;
+GRANT DELETE ON idempotency_keys TO app_runtime;
 GRANT SELECT, INSERT ON document_versions, audit_logs, ai_applied_operations TO app_runtime;
 REVOKE UPDATE, DELETE ON audit_logs FROM app_runtime;
 REVOKE UPDATE, DELETE ON document_versions FROM app_runtime;
@@ -222,8 +250,42 @@ CREATE POLICY tenant_isolation_ai_applied_operations ON ai_applied_operations
   );
 `;
 
-export async function initializePostgreSqlSchema(db: PgDatabaseAdapter): Promise<void> {
-  await db.exec(D2_POSTGRESQL_SCHEMA_SQL);
+export async function initializePostgreSqlSchema(
+  db: PgDatabaseAdapter,
+  options: { force?: boolean } = {},
+): Promise<{ applied: boolean; version: string }> {
+  return db.withTransaction(async (tx) => {
+    await tx.query("SELECT pg_advisory_xact_lock($1)", [CORE_SCHEMA_LOCK_KEY]);
+    await tx.exec(`
+      CREATE TABLE IF NOT EXISTS schema_migrations (
+        version     TEXT PRIMARY KEY,
+        applied_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+      );
+    `);
+    if (!options.force) {
+      const existing = await tx.query<{ version: string }>(
+        "SELECT version FROM schema_migrations WHERE version = $1",
+        [CORE_SCHEMA_VERSION],
+      );
+      if (existing.rows.length > 0) {
+        return { applied: false, version: CORE_SCHEMA_VERSION };
+      }
+    }
+    await tx.exec(D2_POSTGRESQL_SCHEMA_SQL);
+    await tx.query(
+      "INSERT INTO schema_migrations (version) VALUES ($1) ON CONFLICT (version) DO NOTHING",
+      [CORE_SCHEMA_VERSION],
+    );
+    return { applied: true, version: CORE_SCHEMA_VERSION };
+  });
+}
+
+/**
+ * Removes expired rows from `idempotency_keys` (M7). Intended for periodic maintenance jobs.
+ */
+export async function purgeExpiredIdempotencyKeys(db: PgDatabaseAdapter): Promise<number> {
+  const res = await db.query("DELETE FROM idempotency_keys WHERE expires_at < now()");
+  return res.rowCount;
 }
 
 const SAFE_PG_ROLE_IDENT = /^[a-z_][a-z0-9_]{1,62}$/;
