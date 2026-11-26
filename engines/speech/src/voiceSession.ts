@@ -260,4 +260,56 @@ export class VoiceSessionManager {
     s.updatedAt = new Date().toISOString();
     return structuredClone(s);
   }
+
+  /**
+   * Immediately terminates all active (non-terminal) voice sessions for a tenant+actor
+   * on sign-out, tenant switch, or voice UI close (VOC-T27 / PLT-T13).
+   * Guarantees ephemeral audio buffer wiping.
+   */
+  terminateActiveSessionsForActor(
+    tenantId: string,
+    actorId: string,
+    reason = "ACTOR_SESSION_ENDED",
+  ): VoiceSessionRecord[] {
+    const terminated: VoiceSessionRecord[] = [];
+    const nowIso = new Date().toISOString();
+    for (const s of this.sessions.values()) {
+      if (s.tenantId !== tenantId || s.actorId !== actorId) continue;
+      if (s.state === "completed" || s.state === "canceled" || s.state === "error" || s.state === "expired") {
+        continue;
+      }
+      s.state = "canceled";
+      s.audioBufferPresent = false;
+      s.audioRetained = false;
+      s.errorCode = reason;
+      s.errorMessage = `Voice capture terminated safely (${reason}).`;
+      s.updatedAt = nowIso;
+      terminated.push(structuredClone(s));
+    }
+    return terminated;
+  }
+
+  /**
+   * Safely terminates an active session on microphone disconnect (VOC-T17) or
+   * mid-recording network failure (VOC-T18), wiping transient audio buffers without executing operations.
+   */
+  handleHardwareOrNetworkInterruption(
+    sessionId: string,
+    kind: "microphone_disconnected" | "network_failure",
+    eventId: string,
+    eventSeq: number,
+  ): VoiceTransitionOutcome {
+    const errorCode = kind === "microphone_disconnected" ? "MICROPHONE_DISCONNECTED" : "VOICE_NETWORK_FAILURE";
+    const errorMessage =
+      kind === "microphone_disconnected"
+        ? "Microphone disconnected during capture; session terminated safely without execution."
+        : "Network connection interrupted during voice capture; session failed safely without duplicate effects.";
+    return this.transition(sessionId, {
+      eventId,
+      eventSeq,
+      targetState: "error",
+      errorCode,
+      errorMessage,
+    });
+  }
 }

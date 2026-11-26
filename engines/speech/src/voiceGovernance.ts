@@ -62,12 +62,21 @@ export interface ProcessVoiceUtteranceInput {
 
 export interface ProcessVoiceUtteranceResult {
   session: VoiceSessionRecord;
-  outcome: "dictated_text_only" | "awaiting_review_clarify" | "ready_to_propose";
+  outcome: "silence_no_op" | "dictated_text_only" | "awaiting_review_clarify" | "ready_to_propose";
   effectiveTranscript: string;
   literalText?: string;
   executableCommand: string | null;
   isMock: boolean;
   warnings: string[];
+}
+
+const NOISE_OR_FILLER_RE =
+  /^(?:[\s.,!?;:\-–—…'"()[\]]*|\[(?:noise|silence|background\s*noise|inaudible|static|cough|music)\]|(?:uh+|um+|ah+|er+|hmm+|អឺ+|អឹ+)[.,!?\s]*)$/i;
+
+export function isSilenceOrNoiseUtterance(transcript: string): boolean {
+  const trimmed = transcript.trim();
+  if (trimmed.length === 0) return true;
+  return NOISE_OR_FILLER_RE.test(trimmed);
 }
 
 export const DEFAULT_VOICE_POLICY = (tenantId: string): VoicePolicyConfig => ({
@@ -220,7 +229,32 @@ export class VoiceGovernancePipeline {
       const confidence = input.overrideConfidence ?? asr.confidence;
       const retainAudio = input.policy.audioRetentionMode === "opt_in_short_term";
 
-      // 5. Tenant-scoped terminology normalization (VOC-T17)
+      // 4b. Silence / background noise / filler-only guard (VOC-T16) — zero business mutation
+      if (isSilenceOrNoiseUtterance(asr.transcript)) {
+        const canceled = this.sessions.transition(created.sessionId, {
+          eventId: `${created.sessionId}:silence-noop`,
+          eventSeq: 5,
+          targetState: "canceled",
+          errorCode: "VOICE_SILENCE_OR_NOISE",
+          errorMessage: "No actionable speech detected (silence or background noise only).",
+        }).session;
+        if (this.quota && reservationId) {
+          await this.quota.releaseVoiceSeconds(input.actor.tenantId, reservationId);
+        }
+        return {
+          session: canceled,
+          outcome: "silence_no_op",
+          effectiveTranscript: "",
+          executableCommand: null,
+          isMock: asr.isMock,
+          warnings: [
+            ...asr.warnings,
+            "No actionable speech detected (silence/background noise); no operation executed.",
+          ],
+        };
+      }
+
+      // 5. Tenant-scoped terminology normalization (VOC-T14)
       const norm = this.terminology.normalizeTranscript(input.actor.tenantId, asr.transcript);
 
       // 6. Strict Dictation Mode Isolation (VOC-T08, VOC-T09) — NEVER executes imperatives!
@@ -454,5 +488,52 @@ export class VoiceGovernancePipeline {
       quotaReleased = true;
     }
     return { session: canceled, quotaReleased };
+  }
+
+  /**
+   * Terminates all active voice sessions for an actor on sign-out, tenant switch, or UI close,
+   * releasing any active voice-seconds quota reservations (VOC-T27 / PLT-T13).
+   */
+  async cancelOnActorSessionEnd(
+    tenantId: string,
+    actorId: string,
+    reason = "ACTOR_SESSION_ENDED",
+  ): Promise<{ terminatedSessions: VoiceSessionRecord[]; releasedReservations: number }> {
+    const terminatedSessions = this.sessions.terminateActiveSessionsForActor(tenantId, actorId, reason);
+    let releasedReservations = 0;
+    if (this.quota) {
+      for (const sess of terminatedSessions) {
+        if (sess.reservationId) {
+          await this.quota.releaseVoiceSeconds(sess.tenantId, sess.reservationId);
+          releasedReservations += 1;
+        }
+      }
+    }
+    return { terminatedSessions, releasedReservations };
+  }
+
+  /**
+   * Handles hardware microphone disconnect (VOC-T17) or mid-recording network failure (VOC-T18),
+   * transitioning the session safely to error with audio wiped and releasing reserved quota.
+   */
+  async handleInterruption(params: {
+    sessionId: string;
+    kind: "microphone_disconnected" | "network_failure";
+    eventId: string;
+    eventSeq: number;
+  }): Promise<{ session: VoiceSessionRecord; quotaReleased: boolean }> {
+    const before = this.sessions.getSession(params.sessionId);
+    const outcome = this.sessions.handleHardwareOrNetworkInterruption(
+      params.sessionId,
+      params.kind,
+      params.eventId,
+      params.eventSeq,
+    );
+    let quotaReleased = false;
+    if (this.quota && before?.reservationId) {
+      await this.quota.releaseVoiceSeconds(before.tenantId, before.reservationId);
+      quotaReleased = true;
+    }
+    return { session: outcome.session, quotaReleased };
   }
 }

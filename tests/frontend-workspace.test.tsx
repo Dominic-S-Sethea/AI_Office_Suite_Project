@@ -405,4 +405,253 @@ describe("Wave 1 Frontend & Tiptap Codec Verification (C8 & C9)", () => {
     expect(activeDocBtn.getAttribute("aria-current")).toBe("true");
     expect(screen.getByLabelText("Import DOCX file")).toBeTruthy();
   });
+
+  it("TF-11: covers apiClient.ts utilities (safeReadJson, formatApiErrorMessage 429/503/fallback, arrayBufferToBase64, focus trap)", async () => {
+    const apiClient = await import("../apps/web/src/lib/apiClient.ts");
+
+    expect(apiClient.MAX_DOCX_UPLOAD_BYTES).toBe(10 * 1024 * 1024);
+
+    // safeReadJson valid & malformed JSON fallback
+    const okJson = await apiClient.safeReadJson(new Response(JSON.stringify({ ok: true }), { status: 200 }));
+    expect(okJson.ok).toBe(true);
+    const badJson = await apiClient.safeReadJson(new Response("<html>502 Bad Gateway</html>", { status: 502 }));
+    expect(badJson.error).toBe("Request failed with HTTP 502");
+
+    // formatApiErrorMessage: 429 with header, 429 without valid header, 503 SERVICE_BUSY, generic fallback
+    expect(
+      apiClient.formatApiErrorMessage(
+        new Response("", { status: 429, headers: { "Retry-After": "15" } }),
+        {},
+        "Fallback",
+      ),
+    ).toContain("wait 15s");
+    expect(
+      apiClient.formatApiErrorMessage(new Response("", { status: 429 }), {}, "Fallback"),
+    ).toContain("wait a moment");
+    expect(
+      apiClient.formatApiErrorMessage(
+        new Response("", { status: 503, headers: { "Retry-After": "7" } }),
+        { code: "SERVICE_BUSY" },
+        "Fallback",
+      ),
+    ).toContain("retry in 7s");
+    expect(
+      apiClient.formatApiErrorMessage(new Response("", { status: 400 }), { error: "Custom error" }, "Fallback"),
+    ).toBe("Custom error");
+    expect(
+      apiClient.formatApiErrorMessage(new Response("", { status: 500 }), {}, "Fallback message"),
+    ).toBe("Fallback message");
+
+    // arrayBufferToBase64 multi-byte roundtrip
+    const bytes = new Uint8Array([72, 101, 108, 108, 111]);
+    expect(apiClient.arrayBufferToBase64(bytes.buffer)).toBe("SGVsbG8=");
+
+    // Focus trap utility (Tab forward & Shift+Tab backward wrapping inside modal container)
+    const modal = document.createElement("div");
+    const btn1 = document.createElement("button");
+    btn1.textContent = "First";
+    const btn2 = document.createElement("button");
+    btn2.textContent = "Last";
+    modal.appendChild(btn1);
+    modal.appendChild(btn2);
+    document.body.appendChild(modal);
+    Object.defineProperty(btn1, "offsetParent", { value: modal, configurable: true });
+    Object.defineProperty(btn2, "offsetParent", { value: modal, configurable: true });
+
+    expect(apiClient.getFocusableElements(modal)).toHaveLength(2);
+    btn2.focus();
+    const tabForward = new KeyboardEvent("keydown", { key: "Tab", cancelable: true });
+    apiClient.trapDialogTabKey(modal, tabForward);
+    expect(tabForward.defaultPrevented).toBe(true);
+    expect(document.activeElement).toBe(btn1);
+
+    btn1.focus();
+    const tabBack = new KeyboardEvent("keydown", { key: "Tab", shiftKey: true, cancelable: true });
+    apiClient.trapDialogTabKey(modal, tabBack);
+    expect(tabBack.defaultPrevented).toBe(true);
+    expect(document.activeElement).toBe(btn2);
+
+    // Non-Tab key or null container is a safe no-op
+    const escEv = new KeyboardEvent("keydown", { key: "Escape", cancelable: true });
+    apiClient.trapDialogTabKey(modal, escEv);
+    expect(escEv.defaultPrevented).toBe(false);
+    document.body.removeChild(modal);
+  });
+
+  it("TF-11 / VOC-T27 / VOC-T28: exercises AiVoicePanel keyboard Ctrl+Enter, dictation mode, PTT mic lifecycle & unmount cleanup, approve/reject, undo, 401 & 409", async () => {
+    const onDocumentUpdated = vi.fn(async () => {});
+    const onRevisionConflict = vi.fn();
+    const onUnauthorized = vi.fn();
+    const stopTrackSpy = vi.fn();
+
+    // 1. Mock getUserMedia -> start PTT -> unmount cleans up active microphone stream immediately (VOC-T27)
+    const originalMediaDevices = navigator.mediaDevices;
+    Object.defineProperty(navigator, "mediaDevices", {
+      configurable: true,
+      value: {
+        getUserMedia: vi.fn(async () => ({
+          getTracks: () => [{ stop: stopTrackSpy }],
+        })),
+      },
+    });
+
+    const mockProposal = {
+      operationId: "op-ui-1",
+      documentId: sampleBilingualDoc.documentId,
+      expectedRevision: 2,
+      action: "insert_text",
+      params: { text: "Quarterly update" },
+      requestedBy: "u1",
+      riskLevel: "low",
+      requiresApproval: true,
+      source: "typed_ai",
+      inputLanguage: "en",
+      outputLanguage: "en",
+      originalCommand: 'insert "Quarterly update"',
+      explanation: "Insert dictated text into paragraph.",
+      previewDiff: {
+        targetBlockId: "blk_para_en",
+        beforeText: "Operational summary",
+        afterText: "Operational summary Quarterly update",
+      },
+      createdAt: "2026-11-26T00:00:00.000Z",
+    };
+
+    let applyStatus = 200;
+    let planStatus = 200;
+    let transcribeStatus = 200;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.includes("/api/speech/transcribe")) {
+          if (transcribeStatus === 401) return new Response(JSON.stringify({ error: "Expired" }), { status: 401 });
+          return new Response(
+            JSON.stringify({
+              recognition: {
+                provider: "mock",
+                isMock: true,
+                language: "km-KH",
+                transcript: "បញ្ចូលតារាង ៣x៣",
+                confidence: 0.99,
+                disclaimer: "Mock adapter",
+              },
+            }),
+            { status: transcribeStatus },
+          );
+        }
+        if (url.includes("/ai/plan")) {
+          if (planStatus === 401) return new Response(JSON.stringify({ error: "Expired" }), { status: 401 });
+          if (planStatus === 409) return new Response(JSON.stringify({ error: "Stale rev" }), { status: 409 });
+          return new Response(JSON.stringify({ proposal: mockProposal }), { status: 200 });
+        }
+        if (url.includes("/ai/apply")) {
+          if (applyStatus === 401) return new Response(JSON.stringify({ error: "Expired" }), { status: 401 });
+          if (applyStatus === 409) return new Response(JSON.stringify({ error: "Conflict on apply" }), { status: 409 });
+          return new Response(JSON.stringify({ document: sampleBilingualDoc }), { status: 200 });
+        }
+        return new Response(JSON.stringify({}), { status: 200 });
+      }),
+    );
+
+    const { unmount } = render(
+      <AiVoicePanel
+        documentId={sampleBilingualDoc.documentId}
+        revision={2}
+        readOnly={false}
+        selectionBlockId="blk_para_en"
+        selectedText="Operational"
+        onDocumentUpdated={onDocumentUpdated}
+        onRevisionConflict={onRevisionConflict}
+        onUnauthorized={onUnauthorized}
+        apiHeaders={{ "x-test": "1" }}
+      />,
+    );
+
+    // Start PTT mic -> verify active status -> unmount stops track (VOC-T27)
+    fireEvent.click(screen.getByRole("button", { name: "Mic Test (Mock STT)" }));
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: /Stop & Run Mock STT/ })).toBeTruthy();
+    });
+    unmount();
+    expect(stopTrackSpy).toHaveBeenCalledTimes(1);
+
+    // 2. Full interactive & keyboard flow (VOC-T28): language/mode selectors, Ctrl+Enter plan, Reject, Approve & Apply, Undo
+    render(
+      <AiVoicePanel
+        documentId={sampleBilingualDoc.documentId}
+        revision={2}
+        readOnly={false}
+        selectionBlockId="blk_para_en"
+        selectedText="Operational"
+        onDocumentUpdated={onDocumentUpdated}
+        onRevisionConflict={onRevisionConflict}
+        onUnauthorized={onUnauthorized}
+        apiHeaders={{}}
+      />,
+    );
+
+    // Switch input language to km, output to en, mode to dictation
+    const selects = screen.getAllByRole("combobox");
+    fireEvent.change(selects[0]!, { target: { value: "km" } });
+    fireEvent.change(selects[1]!, { target: { value: "en" } });
+    fireEvent.change(selects[2]!, { target: { value: "dictation" } });
+
+    // Start & Stop PTT runs Mock STT cleanly
+    fireEvent.click(screen.getByRole("button", { name: "Mic Test (Mock STT)" }));
+    await waitFor(() => expect(screen.getByRole("button", { name: /Stop & Run Mock STT/ })).toBeTruthy());
+    fireEvent.click(screen.getByRole("button", { name: /Stop & Run Mock STT/ }));
+    await waitFor(() => expect(screen.getByText(/SIMULATED \(isMock: true\)/)).toBeTruthy());
+
+    // Type text and trigger Ctrl+Enter keyboard shortcut (VOC-T28)
+    const textbox = screen.getByRole("textbox");
+    fireEvent.change(textbox, { target: { value: "" } });
+    fireEvent.change(textbox, { target: { value: "Quarterly update" } });
+    fireEvent.keyDown(textbox, { key: "Enter", ctrlKey: true });
+    await waitFor(() => expect(screen.getByText(/Proposed Action: insert_text/)).toBeTruthy());
+
+    // Reject clears proposal cleanly
+    fireEvent.click(screen.getByRole("button", { name: "Reject" }));
+    expect(screen.queryByText(/Proposed Action: insert_text/)).toBeNull();
+
+    // Plan again & Approve & Apply
+    fireEvent.click(screen.getByRole("button", { name: "Plan Operation" }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Approve & Apply" })).toBeTruthy());
+    fireEvent.click(screen.getByRole("button", { name: "Approve & Apply" }));
+    await waitFor(() => expect(onDocumentUpdated).toHaveBeenCalledTimes(1));
+
+    // Apply 409 conflict & 401 unauthorized paths
+    fireEvent.click(screen.getByRole("button", { name: "Undo Last Change" }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Approve & Apply" })).toBeTruthy());
+    applyStatus = 409;
+    fireEvent.click(screen.getByRole("button", { name: "Approve & Apply" }));
+    await waitFor(() => expect(onRevisionConflict).toHaveBeenCalled());
+
+    planStatus = 401;
+    fireEvent.click(screen.getByRole("button", { name: "Plan Operation" }));
+    await waitFor(() => expect(onUnauthorized).toHaveBeenCalled());
+
+    transcribeStatus = 401;
+    fireEvent.click(screen.getByRole("button", { name: "Mock KM Voice" }));
+    await waitFor(() => expect(onUnauthorized.mock.calls.length).toBeGreaterThanOrEqual(2));
+
+    // Denied microphone permission shows safe status and preserves text controls (VOC-T01)
+    Object.defineProperty(navigator, "mediaDevices", {
+      configurable: true,
+      value: {
+        getUserMedia: vi.fn(async () => {
+          throw new Error("PermissionDeniedError");
+        }),
+      },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Mic Test (Mock STT)" }));
+    await waitFor(() => {
+      expect(screen.getByText(/Microphone permission denied or unavailable/)).toBeTruthy();
+    });
+
+    Object.defineProperty(navigator, "mediaDevices", {
+      configurable: true,
+      value: originalMediaDevices,
+    });
+  });
 });

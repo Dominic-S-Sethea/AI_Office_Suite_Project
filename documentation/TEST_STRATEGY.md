@@ -21,10 +21,15 @@
 | **FR-06 Presentation (`PS-00`)** | `tests/g1-ps00-presentation-feasibility.test.ts` | `PPT-T01..T20` local verification + `.pptm`/traversal/macro/prompt-injection blocks + PptxGenJS 5/20/50-slide benchmarks + 6-page HarfBuzz PDF & visual slide PNGs (`PPT-T06` reference PowerPoint viewer open pending) |
 | **FR-07 BI & `X-VIS` (`BI-00`)** | `tests/g1-bi00-intelligence-feasibility.test.ts` | `BI-T01..T32` + `X-VIS-01..08` against §12 Golden Fixture, ECharts SSR SVG + Edge PNG + Vega-Lite JSON parity, `DataScopePolicy` row/col/cache/export isolation, revocation, refresh/snapshot/race-guard, 10k/100k benchmarks (`BI-T33..T34` pending P1) |
 | **FR-08 Integration (`XI-00`)** | `tests/g1-xi00-cross-module-integration.test.ts` | `INT-T01..T24` across all 4 studios + FR-05 + real PGlite PG RLS/outbox: V1/V2/V3 versioning, rename resilience, pinned snapshots vs draft refresh, metric impact, schema break block, BOLA, revocation, dependency redaction, workflow failure/cancel/DB-rehydrate recovery, `409` conflicts, approval invalidation, atomic TX rollback/commit, disclosure PPTX, policy cache invalidation, EN/KM parity |
+| **FR-09/10/11 V1.4 Aligned (`AIC-00`, `VI-00`, `PA-00`, `GOV`)** | `tests/v13-{aic00,vi00,pa00,integrated}*.test.ts` | 1:1 V1.4 Appendix A aligned coverage of `AI-T01..28`, `VOC-T01..30`, `PLT-T01..36` (including live PostgreSQL 16 `aios_pa00_app` non-superuser RLS & backup/restore revoked-member security parity), and `GOV-T01..08` |
+| **V1.4 Consolidation (`TF-01`)** | `tests/v14-rc00-consolidation-and-tf01.test.ts` | `RC-T01..08` (including live `RC-T07` automated RTM parser proving 51 parents / 46 P0 / 5 P1 / 313 unique test IDs), `RC-P1-01..05` fail-closed gates (all 7 `VOC-03` `423` checks), `DOC-T01/03/08/09`, `SHT-T11/12/15/16`, and `TF-11` CycloneDX 1.5 SBOM verification |
+| **1M-Row DuckDB Spill (`TF-04`)** | `tests/tf04-duckdb-1m-and-stats.test.ts` | Bounded 1,000,000-row bilingual USD/KHR DuckDB spill-to-disk benchmark (`memory_limit='256MB'`, `temp_directory`, `enable_external_access=false`, exact BigInt parity) + `RC-T02` exact descriptive statistics |
+| **Supply Chain & Frontend (`TF-11`)** | `scripts/generate-sbom.mjs`, `tests/frontend-workspace.test.tsx` | Zero-dependency CycloneDX 1.5 JSON SBOM (`npm run sbom`), `apiClient.ts` utilities/focus-trap coverage, and `AiVoicePanel.tsx` keyboard (`Ctrl+Enter`, `VOC-T28`) & unmount mic cleanup (`VOC-T27`) |
 
-## 2. Pending Test Suites (Future Phases)
+## 2. Pending External Verification Gates (Blocked Until `APPROVAL-04..07`)
 
-- Desktop Microsoft PowerPoint / LibreOffice Impress visual compatibility audit (`PPT-T06` reference viewer open).
-- Live native Khmer (`km-KH`) & English (`en-US`) consented multi-speaker WER/CER evaluation (`D5`).
-- Playwright browser UI E2E & WCAG 2.2 AA accessibility audit (`D3` / `D8`).
-- Managed PostgreSQL failover, P1 BI alerts/scheduling (`BI-T33..T34`), and P1 forecasting backtest coverage (`AN-08` / `ENG-BI-11` / `D8`).
+- Desktop Microsoft Word / Excel / PowerPoint reference round-trip compatibility (`PPT-T06`, `NFR-T33`, `NFR-T34`, `NFR-T35` — `TF-05`/`TF-06`).
+- Live bilingual LLM benchmark (`NFR-T30` — `TF-02`) and consented native Khmer (`km-KH`) & English human speech WER/CER corpus (`NFR-T31` — `TF-03`).
+- Multi-user staging load, cloud multi-AZ HA failover, and live telemetry/alerting drills (`NFR-T01`, `NFR-T02`, `NFR-T14`, `NFR-T17`, `NFR-T19` — `TF-09`).
+- Independent external penetration test (`NFR-T29` — `TF-12`) and full live production E2E drill (`E2E-06`).
+

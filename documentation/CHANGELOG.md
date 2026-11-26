@@ -1,5 +1,15 @@
 # Changelog — AI Office Suite
 
+## [0.7.0-v1.4-rc00-tf01] — 2026-11-26 (V1.4 Consolidation `RC-00`/`QE-00`/`TF-01` + Zero-Cost Stage 4 `TF-04`/`TF-11`)
+
+### Added & Verified (`CR-008`, `APPROVAL-01..03`, `TD-V14-01`)
+- **Verbatim V1.4 Archive & Canonical Consolidation Pack (`TF-01`):** Archived `documentation/AI_Office_Suite_FR12_FR13_Main_Research_Report_V1.4.md` verbatim; authored `REQUIREMENTS_TRACEABILITY_MATRIX.md` (all `51` original parent IDs: `46 P0`, `5 P1`, and all `313` canonical defined test IDs), `QUALITY_ACCEPTANCE_MATRIX.md`, and `TECHNICAL_FEASIBILITY_PLAN.md` (`TF-01..TF-12`, `APPROVAL-01..07`); recorded `CR-008` (`S1 -> S2 -> S3` progressive delivery order) across `REQUIREMENTS_REGISTER.md`, `DEVELOPMENT_ROADMAP.md`, `TECHNICAL_DECISIONS.md`, `TEST_STRATEGY.md`, and `DEVELOPMENT_STATUS.md`.
+- **1:1 V1.4 Appendix A Test Realignment & New Production Guards:** Realigned `tests/v13-{aic00,vi00,pa00,integrated}*.test.ts` 1:1 with V1.4 Appendix A (`AI-T01..28`, `VOC-T01..30`, `PLT-T01..36`, `GOV-T01..08`); added `terminateActiveSessionsForActor` & `handleHardwareOrNetworkInterruption` (`engines/speech/src/voiceSession.ts`), `silence_no_op` & `cancelOnActorSessionEnd` (`engines/speech/src/voiceGovernance.ts`), `evaluateModelUpgradeRegression` (`modules/ai/src/providers.ts`), and exact `computeDescriptiveStatistics` (`engines/analytics/src/precision.ts`).
+- **Consolidation Suite (`tests/v14-rc00-consolidation-and-tf01.test.ts`):** Implemented `RC-T01..RC-T08` (including live automated `RC-T07` RTM parser proving `51` parents / `46 P0` / `5 P1` / `313` unique test IDs), `RC-P1-01..RC-P1-05` fail-closed P1 gates (all 7 `VOC-03` `423` checks), and missing `DOC-T01/03/08/09` & `SHT-T11/12/15/16` edge assertions.
+- **High-Severity Backup/Restore Security Fix (`PLT-T35` / `GOV-T08`):** Discovered and fixed a real defect in `restorePaExtendedLogicalBackup` (`platform/database/src/governanceRepository.ts`) where PA-00 additive core columns (`memberships.status`, `memberships.content_access`, `workspaces.visibility`, `organizations.mfa_required_for_privileged`) reverted to defaults during restore; revoked memberships and restricted workspaces now survive restore with exact parity.
+- **Bounded 1M-Row DuckDB Spill Benchmark (`TF-04`, `tests/tf04-duckdb-1m-and-stats.test.ts`):** Verified 1,000,000 bilingual USD/KHR rows in DuckDB (`memory_limit='256MB'`, `temp_directory`, `enable_external_access=false`) in `~0.6s` with exact BigInt minor-unit parity (`$25,000,000.00` + `៛102,000,000,000`).
+- **Supply-Chain SBOM & Frontend Coverage Boost (`TF-11`):** Added zero-dependency CycloneDX 1.5 JSON generator `scripts/generate-sbom.mjs` (`npm run sbom`, `620` components / `358` runtime required, SHA-512 SRI hashes) and expanded `tests/frontend-workspace.test.tsx` covering `apiClient.ts` utilities/focus-trap and `AiVoicePanel.tsx` keyboard (`VOC-T28`) & unmount mic cleanup (`VOC-T27`).
+
 ## [0.6.0-v1.3-feasibility] — 2026-11-26 (V1.3 Bounded Feasibility: FR-11 `PA-00`, FR-09 `AIC-00`, FR-10 `VI-00` & Integrated Slice)
 
 ### Added & Verified (`CR-007`, `TD-PA-01`, `TD-AIC-01`, `TD-VOICE-02`)

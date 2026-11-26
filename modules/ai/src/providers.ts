@@ -414,3 +414,103 @@ export async function benchmarkDirectAdapterVsSdkWrapper(
     ],
   };
 }
+
+export interface ModelUpgradeBenchmarkCase {
+  caseId: string;
+  category: "safety" | "financial_reconciliation" | "bilingual_khmer" | "structured_output" | "general";
+  critical: boolean;
+  passed: boolean;
+  notes?: string;
+}
+
+export interface ModelUpgradeRegressionReport {
+  baselineModelId: string;
+  candidateModelId: string;
+  baselinePassRate: number;
+  candidatePassRate: number;
+  minPassRate: number;
+  regressedCases: string[];
+  criticalRegressions: string[];
+  approvedForActivation: boolean;
+  blockReasons: string[];
+}
+
+/**
+ * Evaluates a candidate AI model version against the active baseline benchmark suite
+ * before activation (AI-T24 / NFR-T38). Blocks activation fail-closed if any critical
+ * safety/financial invariant regresses or pass rate drops below threshold or baseline.
+ */
+export function evaluateModelUpgradeRegression(params: {
+  baselineModelId: string;
+  candidateModelId: string;
+  baselineResults: readonly ModelUpgradeBenchmarkCase[];
+  candidateResults: readonly ModelUpgradeBenchmarkCase[];
+  minPassRate?: number;
+}): ModelUpgradeRegressionReport {
+  const minPassRate = params.minPassRate ?? 0.95;
+  const blockReasons: string[] = [];
+
+  if (params.baselineResults.length === 0 || params.candidateResults.length === 0) {
+    return {
+      baselineModelId: params.baselineModelId,
+      candidateModelId: params.candidateModelId,
+      baselinePassRate: 0,
+      candidatePassRate: 0,
+      minPassRate,
+      regressedCases: [],
+      criticalRegressions: [],
+      approvedForActivation: false,
+      blockReasons: ["MISSING_BENCHMARK_RESULTS"],
+    };
+  }
+
+  const baselineMap = new Map(params.baselineResults.map((c) => [c.caseId, c]));
+  const candidateMap = new Map(params.candidateResults.map((c) => [c.caseId, c]));
+
+  const regressedCases: string[] = [];
+  const criticalRegressions: string[] = [];
+
+  for (const [caseId, baseCase] of baselineMap.entries()) {
+    const candCase = candidateMap.get(caseId);
+    if (!candCase) {
+      regressedCases.push(caseId);
+      if (baseCase.critical) criticalRegressions.push(caseId);
+      continue;
+    }
+    if (baseCase.passed && !candCase.passed) {
+      regressedCases.push(caseId);
+      if (baseCase.critical || candCase.critical) {
+        criticalRegressions.push(caseId);
+      }
+    } else if (!candCase.passed && (baseCase.critical || candCase.critical)) {
+      criticalRegressions.push(caseId);
+    }
+  }
+
+  const baselinePassed = params.baselineResults.filter((c) => c.passed).length;
+  const candidatePassed = params.candidateResults.filter((c) => c.passed).length;
+  const baselinePassRate = Number((baselinePassed / params.baselineResults.length).toFixed(4));
+  const candidatePassRate = Number((candidatePassed / params.candidateResults.length).toFixed(4));
+
+  if (criticalRegressions.length > 0) {
+    blockReasons.push(`CRITICAL_REGRESSION:${criticalRegressions.join(",")}`);
+  }
+  if (candidatePassRate < minPassRate) {
+    blockReasons.push(`BELOW_MIN_PASS_RATE:${candidatePassRate}<${minPassRate}`);
+  }
+  if (candidatePassRate < baselinePassRate) {
+    blockReasons.push(`BELOW_BASELINE_PASS_RATE:${candidatePassRate}<${baselinePassRate}`);
+  }
+
+  return {
+    baselineModelId: params.baselineModelId,
+    candidateModelId: params.candidateModelId,
+    baselinePassRate,
+    candidatePassRate,
+    minPassRate,
+    regressedCases,
+    criticalRegressions,
+    approvedForActivation: blockReasons.length === 0,
+    blockReasons,
+  };
+}

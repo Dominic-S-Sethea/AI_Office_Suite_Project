@@ -75,3 +75,13 @@
 - **Advanced Voice Intelligence (`VOC-01`..`02` P0, `VOC-03` P1 -> 30 subrequirements `VOC-01.01..03.07`):** Bounded **`VI-00`** feasibility (`engines/speech`: `VoiceSessionManager`, `validateVoiceCriticalFields` EN/KM numerals/USD-vs-KHR/format-vs-FX, org-versioned `TerminologyRegistry`, `VoiceGovernancePipeline` dictation isolation & ephemeral audio wiping) verified across **`VOC-T01..VOC-T23`** (mocked ASR `isMock: true` + fail-closed `423` cloud STT) and fail-closed P1/corpus gate checks **`VOC-T24..VOC-T30`** (`tests/v13-vi00-voice-intelligence.test.ts`). Live native Khmer (`km-KH`) acoustic WER/CER remains **PENDING consented human corpus**.
 - **Shared Platform Administration & NFRs (`PLT-01`..`06` P0/P1 -> 40 subrequirements `PLT-01.01..06.07`, `NFR-01`..`04` P0):** Bounded **`PA-00`** feasibility (`platform/authorization` 8-role `PolicyDecisionEngine`, `platform/database` 9 new `FORCE RLS` `pa_*` tables + `PlatformGovernanceService`, `platform/storage` `LocalPrivateObjectStore`) verified across all 36 acceptance IDs **`PLT-T01..PLT-T36`** (`tests/v13-pa00-platform-admin.test.ts`) and 8 cross-cutting scenarios **`GOV-T01..GOV-T08`** (`tests/v13-integrated-golden-governance.test.ts`). Live billing/Stripe (`PLT-06.07`), external OIDC/SCIM (`PLT-01.10`), and production `PA-01+` remain gated.
 - **End-to-End Scenarios (`E2E-01`..`06`, `SHT-T01`..`T18`, `GOV-T01`..`T08`):** `d1-vertical-slice-api.test.ts` covers Document §16 slice; `d1-spreadsheet-feasibility.test.ts` covers `SHT-T01..T18`; `v13-integrated-golden-governance.test.ts` verifies the V1.3 §5.1 two-tenant golden workflow (`GOV-T01..T08`).
+
+## 5. V1.4 Complete Consolidation (`CR-008` / `FR-12` + `FR-13` + `TF-01`)
+
+- **Change Record `CR-008` (`APPROVAL-01` & `APPROVAL-02`, 2026-11-26):** Adopted progressive delivery ordering **`S1 -> S2 -> S3`** while preserving **100% of all 51 original parent requirements (`46 P0`, `5 P1`)** and **all 313 defined acceptance test IDs** without silent scope deletion.
+- **Canonical Traceability Artifacts:**
+  - Verbatim V1.4 archive: `documentation/AI_Office_Suite_FR12_FR13_Main_Research_Report_V1.4.md`
+  - Master 51-parent + 313-test matrix (verified live by automated parser `RC-T07`): `documentation/REQUIREMENTS_TRACEABILITY_MATRIX.md`
+  - Consolidated `FR-12` quality acceptance matrix (`NFR-01..04`, `NFR-T01..T40`): `documentation/QUALITY_ACCEPTANCE_MATRIX.md`
+  - Stage 4 Technical Feasibility Plan (`TF-01..TF-12`, `APPROVAL-01..07`): `documentation/TECHNICAL_FEASIBILITY_PLAN.md`
+

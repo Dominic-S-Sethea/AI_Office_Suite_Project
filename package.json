@@ -23,6 +23,7 @@
     "test:coverage": "vitest run --coverage",
     "lint:licenses": "node scripts/check-licenses.mjs",
     "lint:hygiene": "node scripts/check-hygiene.mjs",
+    "sbom": "node scripts/generate-sbom.mjs",
     "bench:check": "node scripts/bench-check.mjs",
     "db:migrate": "node scripts/db-cli.mjs migrate",
     "db:verify-rls": "node scripts/db-cli.mjs verify-rls",

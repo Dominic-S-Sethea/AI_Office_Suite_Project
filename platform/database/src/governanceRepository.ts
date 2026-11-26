@@ -2336,6 +2336,46 @@ export async function restorePaExtendedLogicalBackup(
   const toJson = (v: unknown) => (v == null ? null : typeof v === "string" ? v : JSON.stringify(v));
 
   await targetDb.withTransaction(async (tx) => {
+    // Restore PA-00 additive columns on core tables so revoked/suspended memberships,
+    // restricted workspaces, and MFA enforcement survive backup/restore with exact parity (PLT-T35 / GOV-T08).
+    for (const o of snapshot.coreAndXi.organizations as Array<Record<string, unknown>>) {
+      if (o.mfa_required_for_privileged !== undefined) {
+        await tx.query(
+          `UPDATE organizations
+           SET mfa_required_for_privileged = $2
+           WHERE tenant_id = $1::uuid`,
+          [o.tenant_id, Boolean(o.mfa_required_for_privileged)],
+        );
+      }
+    }
+    for (const w of snapshot.coreAndXi.workspaces as Array<Record<string, unknown>>) {
+      if (w.visibility !== undefined) {
+        await tx.query(
+          `UPDATE workspaces
+           SET visibility = $3
+           WHERE tenant_id = $1::uuid AND workspace_id = $2::uuid`,
+          [w.tenant_id, w.workspace_id, String(w.visibility)],
+        );
+      }
+    }
+    for (const m of snapshot.coreAndXi.memberships as Array<Record<string, unknown>>) {
+      if (m.status !== undefined || m.content_access !== undefined) {
+        await tx.query(
+          `UPDATE memberships
+           SET status = COALESCE($4, status),
+               content_access = COALESCE($5, content_access)
+           WHERE tenant_id = $1::uuid AND workspace_id = $2::uuid AND user_id = $3::uuid`,
+          [
+            m.tenant_id,
+            m.workspace_id,
+            m.user_id,
+            m.status !== undefined ? String(m.status) : null,
+            m.content_access !== undefined ? Boolean(m.content_access) : null,
+          ],
+        );
+      }
+    }
+
     for (const r of snapshot.paTables.paPlanVersions) {
       await tx.query(
         `INSERT INTO pa_plan_versions (plan_id, version, display_name, entitlements_json, created_at)

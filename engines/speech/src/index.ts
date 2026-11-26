@@ -92,8 +92,9 @@ export class MockSpeechAdapter implements SpeechRecognitionAdapter {
       "MOCK SPEECH ADAPTER: Live acoustic ASR is disabled in Phase D1 until founder authorization.",
     ];
 
+    const hasExplicitSimulated = request.simulatedTranscript !== undefined;
     let transcript = request.simulatedTranscript?.trim() ?? "";
-    if (!transcript && request.fixtureId) {
+    if (!hasExplicitSimulated && !transcript && request.fixtureId) {
       const fixture = SYNTHETIC_VOICE_FIXTURES.find((f) => f.fixtureId === request.fixtureId);
       if (!fixture) {
         throw new SpeechProviderError(404, "FIXTURE_NOT_FOUND", `Unknown voice fixture '${request.fixtureId}'.`);
@@ -101,7 +102,7 @@ export class MockSpeechAdapter implements SpeechRecognitionAdapter {
       transcript = fixture.transcript;
     }
 
-    if (!transcript) {
+    if (!hasExplicitSimulated && !transcript) {
       const defaultFixture = SYNTHETIC_VOICE_FIXTURES.find((f) => f.language === request.language);
       transcript =
         defaultFixture?.transcript ??

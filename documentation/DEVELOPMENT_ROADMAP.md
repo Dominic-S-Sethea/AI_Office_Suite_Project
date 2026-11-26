@@ -67,3 +67,16 @@
 | **XI-00** | Cross-module integration feasibility, PG RLS/outbox commit, shared `ArtifactReference`/`LinkedObjectBinding`/`ReportingPackageManifest`, EN/KM planner & `INT-T01..T24` | **Complete (Local Feasibility Verified)** | Verified `3/3` integration test blocks (`INT-T01..T24`) + `12/12` workspace suites |
 | **XI-01 – XI-09** | Production Artifact Registry, Linked Object Intelligence UI, dependency/impact explorer, refresh previews, durable worker workflows, Reporting Package Manager, live EN/KM AI & voice workflows, full QA/security audit | **Gated Pending XI-00 Review & Module/FR-09/FR-10 Gates** | Requires production studios (`D3`, `SS-01`, `DP-01`, `AN-01`, `PS-01`, `ENG-BI-01`) + hosted PostgreSQL/object storage |
 | **XI-10** | Advanced automation (`INT-04.01` scheduled refresh, `INT-04.02` visual builder, `INT-04.03` external connectors) | **Pending P1 Authorization** | Out of P0 MVP scope |
+
+## 8. V1.4 Progressive Delivery Order (`CR-008` / `APPROVAL-01`) & Stage 4 Entry
+
+Approved progressive delivery order preserves all **51 original parent requirements (`46 P0`, `5 P1`)** while sequencing production engineering cleanly after Stage 4 feasibility exits:
+
+| Milestone Slice | Scope Focus | Status | Exit Gate |
+| :--- | :--- | :--- | :--- |
+| **Stage 4 Local Subset (`TF-01`, `TF-04`, `TF-11`)** | 51-parent / 313-test RTM, V1.4 1:1 test alignment, `RC-T01..08`, 1M-row DuckDB spill, CycloneDX 1.5 SBOM & UI coverage | **VERIFIED_LOCAL** (`APPROVAL-02`, `APPROVAL-03`) | Zero-cost local evidence complete |
+| **Stage 4 External Investigations (`TF-02`, `TF-03`, `TF-05`, `TF-06`, `TF-09`, `TF-12`)** | Live EN/KM LLM benchmark, consented `km-KH` speech corpus, spreadsheet vendor RFP, desktop Office QA, staging HA/load, external pentest | **Gated Pending `APPROVAL-04..07`** | See `documentation/TECHNICAL_FEASIBILITY_PLAN.md` |
+| **S1 — Document-First Vertical Slice** | Production Document Studio (`DOC-01..03`), contextual AI (`AI-01/02/04/06`), EN/KM voice (`VOC-01..02`), platform auth/RLS/files (`PLT-01..04`) | **Gated Pending Stage 4 & `APPROVAL-07`** | Production entry blocked until explicit sign-off |
+| **S2 — Governed Numerical Intelligence** | Spreadsheet Studio (`SHT-01..05`), Data Prep (`DAT-01..06`), Business Analysis (`ANA-01..03`), linked docs (`DOC-04`), AI RAG/budgets (`AI-03/05/07`), jobs/billing (`PLT-05..06`) | **Gated Pending S1 & `TF-05`** | Exact `FIN-POL-V1` parity required |
+| **S3 — Complete Integrated Reporting Workflow** | Presentation Studio (`PPT-01..03`), Intelligence Studio (`BI-01..03`), Cross-Module Integration (`INT-01..03`), full MVP release validation (`NFR-01..04`) | **Gated Pending S2** | All `313` defined tests & external release gates |
+
