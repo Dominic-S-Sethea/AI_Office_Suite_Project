@@ -63,14 +63,217 @@ export interface XlsxStageOptions {
   sheetName?: string;
 }
 
+export type SchemaPatternPreset =
+  | "iso_date"
+  | "email"
+  | "khmer_phone"
+  | "uuid"
+  | "alphanumeric"
+  | "currency_code"
+  | "digits";
+
 export interface SchemaColumnRule {
   column: string;
   required?: boolean;
   type?: "string" | "number" | "date" | "enum";
   min?: number;
   max?: number;
+  preset?: SchemaPatternPreset;
   pattern?: string;
   allowedValues?: string[];
+}
+
+const NAMED_CONTRACT_PRESETS: Record<SchemaPatternPreset, RegExp> = {
+  iso_date: /^\d{4}-\d{2}-\d{2}$/,
+  email: /^[^\s@]{1,64}@[^\s@]{1,180}\.[^\s@]{2,24}$/,
+  khmer_phone: /^(?:\+855|0)[1-9]\d{7,8}$/,
+  uuid: /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i,
+  alphanumeric: /^[A-Za-z0-9_-]{1,128}$/,
+  currency_code: /^[A-Z]{3}$/,
+  digits: /^\d{1,32}$/,
+};
+
+const MAX_CONTRACT_PATTERN_LENGTH = 128;
+const MAX_CONTRACT_QUANTIFIER_BOUND = 64;
+const MAX_CONTRACT_REGEX_CELL_LENGTH = 1024;
+
+/**
+ * Compiles a user-supplied schema-contract regex only after verifying structural ReDoS safety:
+ * rejects backreferences, lookarounds, large bounded quantifiers, nested quantifiers on
+ * quantified/alternated groups, and ambiguous consecutive unbounded quantifiers.
+ */
+export function compileSafeContractPattern(rawPattern: string): RegExp {
+  if (typeof rawPattern !== "string" || rawPattern.length === 0 || rawPattern.length > MAX_CONTRACT_PATTERN_LENGTH) {
+    throw new DataPrepError(
+      400,
+      "INVALID_CONTRACT_PATTERN",
+      `Contract pattern must be a non-empty string <= ${MAX_CONTRACT_PATTERN_LENGTH} characters.`,
+    );
+  }
+
+  let inCharClass = false;
+  let prevWasUnboundedQuantifier = false;
+  let consecutiveUnboundedTokens = 0;
+  const groupStack: Array<{ hasQuantifier: boolean; hasAlternation: boolean }> = [];
+
+  for (let i = 0; i < rawPattern.length; i++) {
+    const ch = rawPattern[i]!;
+    if (ch === "\\") {
+      const next = rawPattern[i + 1];
+      if (!next) {
+        throw new DataPrepError(400, "INVALID_CONTRACT_PATTERN", "Trailing escape in contract pattern.");
+      }
+      if (!inCharClass && (/[1-9]/.test(next) || next === "k")) {
+        throw new DataPrepError(
+          400,
+          "UNSAFE_CONTRACT_PATTERN",
+          "Backreferences are prohibited in schema contract patterns (ReDoS protection).",
+        );
+      }
+      i++;
+      prevWasUnboundedQuantifier = false;
+      continue;
+    }
+
+    if (inCharClass) {
+      if (ch === "]") {
+        inCharClass = false;
+      }
+      continue;
+    }
+
+    if (ch === "[") {
+      inCharClass = true;
+      prevWasUnboundedQuantifier = false;
+      continue;
+    }
+
+    if (ch === "(") {
+      const next = rawPattern[i + 1];
+      if (next === "?") {
+        const afterQ = rawPattern[i + 2];
+        // Allow only non-capturing (?:...) groups; forbid lookarounds (?=, ?!, ?<=, ?<!) and named groups
+        if (afterQ !== ":") {
+          throw new DataPrepError(
+            400,
+            "UNSAFE_CONTRACT_PATTERN",
+            "Lookarounds and special regex group assertions are prohibited in schema contract patterns.",
+          );
+        }
+        i += 2;
+      }
+      if (groupStack.length >= 6) {
+        throw new DataPrepError(400, "UNSAFE_CONTRACT_PATTERN", "Regex group nesting exceeds safe limit.");
+      }
+      groupStack.push({ hasQuantifier: false, hasAlternation: false });
+      prevWasUnboundedQuantifier = false;
+      continue;
+    }
+
+    if (ch === "|") {
+      const top = groupStack[groupStack.length - 1];
+      if (top) top.hasAlternation = true;
+      prevWasUnboundedQuantifier = false;
+      consecutiveUnboundedTokens = 0;
+      continue;
+    }
+
+    if (ch === ")") {
+      const closed = groupStack.pop();
+      if (!closed) {
+        throw new DataPrepError(400, "INVALID_CONTRACT_PATTERN", "Unmatched ')' in schema contract pattern.");
+      }
+      const next = rawPattern[i + 1];
+      const groupFollowedByQuantifier = next === "+" || next === "*" || next === "?" || next === "{";
+      if (groupFollowedByQuantifier && (closed.hasQuantifier || closed.hasAlternation)) {
+        throw new DataPrepError(
+          400,
+          "UNSAFE_CONTRACT_PATTERN",
+          "Nested quantifiers or quantified alternations are prohibited (ReDoS protection).",
+        );
+      }
+      const parent = groupStack[groupStack.length - 1];
+      if (parent) {
+        if (closed.hasQuantifier || groupFollowedByQuantifier) parent.hasQuantifier = true;
+        if (closed.hasAlternation) parent.hasAlternation = true;
+      }
+      prevWasUnboundedQuantifier = false;
+      continue;
+    }
+
+    if (ch === "+" || ch === "*" || ch === "?") {
+      if (prevWasUnboundedQuantifier && ch !== "?") {
+        throw new DataPrepError(400, "UNSAFE_CONTRACT_PATTERN", "Stacked quantifiers are prohibited (ReDoS protection).");
+      }
+      const top = groupStack[groupStack.length - 1];
+      if (top && ch !== "?") top.hasQuantifier = true;
+      if (ch === "+" || ch === "*") {
+        consecutiveUnboundedTokens++;
+        if (consecutiveUnboundedTokens > 2) {
+          throw new DataPrepError(
+            400,
+            "UNSAFE_CONTRACT_PATTERN",
+            "Too many unbounded quantifiers in a single branch (ReDoS protection).",
+          );
+        }
+        prevWasUnboundedQuantifier = true;
+      }
+      continue;
+    }
+
+    if (ch === "{") {
+      const closeIdx = rawPattern.indexOf("}", i + 1);
+      if (closeIdx === -1) {
+        throw new DataPrepError(400, "INVALID_CONTRACT_PATTERN", "Unclosed '{' quantifier in schema contract pattern.");
+      }
+      const body = rawPattern.slice(i + 1, closeIdx);
+      const qMatch = body.match(/^(\d+)(?:,(\d*))?$/);
+      if (!qMatch) {
+        throw new DataPrepError(400, "INVALID_CONTRACT_PATTERN", `Invalid quantifier '{${body}}' in schema contract pattern.`);
+      }
+      const minBound = Number(qMatch[1]);
+      const hasComma = body.includes(",");
+      const maxBound = qMatch[2] ? Number(qMatch[2]) : hasComma ? Infinity : minBound;
+      if (minBound > MAX_CONTRACT_QUANTIFIER_BOUND || (Number.isFinite(maxBound) && maxBound > MAX_CONTRACT_QUANTIFIER_BOUND)) {
+        throw new DataPrepError(
+          400,
+          "UNSAFE_CONTRACT_PATTERN",
+          `Quantifier bound exceeds safe limit (${MAX_CONTRACT_QUANTIFIER_BOUND}).`,
+        );
+      }
+      if (hasComma && !qMatch[2]) {
+        consecutiveUnboundedTokens++;
+        if (consecutiveUnboundedTokens > 2) {
+          throw new DataPrepError(
+            400,
+            "UNSAFE_CONTRACT_PATTERN",
+            "Too many unbounded quantifiers in a single branch (ReDoS protection).",
+          );
+        }
+      }
+      const top = groupStack[groupStack.length - 1];
+      if (top && (hasComma || minBound > 1)) top.hasQuantifier = true;
+      i = closeIdx;
+      prevWasUnboundedQuantifier = true;
+      continue;
+    }
+
+    prevWasUnboundedQuantifier = false;
+  }
+
+  if (inCharClass || groupStack.length > 0) {
+    throw new DataPrepError(400, "INVALID_CONTRACT_PATTERN", "Unclosed character class or group in schema contract pattern.");
+  }
+
+  try {
+    return new RegExp(rawPattern);
+  } catch (err) {
+    throw new DataPrepError(
+      400,
+      "INVALID_CONTRACT_PATTERN",
+      `Invalid schema contract regex: ${err instanceof Error ? err.message : "syntax error"}.`,
+    );
+  }
 }
 
 export interface CertifiedCsvExportResult {
@@ -873,16 +1076,24 @@ export class DataPreparationPipeline {
         workingRows = surviving;
       } else if (step.op === "validate_schema_contract") {
         const rules = Array.isArray(step.params.rules) ? (step.params.rules as SchemaColumnRule[]) : [];
-        const compiledPatterns = new Map<string, RegExp>();
-        for (const rule of rules) {
-          if (rule.pattern) {
-            compiledPatterns.set(rule.column, new RegExp(rule.pattern));
+        const compiledRulePatterns: Array<RegExp | null> = rules.map((rule) => {
+          if (rule.preset) {
+            const presetRe = NAMED_CONTRACT_PRESETS[rule.preset];
+            if (!presetRe) {
+              throw new DataPrepError(400, "INVALID_CONTRACT_PRESET", `Unknown schema contract preset '${String(rule.preset)}'.`);
+            }
+            return presetRe;
           }
-        }
+          if (rule.pattern !== undefined) {
+            return compileSafeContractPattern(rule.pattern);
+          }
+          return null;
+        });
         const surviving: StagedRow[] = [];
         for (const row of workingRows) {
           let violation: string | null = null;
-          for (const rule of rules) {
+          for (let rIdx = 0; rIdx < rules.length; rIdx++) {
+            const rule = rules[rIdx]!;
             const val = row[rule.column];
             const isEmpty = val === null || val === undefined || val === "";
             if (rule.required && isEmpty) {
@@ -917,10 +1128,17 @@ export class DataPreparationPipeline {
               }
             }
 
-            const regex = compiledPatterns.get(rule.column);
-            if (regex && !regex.test(String(val))) {
-              violation = `Column '${rule.column}' value '${String(val)}' failed contract regex.`;
-              break;
+            const regex = compiledRulePatterns[rIdx];
+            if (regex) {
+              const strVal = String(val);
+              if (strVal.length > MAX_CONTRACT_REGEX_CELL_LENGTH) {
+                violation = `Column '${rule.column}' value exceeds safe regex evaluation length (${MAX_CONTRACT_REGEX_CELL_LENGTH}).`;
+                break;
+              }
+              if (!regex.test(strVal)) {
+                violation = `Column '${rule.column}' value '${strVal.slice(0, 64)}' failed contract pattern.`;
+                break;
+              }
             }
           }
 

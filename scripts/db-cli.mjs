@@ -5,6 +5,7 @@ import {
   exportLogicalBackupSnapshot,
   initializePostgreSqlSchema,
   NodePgDatabaseAdapter,
+  provisionAppRuntimeLoginRole,
   restoreLogicalBackupSnapshot,
   verifyDatabaseRlsReadiness,
 } from "../platform/database/src/index.ts";
@@ -48,11 +49,37 @@ function requireDatabaseUrl() {
 async function cmdMigrate(db) {
   await initializePostgreSqlSchema(db);
   await initializeIntegrationSchema(db);
+  let provisionedRole = null;
+  const appRole = process.env.POSTGRES_APP_USER?.trim();
+  const appPw = process.env.POSTGRES_APP_PASSWORD?.trim();
+  if (appRole && appPw) {
+    await provisionAppRuntimeLoginRole(db, { roleName: appRole, password: appPw });
+    provisionedRole = appRole;
+  }
   console.log(
     JSON.stringify({
       ok: true,
       command: "migrate",
       schemas: ["core-d2", "integration-xi00"],
+      ...(provisionedRole ? { provisionedAppRole: provisionedRole } : {}),
+      timestamp: new Date().toISOString(),
+    }),
+  );
+}
+
+async function cmdProvisionAppRole(db) {
+  const roleName = process.env.POSTGRES_APP_USER?.trim() || "aios_app";
+  const password = process.env.POSTGRES_APP_PASSWORD?.trim();
+  if (!password) {
+    console.error("ERROR: POSTGRES_APP_PASSWORD (>= 12 chars) is required for provision-app-role.");
+    process.exit(1);
+  }
+  await provisionAppRuntimeLoginRole(db, { roleName, password });
+  console.log(
+    JSON.stringify({
+      ok: true,
+      command: "provision-app-role",
+      roleName,
       timestamp: new Date().toISOString(),
     }),
   );
@@ -209,8 +236,11 @@ async function cmdSeedDev(db) {
 }
 
 const [command, arg1] = process.argv.slice(2);
-if (!command || !["migrate", "verify-rls", "backup", "restore", "seed-dev"].includes(command)) {
-  console.error("Usage: node scripts/db-cli.mjs <migrate|verify-rls|backup|restore|seed-dev> [file]");
+if (
+  !command ||
+  !["migrate", "verify-rls", "provision-app-role", "backup", "restore", "seed-dev"].includes(command)
+) {
+  console.error("Usage: node scripts/db-cli.mjs <migrate|verify-rls|provision-app-role|backup|restore|seed-dev> [file]");
   process.exit(1);
 }
 
@@ -218,6 +248,7 @@ const db = new NodePgDatabaseAdapter(requireDatabaseUrl());
 try {
   if (command === "migrate") await cmdMigrate(db);
   else if (command === "verify-rls") await cmdVerifyRls(db);
+  else if (command === "provision-app-role") await cmdProvisionAppRole(db);
   else if (command === "backup") await cmdBackup(db, arg1);
   else if (command === "restore") await cmdRestore(db, arg1);
   else if (command === "seed-dev") await cmdSeedDev(db);

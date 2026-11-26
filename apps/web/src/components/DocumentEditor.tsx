@@ -1,4 +1,5 @@
 import { useEffect, useRef } from "react";
+import { Extension, mergeAttributes, Node as TiptapCustomNode } from "@tiptap/core";
 import { EditorContent, useEditor } from "@tiptap/react";
 import StarterKit from "@tiptap/starter-kit";
 import TextAlign from "@tiptap/extension-text-align";
@@ -6,12 +7,81 @@ import { Table, TableCell, TableHeader, TableRow } from "@tiptap/extension-table
 import Highlight from "@tiptap/extension-highlight";
 import { Color, FontFamily, TextStyle } from "@tiptap/extension-text-style";
 import Placeholder from "@tiptap/extension-placeholder";
-import type { DocumentBlock, StudioDocument } from "@ai-office-suite/shared-contracts";
+import type { DocumentBlock, LinkedMetricReference, StudioDocument } from "@ai-office-suite/shared-contracts";
+
+const BlockIdAndFontSizeExtension = Extension.create({
+  name: "blockIdAndFontSize",
+  addGlobalAttributes() {
+    return [
+      {
+        types: ["paragraph", "heading", "bulletList", "orderedList", "table", "horizontalRule"],
+        attributes: {
+          blockId: {
+            default: null,
+            parseHTML: (element) => element.getAttribute("data-block-id"),
+            renderHTML: (attributes) => {
+              if (!attributes.blockId) return {};
+              return { "data-block-id": String(attributes.blockId) };
+            },
+          },
+        },
+      },
+      {
+        types: ["textStyle"],
+        attributes: {
+          fontSize: {
+            default: null,
+            parseHTML: (element) => element.style.fontSize || null,
+            renderHTML: (attributes) => {
+              if (!attributes.fontSize) return {};
+              return { style: `font-size: ${String(attributes.fontSize)}` };
+            },
+          },
+        },
+      },
+    ];
+  },
+});
+
+const LinkedMetricPlaceholderNode = TiptapCustomNode.create({
+  name: "linkedMetricPlaceholder",
+  group: "block",
+  atom: true,
+  selectable: true,
+  draggable: false,
+  addAttributes() {
+    return {
+      blockId: { default: null },
+      metric: { default: null },
+    };
+  },
+  parseHTML() {
+    return [{ tag: 'div[data-type="linked-metric-placeholder"]' }];
+  },
+  renderHTML({ node, HTMLAttributes }) {
+    const metric = node.attrs.metric as LinkedMetricReference | null;
+    const label = metric
+      ? `[Linked Metric · ${metric.displayLabel}: ${metric.cachedFormattedValue} (${metric.mode})]`
+      : "[Linked Metric Placeholder]";
+    return [
+      "div",
+      mergeAttributes(HTMLAttributes, {
+        "data-type": "linked-metric-placeholder",
+        "data-block-id": node.attrs.blockId ?? "",
+        contenteditable: "false",
+        class: "metric-pill-node",
+      }),
+      label,
+    ];
+  },
+});
 
 export interface EditorSelectionState {
   blockId?: string;
   selectedText: string;
   graphemeCount?: number;
+  startOffset?: number;
+  endOffset?: number;
 }
 
 interface DocumentEditorProps {
@@ -38,7 +108,15 @@ function countGraphemes(text: string): number {
   return count;
 }
 
-function findCurrentBlockId(blocks: DocumentBlock[], selectedText: string, anchorIndex: number): string | undefined {
+function findCurrentBlockId(
+  blocks: DocumentBlock[],
+  selectedText: string,
+  anchorIndex: number,
+  nodeAttrBlockId?: string | null,
+): string | undefined {
+  if (typeof nodeAttrBlockId === "string" && nodeAttrBlockId.trim()) {
+    return nodeAttrBlockId.trim();
+  }
   const trimmed = selectedText.normalize("NFC").trim();
   if (trimmed) {
     const matched = blocks.find((b) => {
@@ -88,6 +166,8 @@ export function DocumentEditor({
       StarterKit.configure({
         heading: { levels: [1, 2, 3] },
       }),
+      BlockIdAndFontSizeExtension,
+      LinkedMetricPlaceholderNode,
       TextAlign.configure({ types: ["heading", "paragraph"] }),
       Table.configure({ resizable: false }),
       TableRow,
@@ -108,12 +188,27 @@ export function DocumentEditor({
     onSelectionUpdate({ editor: ed }) {
       const { from, to } = ed.state.selection;
       const selectedText = ed.state.doc.textBetween(from, to, " ").normalize("NFC");
-      const parentPos = ed.state.doc.resolve(from);
-      const topIndex = parentPos.index(0);
+      const resolvedFrom = ed.state.doc.resolve(from);
+      const topIndex = resolvedFrom.index(0);
+      const topNode = topIndex >= 0 && topIndex < ed.state.doc.childCount ? ed.state.doc.child(topIndex) : null;
+      const attrBlockId = typeof topNode?.attrs?.blockId === "string" ? topNode.attrs.blockId : null;
+
+      let startOffset: number | undefined;
+      let endOffset: number | undefined;
+      if (to > from && resolvedFrom.depth >= 1) {
+        const blockStartPos = resolvedFrom.start(1);
+        const blockEndPos = resolvedFrom.end(1);
+        if (to <= blockEndPos) {
+          startOffset = ed.state.doc.textBetween(blockStartPos, from, "\n").normalize("NFC").length;
+          endOffset = ed.state.doc.textBetween(blockStartPos, to, "\n").normalize("NFC").length;
+        }
+      }
+
       onSelectionChangeRef.current({
-        blockId: findCurrentBlockId(blocksRef.current, selectedText, topIndex),
+        blockId: findCurrentBlockId(blocksRef.current, selectedText, topIndex, attrBlockId),
         selectedText,
         graphemeCount: countGraphemes(selectedText),
+        ...(startOffset !== undefined && endOffset !== undefined ? { startOffset, endOffset } : {}),
       });
     },
   });

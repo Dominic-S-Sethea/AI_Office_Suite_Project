@@ -178,12 +178,61 @@ export async function initializePostgreSqlSchema(db: PgDatabaseAdapter): Promise
   await db.exec(D2_POSTGRESQL_SCHEMA_SQL);
 }
 
+const SAFE_PG_ROLE_IDENT = /^[a-z_][a-z0-9_]{1,62}$/;
+
+/**
+ * Provisions or updates a dedicated non-superuser, NOBYPASSRLS login role granted `app_runtime`.
+ * Intended to be run by the out-of-band migration/admin principal so runtime API containers
+ * never connect to PostgreSQL as a superuser or table owner.
+ */
+export async function provisionAppRuntimeLoginRole(
+  db: PgDatabaseAdapter,
+  params: { roleName: string; password: string },
+): Promise<void> {
+  const roleName = params.roleName.trim();
+  if (!SAFE_PG_ROLE_IDENT.test(roleName) || roleName === "postgres" || roleName === "app_runtime") {
+    throw new Error(`Invalid least-privilege login role name '${roleName}'.`);
+  }
+  if (!params.password || params.password.length < 12) {
+    throw new Error("App runtime login role password must be at least 12 characters.");
+  }
+
+  await db.withTransaction(async (tx) => {
+    await tx.query("SELECT set_config('app.provision_role', $1, true)", [roleName]);
+    await tx.query("SELECT set_config('app.provision_pw', $1, true)", [params.password]);
+    await tx.exec(`
+      DO $$
+      DECLARE
+        r_name TEXT := current_setting('app.provision_role');
+        r_pw   TEXT := current_setting('app.provision_pw');
+      BEGIN
+        IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = r_name) THEN
+          EXECUTE format(
+            'CREATE ROLE %I LOGIN INHERIT NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE PASSWORD %L',
+            r_name,
+            r_pw
+          );
+        ELSE
+          EXECUTE format(
+            'ALTER ROLE %I LOGIN INHERIT NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE PASSWORD %L',
+            r_name,
+            r_pw
+          );
+        END IF;
+        EXECUTE format('GRANT app_runtime TO %I', r_name);
+      END
+      $$;
+    `);
+  });
+}
+
 export interface DatabaseReadinessReport {
   ready: boolean;
   engine: "pglite" | "node-pg";
   checks: {
     connectivity: boolean;
     appRuntimeLeastPrivilege: boolean;
+    currentConnectionLeastPrivilege: boolean;
     coreForceRlsEnabled: boolean;
     missingForceRlsTables: string[];
   };
@@ -198,9 +247,13 @@ const CORE_RLS_TABLES = [
   "ai_applied_operations",
 ] as const;
 
-export async function verifyDatabaseRlsReadiness(db: PgDatabaseAdapter): Promise<DatabaseReadinessReport> {
+export async function verifyDatabaseRlsReadiness(
+  db: PgDatabaseAdapter,
+  options: { requireNonSuperuserConnection?: boolean } = {},
+): Promise<DatabaseReadinessReport> {
   let connectivity = false;
   let appRuntimeLeastPrivilege = false;
+  let currentConnectionLeastPrivilege = false;
   let coreForceRlsEnabled = false;
   let missingForceRlsTables: string[] = [...CORE_RLS_TABLES];
 
@@ -208,11 +261,17 @@ export async function verifyDatabaseRlsReadiness(db: PgDatabaseAdapter): Promise
     const ping = await db.query<{ ok: number }>("SELECT 1 AS ok");
     connectivity = ping.rows[0]?.ok === 1;
 
-    const roleRes = await db.query<{ rolsuper: boolean; rolbypassrls: boolean }>(
-      "SELECT rolsuper, rolbypassrls FROM pg_roles WHERE rolname = 'app_runtime'",
+    const roleRes = await db.query<{ rolname: string; rolsuper: boolean; rolbypassrls: boolean; is_current: boolean }>(
+      `SELECT rolname, rolsuper, rolbypassrls, (rolname = current_user) AS is_current
+       FROM pg_roles
+       WHERE rolname = 'app_runtime' OR rolname = current_user`,
     );
-    const roleRow = roleRes.rows[0];
-    appRuntimeLeastPrivilege = Boolean(roleRow && roleRow.rolsuper === false && roleRow.rolbypassrls === false);
+    const appRoleRow = roleRes.rows.find((r) => r.rolname === "app_runtime");
+    const curRoleRow = roleRes.rows.find((r) => r.is_current);
+    appRuntimeLeastPrivilege = Boolean(appRoleRow && appRoleRow.rolsuper === false && appRoleRow.rolbypassrls === false);
+    currentConnectionLeastPrivilege = Boolean(
+      curRoleRow && curRoleRow.rolsuper === false && curRoleRow.rolbypassrls === false,
+    );
 
     const rlsRes = await db.query<{ relname: string; relrowsecurity: boolean; relforcerowsecurity: boolean }>(
       `SELECT c.relname, c.relrowsecurity, c.relforcerowsecurity
@@ -232,12 +291,15 @@ export async function verifyDatabaseRlsReadiness(db: PgDatabaseAdapter): Promise
     connectivity = false;
   }
 
+  const connectionPrivilegeOk = options.requireNonSuperuserConnection ? currentConnectionLeastPrivilege : true;
+
   return {
-    ready: connectivity && appRuntimeLeastPrivilege && coreForceRlsEnabled,
+    ready: connectivity && appRuntimeLeastPrivilege && connectionPrivilegeOk && coreForceRlsEnabled,
     engine: db.engine,
     checks: {
       connectivity,
       appRuntimeLeastPrivilege,
+      currentConnectionLeastPrivilege,
       coreForceRlsEnabled,
       missingForceRlsTables,
     },

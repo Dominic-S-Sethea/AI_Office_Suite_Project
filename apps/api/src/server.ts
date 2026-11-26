@@ -21,11 +21,23 @@ function parsePositiveInt(raw: string | undefined, fallback: number, min: number
   return n;
 }
 
+function resolveTrustProxy(raw: string | undefined): number | string | false {
+  const trimmed = (raw ?? "").trim().toLowerCase();
+  if (!trimmed || trimmed === "false" || trimmed === "0") return false;
+  if (/^[1-5]$/.test(trimmed)) return Number.parseInt(trimmed, 10);
+  if (trimmed === "loopback" || trimmed === "linklocal" || trimmed === "uniquelocal") return trimmed;
+  throw new Error(`Invalid TRUST_PROXY value '${raw}'. Allowed: false, 0..5, loopback, linklocal, uniquelocal.`);
+}
+
 async function startServer(): Promise<void> {
   const authMode = resolveAuthMode();
   const port = parsePositiveInt(process.env.PORT, 4100, 1, 65535);
   const defaultHost = authMode === "jwt-pg" ? "0.0.0.0" : "127.0.0.1";
   const host = (process.env.HOST || defaultHost).trim();
+  const trustProxy = resolveTrustProxy(process.env.TRUST_PROXY);
+  const requireNonSuperuserDb =
+    process.env.REQUIRE_NON_SUPERUSER_DB === "true" ||
+    (process.env.NODE_ENV === "production" && process.env.ALLOW_SUPERUSER_DB_RUNTIME !== "true");
 
   let db: PgDatabaseAdapter | undefined;
 
@@ -46,6 +58,9 @@ async function startServer(): Promise<void> {
     const poolMax = parsePositiveInt(process.env.PG_POOL_MAX, 10, 1, 100);
     const statementTimeout = parsePositiveInt(process.env.PG_STATEMENT_TIMEOUT_MS, 15_000, 1_000, 120_000);
     const sslMode = (process.env.PG_SSL_MODE ?? "").trim().toLowerCase();
+    if (sslMode && sslMode !== "disable" && sslMode !== "require" && sslMode !== "verify-full") {
+      throw new Error(`Invalid PG_SSL_MODE '${sslMode}'. Allowed: disable, require, verify-full.`);
+    }
 
     db = new NodePgDatabaseAdapter(databaseUrl, {
       max: poolMax,
@@ -62,9 +77,13 @@ async function startServer(): Promise<void> {
     }
   }
 
+  let shuttingDown = false;
   const app = createApiApp({
     authMode,
     db,
+    trustProxy,
+    requireNonSuperuserDb,
+    isShuttingDown: () => shuttingDown,
     rateLimit: {
       enabled: process.env.DISABLE_RATE_LIMIT !== "true",
       loginMaxPerWindow: parsePositiveInt(process.env.RATE_LIMIT_LOGIN_MAX, 15, 1, 1000),
@@ -88,11 +107,16 @@ async function startServer(): Promise<void> {
         modeLabel,
         host,
         port,
+        trustProxy,
       })}\n`,
     );
   });
 
-  let shuttingDown = false;
+  // Protect against reverse-proxy keep-alive race (502) and Slowloris uploads
+  server.keepAliveTimeout = 65_000;
+  server.headersTimeout = 66_000;
+  server.requestTimeout = 30_000;
+
   const shutdown = (signal: string) => {
     if (shuttingDown) return;
     shuttingDown = true;
@@ -127,10 +151,36 @@ async function startServer(): Promise<void> {
         process.exit(0);
       }
     });
+    if (typeof server.closeIdleConnections === "function") {
+      server.closeIdleConnections();
+    }
   };
 
   process.on("SIGTERM", () => shutdown("SIGTERM"));
   process.on("SIGINT", () => shutdown("SIGINT"));
+  process.on("unhandledRejection", (reason) => {
+    process.stderr.write(
+      `${JSON.stringify({
+        ts: new Date().toISOString(),
+        level: "error",
+        service: "ai-office-suite-api",
+        event: "process.unhandled_rejection",
+        error: reason instanceof Error ? reason.message : String(reason),
+      })}\n`,
+    );
+  });
+  process.on("uncaughtException", (err) => {
+    process.stderr.write(
+      `${JSON.stringify({
+        ts: new Date().toISOString(),
+        level: "error",
+        service: "ai-office-suite-api",
+        event: "process.uncaught_exception",
+        error: err.message,
+      })}\n`,
+    );
+    shutdown("uncaughtException");
+  });
 }
 
 startServer().catch((err) => {

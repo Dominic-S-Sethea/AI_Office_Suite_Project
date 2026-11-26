@@ -8,6 +8,7 @@ import * as echarts from "echarts";
 import type { ChartSpec } from "@ai-office-suite/shared-contracts";
 import { validateChartSpecSafety } from "@ai-office-suite/validation";
 import {
+  buildSanitizedSubprocessEnv,
   detectChromiumBinary,
   HARDENED_CHROMIUM_BASE_ARGS,
   PDF_RENDER_CSP_META,
@@ -248,7 +249,7 @@ export async function renderChartSpecPngViaEdge(
         `--screenshot=${path.resolve(outputPngPath)}`,
         pathToFileURL(htmlPath).href,
       ],
-      { timeout: 25_000, windowsHide: true },
+      { timeout: 25_000, windowsHide: true, env: buildSanitizedSubprocessEnv(tmpDir) },
     );
     return { pngPath: outputPngPath, byteLength: readFileSync(outputPngPath).byteLength };
   } finally {

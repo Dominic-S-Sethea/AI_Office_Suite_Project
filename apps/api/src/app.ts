@@ -68,6 +68,9 @@ export interface CreateApiAppOptions {
   inMemory?: boolean;
   authMode?: "provisional-local" | "jwt-pg";
   db?: PgDatabaseAdapter;
+  trustProxy?: number | string | boolean;
+  requireNonSuperuserDb?: boolean;
+  isShuttingDown?: () => boolean;
   enableStructuredLogs?: boolean;
   logSink?: (line: string) => void;
   rateLimit?: {
@@ -134,6 +137,22 @@ export function createApiApp(options: CreateApiAppOptions = {}): Express {
   const apiLimiter = createSlidingWindowRateLimiter({
     windowMs: options.rateLimit?.windowMs ?? 60_000,
     maxRequests: options.rateLimit?.apiMaxPerWindow ?? 300,
+    keyGenerator: (req) => {
+      const authReq = req as AuthenticatedRequest;
+      if (authReq.actor) {
+        return `actor:${authReq.actor.tenantId}:${authReq.actor.userId}`;
+      }
+      const ip = req.ip || req.socket?.remoteAddress || "unknown";
+      return `ip:${String(ip).trim().slice(0, 128)}`;
+    },
+    onLimitExceeded: (req, key) => {
+      observability.logEvent("warn", "security.rate_limit_exceeded", {
+        requestId: (req as Request & { requestId?: string }).requestId,
+        method: req.method,
+        path: req.path,
+        bucket: key.split(":")[0],
+      });
+    },
   });
   const observability = createApiObservability({
     enableStructuredLogs: options.enableStructuredLogs,
@@ -142,6 +161,9 @@ export function createApiApp(options: CreateApiAppOptions = {}): Express {
 
   const app = express();
   app.disable("x-powered-by");
+  if (options.trustProxy !== undefined && options.trustProxy !== false) {
+    app.set("trust proxy", options.trustProxy);
+  }
   app.use(observability.middleware);
   app.use(
     helmet({
@@ -177,12 +199,6 @@ export function createApiApp(options: CreateApiAppOptions = {}): Express {
     next();
   });
 
-  if (rateLimitEnabled) {
-    app.use("/api/documents", apiLimiter.middleware);
-    app.use("/api/speech", apiLimiter.middleware);
-    app.use("/api/data-prep", apiLimiter.middleware);
-  }
-
   app.get("/api/health", (_req, res) => {
     res.json({
       status: "ok",
@@ -193,7 +209,16 @@ export function createApiApp(options: CreateApiAppOptions = {}): Express {
     });
   });
 
-  app.get("/api/ready", async (_req, res) => {
+  app.get("/api/ready", async (req, res) => {
+    const requestId = (req as Request & { requestId?: string }).requestId;
+    if (options.isShuttingDown?.()) {
+      res.status(503).json({
+        status: "draining",
+        authMode,
+        requestId,
+      });
+      return;
+    }
     if (!useJwtPg || !options.db) {
       res.json({
         status: "ready",
@@ -202,13 +227,29 @@ export function createApiApp(options: CreateApiAppOptions = {}): Express {
       });
       return;
     }
-    const report = await verifyDatabaseRlsReadiness(options.db);
-    res.status(report.ready ? 200 : 503).json({
-      status: report.ready ? "ready" : "degraded",
-      authMode,
-      engine: report.engine,
-      checks: report.checks,
-    });
+    try {
+      const report = await verifyDatabaseRlsReadiness(options.db, {
+        requireNonSuperuserConnection: Boolean(options.requireNonSuperuserDb),
+      });
+      res.status(report.ready ? 200 : 503).json({
+        status: report.ready ? "ready" : "degraded",
+        authMode,
+        engine: report.engine,
+        checks: report.checks,
+      });
+    } catch (err) {
+      observability.logEvent("error", "readiness.probe_failed", {
+        requestId,
+        error: err instanceof Error ? err.message : "UnknownError",
+      });
+      res.status(503).json({
+        status: "degraded",
+        authMode,
+        error: "Readiness probe failed",
+        code: "READINESS_ERROR",
+        requestId,
+      });
+    }
   });
 
   if (useJwtPg && options.db) {
@@ -292,7 +333,17 @@ export function createApiApp(options: CreateApiAppOptions = {}): Express {
     app.use("/api/documents", jwtMiddleware);
     app.use("/api/speech", jwtMiddleware);
     app.use("/api/data-prep", jwtMiddleware);
+    if (rateLimitEnabled) {
+      app.use("/api/documents", apiLimiter.middleware);
+      app.use("/api/speech", apiLimiter.middleware);
+      app.use("/api/data-prep", apiLimiter.middleware);
+    }
   } else {
+    if (rateLimitEnabled) {
+      app.use("/api/documents", apiLimiter.middleware);
+      app.use("/api/speech", apiLimiter.middleware);
+      app.use("/api/data-prep", apiLimiter.middleware);
+    }
     app.get("/api/metrics", (req, res) => {
       const actor = resolvePrototypeActor(req);
       if (actor.role !== "owner" && actor.role !== "administrator") {
@@ -816,7 +867,17 @@ export function createApiApp(options: CreateApiAppOptions = {}): Express {
     }
   });
 
-  app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
+  app.use((req: Request, res: Response) => {
+    const requestId = (req as Request & { requestId?: string }).requestId;
+    res.status(404).json({
+      error: "Endpoint not found",
+      code: "NOT_FOUND",
+      ...(requestId ? { requestId } : {}),
+    });
+  });
+
+  app.use((err: unknown, req: Request, res: Response, _next: NextFunction) => {
+    const requestId = (req as Request & { requestId?: string }).requestId;
     if (
       err instanceof AuthenticationError ||
       err instanceof AuthorizationError ||
@@ -831,13 +892,45 @@ export function createApiApp(options: CreateApiAppOptions = {}): Express {
       res.status(err.statusCode).json({
         error: err.message,
         code: err.code,
+        ...(requestId ? { requestId } : {}),
       });
       return;
     }
-    console.error("Unhandled API error:", err instanceof Error ? err.name : "UnknownError");
+
+    // Handle Express body-parser HTTP errors cleanly (400 malformed JSON, 413 oversized payload)
+    const httpErr = err as { status?: number; statusCode?: number; type?: string; name?: string; message?: string };
+    const status = httpErr?.status ?? httpErr?.statusCode;
+    if (httpErr?.type === "entity.parse.failed" || (err instanceof SyntaxError && status === 400)) {
+      res.status(400).json({
+        error: "Malformed JSON request body.",
+        code: "INVALID_JSON",
+        ...(requestId ? { requestId } : {}),
+      });
+      return;
+    }
+    if (httpErr?.type === "entity.too.large" || status === 413) {
+      res.status(413).json({
+        error: "Request body exceeds maximum allowed size.",
+        code: "PAYLOAD_TOO_LARGE",
+        ...(requestId ? { requestId } : {}),
+      });
+      return;
+    }
+
+    const authReq = req as AuthenticatedRequest;
+    observability.logEvent("error", "http.unhandled_error", {
+      requestId,
+      method: req.method,
+      path: req.path,
+      tenantId: authReq.actor?.tenantId,
+      errName: err instanceof Error ? err.name : "UnknownError",
+      errMessage: err instanceof Error ? err.message : String(err),
+      stack: err instanceof Error ? err.stack?.slice(0, 1500) : undefined,
+    });
     res.status(500).json({
       error: "Internal server error",
       code: "INTERNAL_ERROR",
+      ...(requestId ? { requestId } : {}),
     });
   });
 

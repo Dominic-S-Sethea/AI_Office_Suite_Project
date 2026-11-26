@@ -95,10 +95,18 @@ export class FasterWhisperLocalAdapter implements SpeechRecognitionAdapter {
     try {
       const modelSize = process.env.FASTER_WHISPER_MODEL?.trim() || "tiny";
       const langCode = request.language === "km-KH" ? "km" : "en";
+      const safeEnv: NodeJS.ProcessEnv = {
+        PATH: process.env.PATH ?? "/usr/local/bin:/usr/bin:/bin",
+        HOME: scratchDir,
+        TMPDIR: scratchDir,
+        LANG: process.env.LANG ?? "C.UTF-8",
+        ...(process.env.HF_HOME ? { HF_HOME: process.env.HF_HOME } : {}),
+        ...(process.env.XDG_CACHE_HOME ? { XDG_CACHE_HOME: process.env.XDG_CACHE_HOME } : {}),
+      };
       const { stdout } = await execFileAsync(
         pythonPath,
         [workerScript, "--audio", wavPath, "--language", langCode, "--model", modelSize],
-        { timeout: 120_000, maxBuffer: 4 * 1024 * 1024 },
+        { timeout: 120_000, maxBuffer: 4 * 1024 * 1024, env: safeEnv },
       );
 
       const parsed = JSON.parse(stdout.trim()) as {
@@ -120,12 +128,11 @@ export class FasterWhisperLocalAdapter implements SpeechRecognitionAdapter {
           `Local Faster-Whisper (${parsed.model}) CPU execution — zero audio sent to external cloud APIs.`,
         ],
       };
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
+    } catch {
       throw new SpeechProviderError(
         503,
         "FASTER_WHISPER_EXECUTION_FAILED",
-        `Local Faster-Whisper execution failed: ${msg}`,
+        "Local Faster-Whisper transcription failed. Check server speech worker logs for details.",
       );
     } finally {
       rmSync(scratchDir, { recursive: true, force: true });

@@ -10,6 +10,7 @@ import type {
   StudioPresentation,
 } from "@ai-office-suite/shared-contracts";
 import {
+  buildSanitizedSubprocessEnv,
   countPdfPages,
   detectChromiumBinary,
   HARDENED_CHROMIUM_BASE_ARGS,
@@ -183,7 +184,7 @@ export async function exportPresentationPdf(deck: StudioPresentation): Promise<{
         `--print-to-pdf=${pdfPath}`,
         fileUrl,
       ],
-      { timeout: 25_000, windowsHide: true },
+      { timeout: 25_000, windowsHide: true, env: buildSanitizedSubprocessEnv(tmpDir) },
     );
     const pdfBuffer = readFileSync(pdfPath);
     return { pdfBuffer, pageCount: countPdfPages(pdfBuffer), engine: "chromium-harfbuzz" };
@@ -216,7 +217,7 @@ export async function renderPresentationSlideScreenshot(
         `--screenshot=${path.resolve(outputPngPath)}`,
         fileUrl,
       ],
-      { timeout: 25_000, windowsHide: true },
+      { timeout: 25_000, windowsHide: true, env: buildSanitizedSubprocessEnv(tmpDir) },
     );
     return { pngPath: outputPngPath, byteLength: readFileSync(outputPngPath).byteLength };
   } finally {

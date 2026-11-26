@@ -345,6 +345,18 @@ button, input, select, textarea {
   background: #f1f5f9;
 }
 
+.ProseMirror .metric-pill-node {
+  background: var(--warning-bg);
+  border: 1px solid var(--warning-border);
+  border-radius: 6px;
+  padding: 6px 10px;
+  margin: 8px 0;
+  font-size: 13px;
+  font-weight: 600;
+  color: #78350f;
+  user-select: all;
+}
+
 .ai-panel {
   background: var(--surface);
   border-left: 1px solid var(--border);

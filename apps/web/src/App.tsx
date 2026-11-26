@@ -104,6 +104,10 @@ export function App() {
   const isAuthenticated = authMode === "provisional-local" || sessionActor !== null;
   const hasUnsavedChanges =
     draftBlocks !== null || draftTitle !== null || draftLanguage !== null || draftLayout !== null;
+  const hasUnsavedChangesRef = useRef(hasUnsavedChanges);
+  useEffect(() => {
+    hasUnsavedChangesRef.current = hasUnsavedChanges;
+  }, [hasUnsavedChanges]);
 
   const clearDrafts = useCallback(() => {
     setDraftBlocks(null);
@@ -182,7 +186,7 @@ export function App() {
     }
   }, [authMode, clearDrafts]);
 
-  const loadDocuments = useCallback(async () => {
+  const loadDocuments = useCallback(async (opts?: { forceSyncActive?: boolean }) => {
     if (!authInitialized || !isAuthenticated) return;
     setIsLoadingDocs(true);
     try {
@@ -214,8 +218,22 @@ export function App() {
         setActiveDoc(list[0]);
       } else if (currentId) {
         const refreshed = list.find((d) => d.documentId === currentId);
-        if (refreshed) setActiveDoc(refreshed);
-        else if (!searchQuery.trim() && !languageFilter) setActiveDoc(list[0] ?? null);
+        if (refreshed) {
+          if (opts?.forceSyncActive || !hasUnsavedChangesRef.current) {
+            setActiveDoc(refreshed);
+          } else {
+            setActiveDoc((prev) => {
+              if (prev && refreshed.revision !== prev.revision) {
+                setConflictMessage(
+                  `Server revision advanced to rev ${refreshed.revision} while you have unsaved edits on rev ${prev.revision}.`,
+                );
+              }
+              return prev;
+            });
+          }
+        } else if (!searchQuery.trim() && !languageFilter && !hasUnsavedChangesRef.current) {
+          setActiveDoc(list[0] ?? null);
+        }
       }
     } catch {
       setErrorBanner("Network error while loading workspace documents.");
@@ -1049,7 +1067,10 @@ export function App() {
                 selectionBlockId={selection.blockId}
                 selectedText={selection.selectedText}
                 selectionGraphemeCount={selection.graphemeCount}
-                onDocumentUpdated={loadDocuments}
+                onDocumentUpdated={async () => {
+                  clearDrafts();
+                  await loadDocuments({ forceSyncActive: true });
+                }}
                 onRevisionConflict={(msg) => setConflictMessage(msg)}
                 onUnauthorized={handleUnauthorized}
                 apiHeaders={apiHeaders}

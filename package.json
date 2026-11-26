@@ -20,6 +20,7 @@
     "build:api": "tsc -p apps/api/tsconfig.build.json",
     "build:web": "npm run build --workspace=@ai-office-suite/web",
     "test": "vitest run",
+    "test:coverage": "vitest run --coverage",
     "lint:licenses": "node scripts/check-licenses.mjs",
     "lint:hygiene": "node scripts/check-hygiene.mjs",
     "bench:check": "node scripts/bench-check.mjs",
@@ -51,11 +52,14 @@
     "zod": "^4.0.0"
   },
   "devDependencies": {
+    "@testing-library/react": "^16.3.3",
     "@types/cors": "^2.8.17",
     "@types/express": "^5.0.0",
     "@types/jsonwebtoken": "^9.0.10",
     "@types/node": "^24.0.0",
     "@types/pg": "^8.23.1",
+    "@vitest/coverage-v8": "^3.2.7",
+    "happy-dom": "^21.0.4",
     "tsx": "^4.20.0",
     "typescript": "^5.9.3",
     "vitest": "^3.2.4"

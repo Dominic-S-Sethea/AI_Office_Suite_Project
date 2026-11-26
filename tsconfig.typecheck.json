@@ -35,6 +35,7 @@
     "apps/api/src/**/*.ts",
     "apps/web/src/**/*.ts",
     "apps/web/src/**/*.tsx",
-    "tests/**/*.ts"
+    "tests/**/*.ts",
+    "tests/**/*.tsx"
   ]
 }
