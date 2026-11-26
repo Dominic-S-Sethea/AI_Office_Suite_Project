@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import {
+  createPgPoolConfigFromEnv,
   exportLogicalBackupSnapshot,
   initializePostgreSqlSchema,
   NodePgDatabaseAdapter,
@@ -248,7 +249,7 @@ if (
   process.exit(1);
 }
 
-const db = new NodePgDatabaseAdapter(requireDatabaseUrl());
+const db = new NodePgDatabaseAdapter(requireDatabaseUrl(), createPgPoolConfigFromEnv(process.env));
 try {
   if (command === "migrate") await cmdMigrate(db);
   else if (command === "verify-rls") await cmdVerifyRls(db);

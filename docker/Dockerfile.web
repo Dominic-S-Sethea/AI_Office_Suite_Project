@@ -3,15 +3,20 @@ FROM node:22-bookworm-slim AS build
 
 WORKDIR /app
 
+# Copy workspace manifests first so Docker caches `npm ci` across frontend source edits (H29)
 COPY package.json package-lock.json tsconfig.base.json ./
-COPY packages ./packages
-COPY platform ./platform
-COPY engines ./engines
-COPY modules ./modules
-COPY apps/api/package.json apps/api/
+COPY packages/shared-contracts/package.json packages/shared-contracts/
+COPY engines/document/package.json engines/document/
+COPY apps/web/package.json apps/web/
+
+RUN npm ci --workspace=@ai-office-suite/web --include-workspace-root --no-audit --no-fund
+
+# Copy only the source workspaces required to compile apps/web
+COPY packages/shared-contracts ./packages/shared-contracts
+COPY engines/document ./engines/document
 COPY apps/web ./apps/web
 
-RUN npm ci --no-audit --no-fund && npm run build:web
+RUN npm run build:web
 
 FROM nginxinc/nginx-unprivileged:1.27-alpine AS runtime
 

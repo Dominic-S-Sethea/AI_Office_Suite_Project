@@ -135,4 +135,109 @@ describe("Wave 1 Server Lifecycle & CLI Governance Suite (C9)", () => {
     expect(licenses.code).toBe(0);
     expect(licenses.stdout).toContain("PASS:");
   });
+
+  it("Wave 5C (H30, H31, M18, L5): verifies Zod config, shared PG SSL/CA validation, Prometheus metrics, SPDX parser & expanded hygiene rules", async () => {
+    const { createPgPoolConfigFromEnv } = await import("@ai-office-suite/database");
+    const { loadApiServerConfig } = await import("../apps/api/src/config.ts");
+    const { createApiApp } = await import("../apps/api/src/app.ts");
+    const { pathToFileURL } = await import("node:url");
+    const { isPermissiveOrDualAllowed } = (await import(
+      pathToFileURL(path.join(repoRoot, "scripts/check-licenses.mjs")).href
+    )) as { isPermissiveOrDualAllowed: (expr: string) => boolean };
+    const { scanTextForSecrets, verifySpeechGateSource } = (await import(
+      pathToFileURL(path.join(repoRoot, "scripts/check-hygiene.mjs")).href
+    )) as {
+      scanTextForSecrets: (text: string, file?: string) => string[];
+      verifySpeechGateSource: (source: string) => boolean;
+    };
+    const { mkdtempSync, rmSync, writeFileSync } = await import("node:fs");
+    const os = await import("node:os");
+
+    // M18: PG_SSL_MODE=require emits explicit TLS verification warning; invalid CA or mode throws
+    const warnings: string[] = [];
+    const reqCfg = createPgPoolConfigFromEnv(
+      { PG_SSL_MODE: "require", PG_POOL_MAX: "8", PG_STATEMENT_TIMEOUT_MS: "12000" },
+      { onWarn: (m) => warnings.push(m) },
+    );
+    expect(reqCfg.max).toBe(8);
+    expect((reqCfg.ssl as { rejectUnauthorized?: boolean })?.rejectUnauthorized).toBe(false);
+    expect(warnings.some((w) => w.includes("rejectUnauthorized=false"))).toBe(true);
+
+    const tmpDir = mkdtempSync(path.join(os.tmpdir(), "aios-ca-test-"));
+    try {
+      const caPath = path.join(tmpDir, "ca.pem");
+      writeFileSync(caPath, "-----BEGIN CERTIFICATE-----\nMIIBFAKECERT\n-----END CERTIFICATE-----\n");
+      const strictCfg = createPgPoolConfigFromEnv({ PG_SSL_MODE: "verify-full", PG_SSL_CA_FILE: caPath });
+      expect((strictCfg.ssl as { rejectUnauthorized?: boolean; ca?: string })?.rejectUnauthorized).toBe(true);
+      expect((strictCfg.ssl as { ca?: string })?.ca).toContain("BEGIN CERTIFICATE");
+
+      expect(() =>
+        createPgPoolConfigFromEnv({ PG_SSL_MODE: "disable", PG_SSL_CA_FILE: caPath }),
+      ).toThrow(/PG_SSL_CA_FILE/);
+    } finally {
+      rmSync(tmpDir, { recursive: true, force: true });
+    }
+
+    // L5: Zod config rejects invalid PORT and AUTH_MODE
+    expect(() => loadApiServerConfig({ PORT: "not-a-port" })).toThrow(/Invalid PORT/);
+    expect(() => loadApiServerConfig({ AUTH_MODE: "magic-bypass" })).toThrow(/Invalid AUTH_MODE/);
+    const validCfg = loadApiServerConfig({
+      AUTH_MODE: "provisional-local",
+      HOST: "127.0.0.1",
+      PORT: "4200",
+      MAX_CONCURRENT_PDF_EXPORTS: "3",
+    });
+    expect(validCfg.port).toBe(4200);
+    expect(validCfg.maxConcurrentPdfExports).toBe(3);
+
+    // H30: Prometheus text exposition format on /api/metrics + route template logging
+    const logs: string[] = [];
+    const app = createApiApp({
+      inMemory: true,
+      enableStructuredLogs: true,
+      logSink: (line) => logs.push(line),
+      rateLimit: { enabled: false },
+    });
+    const server = await new Promise<import("node:http").Server>((resolve) => {
+      const s = app.listen(0, "127.0.0.1", () => resolve(s));
+    });
+    try {
+      const port = (server.address() as import("node:net").AddressInfo).port;
+      await fetch(`http://127.0.0.1:${port}/api/health`);
+      const promRes = await fetch(`http://127.0.0.1:${port}/api/metrics?format=prometheus`, {
+        headers: { "x-workspace-role": "owner" },
+      });
+      expect(promRes.status).toBe(200);
+      expect(promRes.headers.get("content-type")).toContain("text/plain");
+      const promBody = await promRes.text();
+      expect(promBody).toContain("aios_http_requests_total");
+      expect(promBody).toContain('aios_http_responses_total{status_class="2xx"}');
+      expect(logs.some((l) => l.includes('"route":"/api/health"'))).toBe(true);
+    } finally {
+      server.close();
+    }
+
+    // H31: Recursive-descent SPDX expression evaluator
+    expect(isPermissiveOrDualAllowed("MIT")).toBe(true);
+    expect(isPermissiveOrDualAllowed("(MIT OR GPL-3.0-or-later)")).toBe(true);
+    expect(isPermissiveOrDualAllowed("(MIT AND Zlib)")).toBe(true);
+    expect(isPermissiveOrDualAllowed("Apache-2.0 WITH LLVM-exception")).toBe(true);
+    expect(isPermissiveOrDualAllowed("(MIT AND GPL-3.0-only) OR Apache-2.0")).toBe(true);
+    expect(isPermissiveOrDualAllowed("(MIT OR Apache-2.0) AND GPL-3.0-only")).toBe(false);
+    expect(isPermissiveOrDualAllowed("AGPL-3.0-only")).toBe(false);
+    expect(isPermissiveOrDualAllowed("(MIT AND (BSD-3-Clause OR AGPL-3.0-only))")).toBe(true);
+    expect(isPermissiveOrDualAllowed("(MIT AND (GPL-3.0-only OR AGPL-3.0-only))")).toBe(false);
+
+    // H31: Expanded secret scanner & comment-stripped speech gate verification
+    const fakeFinePat = `github_pat_${"A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6"}`;
+    const fakeOpenAi = `sk-proj-${"AbCdEfGhIjKlMnOpQrStUvWxYz0123456789"}`;
+    const fakeSlack = `xoxb-${"123456789012"}-${"abcdefGHIJKL12345"}`;
+    const fakeRemotePg = `postgres://prod_admin:${"SuperSecretPass99"}@db.prod-corp.internal:5432/prod_db`;
+    expect(scanTextForSecrets(fakeFinePat)).toHaveLength(1);
+    expect(scanTextForSecrets(fakeOpenAi)).toHaveLength(1);
+    expect(scanTextForSecrets(fakeSlack)).toHaveLength(1);
+    expect(scanTextForSecrets(fakeRemotePg)).toHaveLength(1);
+    expect(verifySpeechGateSource("// readonly isMock = true\n// new SpeechProviderError(423, 'X', 'Y')")).toBe(false);
+    expect(verifySpeechGateSource("readonly isMock = true;\nthrow new SpeechProviderError(423, 'X', 'Y');")).toBe(true);
+  });
 });
