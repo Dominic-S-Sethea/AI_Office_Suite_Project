@@ -381,9 +381,10 @@ const UNSAFE_ANALYTICAL_PATTERNS: ReadonlyArray<{ id: string; pattern: RegExp; r
 
 export function scanForUnsafeAnalyticalInput(input: string): PromptSafetyScanResult {
   const base = scanForPromptInjection(input);
+  const normalized = normalizeForPromptScan(input);
   const reasons = [...base.reasons];
   for (const rule of UNSAFE_ANALYTICAL_PATTERNS) {
-    if (rule.pattern.test(input)) {
+    if (rule.pattern.test(normalized)) {
       reasons.push(rule.reason);
     }
   }
@@ -476,8 +477,9 @@ export function validateChartSpecSafety(spec: {
     if (!promptCheck.safe) {
       reasons.push(...promptCheck.reasons);
     }
+    const normalized = normalizeForPromptScan(t);
     for (const rule of UNSAFE_CHART_SPEC_PATTERNS) {
-      if (rule.pattern.test(t)) {
+      if (rule.pattern.test(normalized)) {
         reasons.push(rule.reason);
       }
     }
@@ -487,6 +489,8 @@ export function validateChartSpecSafety(spec: {
     reasons: Array.from(new Set(reasons)),
   };
 }
+
+export * from "./ooxmlSafety.ts";
 
 export function validateReportingManifestSafety(manifest: ReportingPackageManifest): {
   valid: boolean;

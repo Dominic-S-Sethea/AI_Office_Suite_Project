@@ -50,7 +50,7 @@ describe("Phase 3 — Workspace & API Features (Search/Pagination, Revision Diff
       const baseUrl = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
 
       const login = async (email: string, tenantId: string, workspaceId: string): Promise<string> => {
-        const res = await fetch(`${baseUrl}/api/auth/login`, {
+        const res = await fetch(`${baseUrl}/api/auth/token`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ email, password: "FeaturePass!2026", tenantId, workspaceId }),

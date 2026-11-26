@@ -1,13 +1,20 @@
+import { randomBytes, randomUUID } from "node:crypto";
 import bcrypt from "bcryptjs";
-import jwt, { type JwtPayload } from "jsonwebtoken";
+import jwt, { type JwtPayload, type SignOptions } from "jsonwebtoken";
 import type { NextFunction, Request, Response } from "express";
 import type { ActorContext, WorkspaceRole } from "@ai-office-suite/shared-contracts";
 import { isWorkspaceRole } from "@ai-office-suite/authorization";
 import type { PgDatabaseAdapter } from "@ai-office-suite/database";
 
 export const SESSION_COOKIE_NAME = "aios_session";
-const SESSION_COOKIE_MAX_AGE_SECONDS = 604800; // 7 days
+const SESSION_COOKIE_MAX_AGE_SECONDS = 43_200; // 12 hours
 const STATE_CHANGING_METHODS = new Set(["POST", "PUT", "PATCH", "DELETE"]);
+export const JWT_ISSUER = "ai-office-suite-api";
+export const JWT_AUDIENCE = "ai-office-suite-workspace";
+
+// Per-process CSPRNG fallback for test/dev only — never hardcoded, never used in production (H4)
+const EPHEMERAL_DEV_JWT_SECRET = randomBytes(32).toString("hex");
+const LOOPBACK_HOST_PATTERN = /^(?:127\.0\.0\.1|localhost)(?::\d{1,5})?$/i;
 
 export class AuthenticationError extends Error {
   readonly statusCode: number;
@@ -42,7 +49,7 @@ export function getJwtSecret(): string {
     return secret;
   }
   if (process.env.NODE_ENV === "test" || process.env.ALLOW_DEV_JWT_SECRET === "true") {
-    return "aios-ephemeral-test-jwt-secret-min-32-chars-only";
+    return EPHEMERAL_DEV_JWT_SECRET;
   }
   throw new Error("JWT_SECRET (>= 32 chars) is required outside tests.");
 }
@@ -120,9 +127,13 @@ export function verifyCookieCsrf(
   allowedOrigins: readonly string[],
 ): boolean {
   const fetchSite = req.headers["sec-fetch-site"];
-  if (typeof fetchSite === "string" && fetchSite.trim().toLowerCase() === "cross-site") {
-    res.status(403).json({ error: "Cross-site request rejected", code: "CSRF_ORIGIN_REJECTED" });
-    return false;
+  if (typeof fetchSite === "string" && fetchSite.trim().length > 0) {
+    const normalizedSite = fetchSite.trim().toLowerCase();
+    // Reject cross-site AND same-site (sibling subdomain) cookie mutations; only allow same-origin or direct none (H2)
+    if (normalizedSite !== "same-origin" && normalizedSite !== "none") {
+      res.status(403).json({ error: "Cross-origin or sibling-site request rejected", code: "CSRF_ORIGIN_REJECTED" });
+      return false;
+    }
   }
 
   const originHeader = typeof req.headers.origin === "string" ? req.headers.origin.trim() : "";
@@ -143,10 +154,12 @@ export function verifyCookieCsrf(
     const n = normalizeOrigin(orig);
     if (n) allowed.add(n);
   }
-  const host = typeof req.headers.host === "string" ? req.headers.host.trim().toLowerCase() : "";
-  if (host) {
-    allowed.add(`http://${host}`);
-    allowed.add(`https://${host}`);
+  // Never trust arbitrary Host headers in production; in non-prod only permit matching loopback hosts (H2)
+  if (process.env.NODE_ENV !== "production") {
+    const host = typeof req.headers.host === "string" ? req.headers.host.trim().toLowerCase() : "";
+    if (host && LOOPBACK_HOST_PATTERN.test(host)) {
+      allowed.add(`http://${host}`);
+    }
   }
 
   if (!allowed.has(requestOrigin)) {
@@ -163,9 +176,13 @@ export interface SessionTokenClaims {
   workspaceId: string;
   role: WorkspaceRole;
   tv: number;
+  jti?: string;
 }
 
-export function signSessionToken(claims: SessionTokenClaims): string {
+export function signSessionToken(
+  claims: SessionTokenClaims,
+  options: { expiresIn?: SignOptions["expiresIn"] } = {},
+): string {
   return jwt.sign(
     {
       sub: claims.userId,
@@ -176,7 +193,13 @@ export function signSessionToken(claims: SessionTokenClaims): string {
       tv: claims.tv,
     },
     getJwtSecret(),
-    { algorithm: "HS256", expiresIn: "7d" },
+    {
+      algorithm: "HS256",
+      expiresIn: options.expiresIn ?? "12h",
+      issuer: JWT_ISSUER,
+      audience: JWT_AUDIENCE,
+      jwtid: claims.jti ?? randomUUID(),
+    },
   );
 }
 
@@ -184,7 +207,11 @@ const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{
 
 export function verifySessionToken(token: string): SessionTokenClaims | null {
   try {
-    const decoded = jwt.verify(token, getJwtSecret(), { algorithms: ["HS256"] });
+    const decoded = jwt.verify(token, getJwtSecret(), {
+      algorithms: ["HS256"],
+      issuer: JWT_ISSUER,
+      audience: JWT_AUDIENCE,
+    });
     if (typeof decoded === "string") return null;
     const p = decoded as JwtPayload;
     if (
@@ -198,7 +225,9 @@ export function verifySessionToken(token: string): SessionTokenClaims | null {
       typeof p.role !== "string" ||
       !isWorkspaceRole(p.role) ||
       typeof p.tv !== "number" ||
-      !Number.isInteger(p.tv)
+      !Number.isInteger(p.tv) ||
+      typeof p.jti !== "string" ||
+      p.jti.length < 8
     ) {
       return null;
     }
@@ -209,6 +238,7 @@ export function verifySessionToken(token: string): SessionTokenClaims | null {
       workspaceId: p.workspace_id,
       role: p.role,
       tv: p.tv,
+      jti: p.jti,
     };
   } catch {
     return null;
@@ -224,6 +254,7 @@ export async function authenticateUserWithPassword(params: {
   password: string;
   tenantId: string;
   workspaceId: string;
+  tokenExpiresIn?: SignOptions["expiresIn"];
 }): Promise<{ token: string; actor: ActorContext }> {
   const userRes = await params.db.query<{
     user_id: string;
@@ -237,11 +268,9 @@ export async function authenticateUserWithPassword(params: {
   );
   const user = userRes.rows[0];
   const passwordOk = await verifyPassword(params.password, user ? user.password_hash : DUMMY_BCRYPT_HASH);
-  if (!user || !passwordOk) {
+  if (!user || !passwordOk || user.status !== "active") {
+    // Uniform 401 prevents account status & credential enumeration (H4)
     throw new AuthenticationError(401, "INVALID_CREDENTIALS", "Invalid email or password.");
-  }
-  if (user.status !== "active") {
-    throw new AuthenticationError(403, "ACCOUNT_INACTIVE", "User account is not active.");
   }
 
   const memRes = await params.db.query<{ role: string }>(
@@ -253,7 +282,8 @@ export async function authenticateUserWithPassword(params: {
   );
   const membership = memRes.rows[0];
   if (!membership || !isWorkspaceRole(membership.role)) {
-    throw new AuthenticationError(403, "WORKSPACE_MEMBERSHIP_DENIED", "User is not a member of the requested tenant/workspace.");
+    // Uniform 401 prevents workspace/tenant membership enumeration (H4)
+    throw new AuthenticationError(401, "INVALID_CREDENTIALS", "Invalid email or password.");
   }
 
   const actor: ActorContext = {
@@ -262,11 +292,14 @@ export async function authenticateUserWithPassword(params: {
     userId: user.user_id,
     role: membership.role,
   };
-  const token = signSessionToken({
-    ...actor,
-    email: user.email,
-    tv: user.token_version,
-  });
+  const token = signSessionToken(
+    {
+      ...actor,
+      email: user.email,
+      tv: user.token_version,
+    },
+    params.tokenExpiresIn ? { expiresIn: params.tokenExpiresIn } : undefined,
+  );
   return { token, actor };
 }
 

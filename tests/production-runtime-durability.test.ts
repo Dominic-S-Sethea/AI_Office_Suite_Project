@@ -95,7 +95,7 @@ describe("Phase 4 — Production Runtime Durability, Readiness Probe, Metrics RB
 
       // Login as owner and editor
       const login = async (email: string): Promise<string> => {
-        const res = await fetch(`${url1}/api/auth/login`, {
+        const res = await fetch(`${url1}/api/auth/token`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ email, password: "RuntimePass!2026", tenantId, workspaceId }),

@@ -190,7 +190,11 @@ async function cmdSeedDev(db) {
     console.error("REFUSED: seed-dev cannot execute when NODE_ENV=production.");
     process.exit(1);
   }
-  const devPassword = process.env.DEV_SEED_PASSWORD?.trim() || "DevLocalPass!2026";
+  const devPassword = process.env.DEV_SEED_PASSWORD?.trim();
+  if (!devPassword || devPassword.length < 12) {
+    console.error("REFUSED: DEV_SEED_PASSWORD (>= 12 chars) must be explicitly provided for seed-dev.");
+    process.exit(1);
+  }
   const pwHash = await hashPassword(devPassword);
 
   const tenantId = "11111111-1111-4111-8111-111111111111";

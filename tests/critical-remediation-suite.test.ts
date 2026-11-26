@@ -205,14 +205,14 @@ describe("Wave 1 Critical Remediation Suite (C1–C7)", () => {
       draining = false;
 
       // C4: Authenticate two distinct users behind the SAME reverse proxy IP; exhausting User A's quota must NOT throttle User B
-      const loginA = await fetch(`${baseUrl}/api/auth/login`, {
+      const loginA = await fetch(`${baseUrl}/api/auth/token`, {
         method: "POST",
         headers: { "Content-Type": "application/json", "X-Forwarded-For": "203.0.113.10" },
         body: JSON.stringify({ email: "a@org.kh", password: "StrongPass!2026", tenantId: TENANT_A, workspaceId: WS_A }),
       });
       const tokenA = ((await loginA.json()) as { token: string }).token;
 
-      const loginB = await fetch(`${baseUrl}/api/auth/login`, {
+      const loginB = await fetch(`${baseUrl}/api/auth/token`, {
         method: "POST",
         headers: { "Content-Type": "application/json", "X-Forwarded-For": "203.0.113.10" },
         body: JSON.stringify({ email: "b@org.kh", password: "StrongPass!2026", tenantId: TENANT_A, workspaceId: WS_A }),

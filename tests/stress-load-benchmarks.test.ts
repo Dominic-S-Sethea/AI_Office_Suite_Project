@@ -104,7 +104,7 @@ describe("Phase 6 — Stress, Concurrency & Soak Benchmarks", () => {
         const baseUrl = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
         for (let i = 0; i < tenants.length; i++) {
           const t = tenants[i]!;
-          const loginRes = await fetch(`${baseUrl}/api/auth/login`, {
+          const loginRes = await fetch(`${baseUrl}/api/auth/token`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({

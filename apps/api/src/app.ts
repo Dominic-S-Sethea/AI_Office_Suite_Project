@@ -258,28 +258,27 @@ export function createApiApp(options: CreateApiAppOptions = {}): Express {
 
     if (rateLimitEnabled) {
       app.use("/api/auth/login", loginLimiter.middleware);
+      app.use("/api/auth/token", loginLimiter.middleware);
     }
 
-    app.get("/api/metrics", jwtMiddleware, (req, res) => {
-      const authReq = req as AuthenticatedRequest;
-      if (authReq.actor?.role !== "owner" && authReq.actor?.role !== "administrator") {
-        res.status(403).json({
-          error: "Metrics endpoint requires owner or administrator role.",
-          code: "FORBIDDEN_ROLE",
+    app.get("/api/metrics", jwtMiddleware, (req, res, next) => {
+      try {
+        const authReq = req as AuthenticatedRequest;
+        assertCanPerform(authReq.actor!, "metrics", "read");
+        res.json({
+          service: "ai-office-suite-api",
+          authMode,
+          metrics: observability.getMetrics(),
+          rateLimits: {
+            enabled: rateLimitEnabled,
+            login: loginLimiter.getStats(),
+            api: apiLimiter.getStats(),
+          },
+          ...(db.getPoolStats ? { dbPool: db.getPoolStats() } : {}),
         });
-        return;
+      } catch (err) {
+        next(err);
       }
-      res.json({
-        service: "ai-office-suite-api",
-        authMode,
-        metrics: observability.getMetrics(),
-        rateLimits: {
-          enabled: rateLimitEnabled,
-          login: loginLimiter.getStats(),
-          api: apiLimiter.getStats(),
-        },
-        ...(db.getPoolStats ? { dbPool: db.getPoolStats() } : {}),
-      });
     });
 
     app.post("/api/auth/login", async (req, res, next) => {
@@ -297,7 +296,42 @@ export function createApiApp(options: CreateApiAppOptions = {}): Express {
           workspaceId: parsed.data.workspaceId,
         });
         setSessionCookie(req, res, session.token);
-        res.json({ token: session.token, actor: session.actor });
+        // Browser login issues HttpOnly session cookie only — never leaks raw JWT into JS response body (H2)
+        res.json({ actor: session.actor });
+      } catch (err) {
+        next(err);
+      }
+    });
+
+    // Dedicated programmatic Bearer token endpoint (CLI / service integrations); rejects browser origins (H2)
+    app.post("/api/auth/token", async (req, res, next) => {
+      try {
+        if (req.headers.origin || req.headers["sec-fetch-site"]) {
+          res.status(403).json({
+            error: "Programmatic token endpoint cannot be invoked from browser origins; use /api/auth/login.",
+            code: "BROWSER_TOKEN_ENDPOINT_BLOCKED",
+          });
+          return;
+        }
+        const parsed = loginRequestSchema.safeParse(req.body);
+        if (!parsed.success) {
+          res.status(400).json({ error: "Invalid login credentials payload", code: "VALIDATION_ERROR", issues: parsed.error.issues });
+          return;
+        }
+        const session = await authenticateUserWithPassword({
+          db,
+          email: parsed.data.email,
+          password: parsed.data.password,
+          tenantId: parsed.data.tenantId,
+          workspaceId: parsed.data.workspaceId,
+          tokenExpiresIn: "2h",
+        });
+        res.json({
+          token: session.token,
+          tokenType: "Bearer",
+          expiresInSeconds: 7200,
+          actor: session.actor,
+        });
       } catch (err) {
         next(err);
       }
@@ -636,6 +670,8 @@ export function createApiApp(options: CreateApiAppOptions = {}): Express {
 
   app.post("/api/speech/transcribe", async (req, res, next) => {
     try {
+      const actor = getActor(req);
+      assertCanPerform(actor, "speech", "transcribe");
       const parsed = speechTranscribeRequestSchema.safeParse(req.body);
       if (!parsed.success) {
         res.status(400).json({ error: "Invalid speech request", code: "VALIDATION_ERROR", issues: parsed.error.issues });
@@ -643,6 +679,25 @@ export function createApiApp(options: CreateApiAppOptions = {}): Express {
       }
       const adapter = getSpeechAdapter(parsed.data.provider);
       const result = await adapter.transcribe(parsed.data);
+      const auditEvent = {
+        tenantId: actor.tenantId,
+        workspaceId: actor.workspaceId,
+        actorId: actor.userId,
+        actorRole: actor.role,
+        source: "voice_command" as const,
+        action: "speech.transcribed",
+        outcome: "success" as const,
+        summary: `Speech transcription via '${parsed.data.provider}' (${parsed.data.language}, isMock=${String(result.isMock)})`,
+      };
+      if (pgRepo) {
+        await pgRepo.recordAudit(actor, auditEvent);
+      } else {
+        audit.append({
+          ...auditEvent,
+          auditId: randomUUID(),
+          createdAt: new Date().toISOString(),
+        });
+      }
       res.json({ recognition: result });
     } catch (err) {
       next(err);

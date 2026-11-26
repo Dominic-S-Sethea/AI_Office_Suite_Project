@@ -3,16 +3,47 @@ import json
 import sys
 import time
 import wave
-import numpy as np
 
 
-def load_pcm_wav_16k(path: str) -> np.ndarray:
+MAX_SAMPLE_RATE = 96000
+MIN_SAMPLE_RATE = 8000
+MAX_CHANNELS = 2
+MAX_DURATION_SECONDS = 300.0
+MAX_PCM_BYTES = 64 * 1024 * 1024
+
+
+def load_pcm_wav_16k(path: str):
     with wave.open(path, "rb") as wf:
         channels = wf.getnchannels()
         sampwidth = wf.getsampwidth()
         sample_rate = wf.getframerate()
         n_frames = wf.getnframes()
+
+        if channels < 1 or channels > MAX_CHANNELS:
+            raise ValueError(f"Unsupported WAV channel count: {channels} (allowed: 1..{MAX_CHANNELS})")
+        if sample_rate < MIN_SAMPLE_RATE or sample_rate > MAX_SAMPLE_RATE:
+            raise ValueError(
+                f"Unsupported WAV sample rate: {sample_rate} Hz (allowed: {MIN_SAMPLE_RATE}..{MAX_SAMPLE_RATE})"
+            )
+        if sampwidth not in (1, 2, 4):
+            raise ValueError(f"Unsupported WAV sample width: {sampwidth} bytes")
+        if n_frames <= 0:
+            raise ValueError("WAV file contains zero audio frames")
+        duration_sec = float(n_frames) / float(sample_rate)
+        if duration_sec > MAX_DURATION_SECONDS:
+            raise ValueError(
+                f"WAV duration {duration_sec:.1f}s exceeds maximum allowed {MAX_DURATION_SECONDS:.0f}s"
+            )
+        expected_bytes = n_frames * channels * sampwidth
+        if expected_bytes > MAX_PCM_BYTES:
+            raise ValueError(f"WAV PCM payload ({expected_bytes} bytes) exceeds maximum limit ({MAX_PCM_BYTES} bytes)")
+
         raw = wf.readframes(n_frames)
+
+    if len(raw) > MAX_PCM_BYTES:
+        raise ValueError(f"WAV PCM data exceeds maximum limit ({MAX_PCM_BYTES} bytes)")
+
+    import numpy as np
 
     if sampwidth == 2:
         audio = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0

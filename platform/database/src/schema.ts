@@ -135,15 +135,39 @@ ALTER TABLE workspaces ENABLE ROW LEVEL SECURITY;
 ALTER TABLE workspaces FORCE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS tenant_isolation_workspaces ON workspaces;
 CREATE POLICY tenant_isolation_workspaces ON workspaces
-  USING (tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')::uuid)
-  WITH CHECK (tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')::uuid);
+  USING (
+    tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')::uuid
+    AND (
+      NULLIF(current_setting('app.current_workspace_id', true), '') IS NULL
+      OR workspace_id = NULLIF(current_setting('app.current_workspace_id', true), '')::uuid
+    )
+  )
+  WITH CHECK (
+    tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')::uuid
+    AND (
+      NULLIF(current_setting('app.current_workspace_id', true), '') IS NULL
+      OR workspace_id = NULLIF(current_setting('app.current_workspace_id', true), '')::uuid
+    )
+  );
 
 ALTER TABLE documents ENABLE ROW LEVEL SECURITY;
 ALTER TABLE documents FORCE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS tenant_isolation_documents ON documents;
 CREATE POLICY tenant_isolation_documents ON documents
-  USING (tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')::uuid)
-  WITH CHECK (tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')::uuid);
+  USING (
+    tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')::uuid
+    AND (
+      NULLIF(current_setting('app.current_workspace_id', true), '') IS NULL
+      OR workspace_id = NULLIF(current_setting('app.current_workspace_id', true), '')::uuid
+    )
+  )
+  WITH CHECK (
+    tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')::uuid
+    AND (
+      NULLIF(current_setting('app.current_workspace_id', true), '') IS NULL
+      OR workspace_id = NULLIF(current_setting('app.current_workspace_id', true), '')::uuid
+    )
+  );
 
 ALTER TABLE document_versions ENABLE ROW LEVEL SECURITY;
 ALTER TABLE document_versions FORCE ROW LEVEL SECURITY;
@@ -163,15 +187,39 @@ ALTER TABLE audit_logs ENABLE ROW LEVEL SECURITY;
 ALTER TABLE audit_logs FORCE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS tenant_isolation_audit_logs ON audit_logs;
 CREATE POLICY tenant_isolation_audit_logs ON audit_logs
-  USING (tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')::uuid)
-  WITH CHECK (tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')::uuid);
+  USING (
+    tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')::uuid
+    AND (
+      NULLIF(current_setting('app.current_workspace_id', true), '') IS NULL
+      OR workspace_id = NULLIF(current_setting('app.current_workspace_id', true), '')::uuid
+    )
+  )
+  WITH CHECK (
+    tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')::uuid
+    AND (
+      NULLIF(current_setting('app.current_workspace_id', true), '') IS NULL
+      OR workspace_id = NULLIF(current_setting('app.current_workspace_id', true), '')::uuid
+    )
+  );
 
 ALTER TABLE ai_applied_operations ENABLE ROW LEVEL SECURITY;
 ALTER TABLE ai_applied_operations FORCE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS tenant_isolation_ai_applied_operations ON ai_applied_operations;
 CREATE POLICY tenant_isolation_ai_applied_operations ON ai_applied_operations
-  USING (tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')::uuid)
-  WITH CHECK (tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')::uuid);
+  USING (
+    tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')::uuid
+    AND (
+      NULLIF(current_setting('app.current_workspace_id', true), '') IS NULL
+      OR workspace_id = NULLIF(current_setting('app.current_workspace_id', true), '')::uuid
+    )
+  )
+  WITH CHECK (
+    tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')::uuid
+    AND (
+      NULLIF(current_setting('app.current_workspace_id', true), '') IS NULL
+      OR workspace_id = NULLIF(current_setting('app.current_workspace_id', true), '')::uuid
+    )
+  );
 `;
 
 export async function initializePostgreSqlSchema(db: PgDatabaseAdapter): Promise<void> {
@@ -310,15 +358,20 @@ const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{
 
 /**
  * Executes queries inside an explicit transaction using the least-privilege non-superuser
- * role `app_runtime` and setting `app.current_tenant_id` locally for fail-closed RLS.
+ * role `app_runtime` and setting `app.current_tenant_id` (and optionally `app.current_workspace_id`)
+ * locally for fail-closed tenant + workspace RLS.
  */
 export async function withTenantTransaction<T>(
   db: PgDatabaseAdapter,
   tenantId: string | null,
   fn: (tx: PgQueryExecutor) => Promise<T>,
+  workspaceId?: string | null,
 ): Promise<T> {
   if (tenantId !== null && !UUID_PATTERN.test(tenantId)) {
     throw new Error(`Invalid tenant UUID '${tenantId}' for PostgreSQL RLS context.`);
+  }
+  if (workspaceId !== undefined && workspaceId !== null && !UUID_PATTERN.test(workspaceId)) {
+    throw new Error(`Invalid workspace UUID '${workspaceId}' for PostgreSQL RLS context.`);
   }
   return db.withTransaction(async (tx) => {
     await tx.exec("SET LOCAL ROLE app_runtime");
@@ -326,6 +379,11 @@ export async function withTenantTransaction<T>(
       await tx.query("SELECT set_config('app.current_tenant_id', $1, true)", [tenantId]);
     } else {
       await tx.query("SELECT set_config('app.current_tenant_id', '', true)");
+    }
+    if (workspaceId) {
+      await tx.query("SELECT set_config('app.current_workspace_id', $1, true)", [workspaceId]);
+    } else {
+      await tx.query("SELECT set_config('app.current_workspace_id', '', true)");
     }
     return fn(tx);
   });

@@ -5,8 +5,8 @@ import type {
   SpreadsheetWorkbook,
   SpreadsheetWorksheet,
 } from "@ai-office-suite/shared-contracts";
+import { escapeSafeCsvCell, inspectAndExtractOoxmlZip } from "@ai-office-suite/validation";
 import ExcelJS from "exceljs";
-import { unzipSync } from "fflate";
 import {
   colIndexToLetters,
   colLettersToIndex,
@@ -68,103 +68,12 @@ export async function importWorkbookFromXlsxBuffer(
   buffer: Uint8Array,
   filename: string,
 ): Promise<SpreadsheetWorkbook> {
-  const lower = filename.toLowerCase();
-  if (lower.endsWith(".xlsm") || lower.endsWith(".xlsb")) {
-    throw new WorkbookInteroperabilityError(
-      400,
-      "MACRO_WORKBOOK_BLOCKED",
-      `Macro-enabled workbook format '${filename}' is blocked.`,
-    );
+  const inspected = inspectAndExtractOoxmlZip(buffer, filename, "xlsx");
+  if (!inspected.ok) {
+    throw new WorkbookInteroperabilityError(400, inspected.code, inspected.message);
   }
 
-  if (
-    buffer.byteLength >= 8 &&
-    buffer[0] === 0xd0 &&
-    buffer[1] === 0xcf &&
-    buffer[2] === 0x11 &&
-    buffer[3] === 0xe0 &&
-    buffer[4] === 0xa1 &&
-    buffer[5] === 0xb1 &&
-    buffer[6] === 0x1a &&
-    buffer[7] === 0xe1
-  ) {
-    throw new WorkbookInteroperabilityError(
-      400,
-      "ENCRYPTED_WORKBOOK_UNSUPPORTED",
-      "Encrypted or legacy OLE2 binary Excel files are not supported.",
-    );
-  }
-
-  if (
-    buffer.byteLength < 4 ||
-    buffer[0] !== 0x50 ||
-    buffer[1] !== 0x4b ||
-    buffer[2] !== 0x03 ||
-    buffer[3] !== 0x04
-  ) {
-    throw new WorkbookInteroperabilityError(400, "INVALID_XLSX_ZIP", "Uploaded XLSX is not a valid ZIP archive.");
-  }
-
-  let zipEntries: Record<string, Uint8Array>;
-  let entryCount = 0;
-  let totalUncompressedBytes = 0;
-  const MAX_ENTRIES = 600;
-  const MAX_ENTRY_BYTES = 25 * 1024 * 1024;
-  const MAX_TOTAL_BYTES = 64 * 1024 * 1024;
-  try {
-    zipEntries = unzipSync(buffer, {
-      filter: (f) => {
-        entryCount++;
-        if (entryCount > MAX_ENTRIES) {
-          throw new WorkbookInteroperabilityError(400, "TOO_MANY_ARCHIVE_ENTRIES", "XLSX exceeds archive entry safety limit.");
-        }
-        if (
-          f.name.includes("..") ||
-          f.name.startsWith("/") ||
-          f.name.startsWith("\\") ||
-          /^[A-Za-z]:/.test(f.name) ||
-          f.name.includes("\0")
-        ) {
-          throw new WorkbookInteroperabilityError(
-            400,
-            "ZIP_PATH_TRAVERSAL_BLOCKED",
-            "XLSX archive contains unsafe path-traversal entries.",
-          );
-        }
-        if (/EncryptedPackage/i.test(f.name)) {
-          throw new WorkbookInteroperabilityError(
-            400,
-            "ENCRYPTED_WORKBOOK_UNSUPPORTED",
-            "Encrypted Excel files are not supported.",
-          );
-        }
-        if (/vbaProject\.bin|vbaData\.xml|\.xlm$/i.test(f.name)) {
-          throw new WorkbookInteroperabilityError(
-            400,
-            "MACRO_WORKBOOK_BLOCKED",
-            `Embedded macro part '${f.name}' detected and blocked.`,
-          );
-        }
-        totalUncompressedBytes += f.originalSize;
-        if (
-          f.originalSize > MAX_ENTRY_BYTES ||
-          totalUncompressedBytes > MAX_TOTAL_BYTES ||
-          (f.originalSize > 1_048_576 && f.size > 0 && f.originalSize / f.size > 100)
-        ) {
-          throw new WorkbookInteroperabilityError(
-            400,
-            "ZIP_BOMB_BLOCKED",
-            "XLSX archive exceeds safe decompressed size or compression ratio bounds.",
-          );
-        }
-        return true;
-      },
-    });
-  } catch (err) {
-    if (err instanceof WorkbookInteroperabilityError) throw err;
-    throw new WorkbookInteroperabilityError(400, "INVALID_XLSX_ZIP", "Uploaded XLSX is not a valid ZIP archive.");
-  }
-
+  const { entries: zipEntries, repackedBuffer } = inspected;
   const entryNames = Object.keys(zipEntries);
   if (!entryNames.some((n) => n === "xl/workbook.xml")) {
     throw new WorkbookInteroperabilityError(400, "INVALID_XLSX_STRUCTURE", "Archive is missing xl/workbook.xml.");
@@ -184,8 +93,9 @@ export async function importWorkbookFromXlsxBuffer(
     }
   }
 
+  // Pass canonical repacked ZIP buffer into ExcelJS to defeat ZIP parser-differential attacks
   const wb = new ExcelJS.Workbook();
-  await wb.xlsx.load(Buffer.from(buffer) as unknown as ExcelJS.Buffer);
+  await wb.xlsx.load(Buffer.from(repackedBuffer) as unknown as ExcelJS.Buffer);
 
   const sheets: SpreadsheetWorksheet[] = [];
   wb.eachSheet((ws) => {
@@ -247,8 +157,6 @@ export async function importWorkbookFromXlsxBuffer(
   return recalc.workbook;
 }
 
-const FORMULA_INJECTION_PREFIX = /^[\s\x00-\x1f]*[=+\-@]|^[\t\r]/;
-
 /**
  * Exports a worksheet to CSV with OWASP CSV formula-injection neutralization
  * (prefixes untrusted text values starting with =, +, -, @, tab, or CR with a single quote).
@@ -282,15 +190,11 @@ export function exportSheetToSafeCsv(sheet: SpreadsheetWorksheet): CsvExportSafe
           : (cell.evaluatedValue ?? "")
         : (cell.value ?? "");
 
-      let text = String(rawVal);
-      if (typeof rawVal === "string" && FORMULA_INJECTION_PREFIX.test(text)) {
-        text = `'${text}`;
+      const escaped = escapeSafeCsvCell(rawVal);
+      if (escaped.neutralized) {
         neutralizedFormulaCells++;
       }
-      if (text.includes(",") || text.includes('"') || text.includes("\n") || text.includes("\r")) {
-        text = `"${text.replace(/"/g, '""')}"`;
-      }
-      rowValues.push(text);
+      rowValues.push(escaped.cell);
     }
     lines.push(rowValues.join(","));
   }

@@ -232,7 +232,7 @@ describeLivePg("Phase 1 — Real PostgreSQL 16 Verification (RLS, Pooled Isolati
   });
 
   it("enforces FORCE RLS across reads, joins, cross-tenant writes, pooled transactions, and revokes audit/version tampering", async () => {
-    // Login as Alpha editor and Beta owner via real PG16 jwt-pg API
+    // Login as Alpha editor via cookie (/api/auth/login) and Bearer (/api/auth/token)
     const loginAlpha = await fetch(`${baseUrl}/api/auth/login`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -247,9 +247,23 @@ describeLivePg("Phase 1 — Real PostgreSQL 16 Verification (RLS, Pooled Isolati
     const setCookie = loginAlpha.headers.get("set-cookie") ?? "";
     expect(setCookie).toContain("aios_session=");
     expect(setCookie).toContain("HttpOnly");
-    const { token: alphaToken } = (await loginAlpha.json()) as { token: string };
+    const loginAlphaBody = (await loginAlpha.json()) as { token?: string };
+    expect(loginAlphaBody.token).toBeUndefined();
 
-    const loginBeta = await fetch(`${baseUrl}/api/auth/login`, {
+    const tokenAlphaRes = await fetch(`${baseUrl}/api/auth/token`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        email: "editor@alpha.pg16.test",
+        password: "StrongPass!2026",
+        tenantId: TENANT_ALPHA,
+        workspaceId: WS_ALPHA,
+      }),
+    });
+    expect(tokenAlphaRes.status).toBe(200);
+    const { token: alphaToken } = (await tokenAlphaRes.json()) as { token: string };
+
+    const loginBeta = await fetch(`${baseUrl}/api/auth/token`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({

@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import type {
   DocumentBlock,
   ImportDiagnostics,
@@ -7,8 +7,7 @@ import type {
   TextRun,
 } from "@ai-office-suite/shared-contracts";
 import { normalizeDocumentText } from "@ai-office-suite/document-engine";
-import { validateDocxUploadBytes } from "@ai-office-suite/validation";
-import { unzipSync } from "fflate";
+import { inspectAndExtractOoxmlZip } from "@ai-office-suite/validation";
 import mammoth from "mammoth";
 
 export class DocxImportError extends Error {
@@ -163,73 +162,12 @@ export async function importFromDocxBuffer(params: {
   actorId: string;
   titleOverride?: string;
 }): Promise<{ document: StudioDocument; diagnostics: ImportDiagnostics }> {
-  const precheck = validateDocxUploadBytes(params.filename, params.buffer);
-  if (!precheck.ok) {
-    throw new DocxImportError(400, precheck.code, precheck.message);
+  const inspected = inspectAndExtractOoxmlZip(params.buffer, params.filename, "docx");
+  if (!inspected.ok) {
+    throw new DocxImportError(400, inspected.code, inspected.message);
   }
 
-  const originalSha256 = createHash("sha256").update(params.buffer).digest("hex");
-
-  let zipEntries: Record<string, Uint8Array>;
-  let entryCount = 0;
-  let totalUncompressedBytes = 0;
-  const MAX_ENTRIES = 500;
-  const MAX_ENTRY_BYTES = 25 * 1024 * 1024;
-  const MAX_TOTAL_BYTES = 64 * 1024 * 1024;
-  try {
-    zipEntries = unzipSync(params.buffer, {
-      filter: (file) => {
-        entryCount++;
-        if (entryCount > MAX_ENTRIES) {
-          throw new DocxImportError(400, "TOO_MANY_ARCHIVE_ENTRIES", "DOCX archive exceeds Phase D1 entry safety limit.");
-        }
-        if (
-          file.name.includes("..") ||
-          file.name.startsWith("/") ||
-          file.name.startsWith("\\") ||
-          /^[A-Za-z]:/.test(file.name) ||
-          file.name.includes("\0")
-        ) {
-          throw new DocxImportError(
-            400,
-            "ZIP_PATH_TRAVERSAL_BLOCKED",
-            "DOCX archive contains unsafe relative or absolute path entries.",
-          );
-        }
-        if (/EncryptedPackage/i.test(file.name)) {
-          throw new DocxImportError(
-            400,
-            "ENCRYPTED_FILE_UNSUPPORTED",
-            "Encrypted DOCX files are not supported.",
-          );
-        }
-        if (/vbaProject\.bin|vbaData\.xml|\.xlm$/i.test(file.name)) {
-          throw new DocxImportError(
-            400,
-            "MACRO_CONTENT_BLOCKED",
-            `Embedded macro part '${file.name}' detected and blocked. Macro execution and import are prohibited.`,
-          );
-        }
-        totalUncompressedBytes += file.originalSize;
-        if (
-          file.originalSize > MAX_ENTRY_BYTES ||
-          totalUncompressedBytes > MAX_TOTAL_BYTES ||
-          (file.originalSize > 1_048_576 && file.size > 0 && file.originalSize / file.size > 100)
-        ) {
-          throw new DocxImportError(
-            400,
-            "ZIP_BOMB_BLOCKED",
-            "DOCX archive exceeds safe decompressed size or compression ratio limits.",
-          );
-        }
-        return true;
-      },
-    });
-  } catch (err) {
-    if (err instanceof DocxImportError) throw err;
-    throw new DocxImportError(400, "MALFORMED_DOCX_ARCHIVE", "Unable to unpack OOXML ZIP container safely.");
-  }
-
+  const { originalSha256, entries: zipEntries, repackedBuffer } = inspected;
   const entryNames = Object.keys(zipEntries);
 
   if (!zipEntries["word/document.xml"]) {
@@ -268,7 +206,8 @@ export async function importFromDocxBuffer(params: {
     );
   }
 
-  const mammothResult = await mammoth.convertToHtml({ buffer: Buffer.from(params.buffer) });
+  // Pass canonical repacked ZIP buffer into mammoth to prevent ZIP parser-differential attacks
+  const mammothResult = await mammoth.convertToHtml({ buffer: Buffer.from(repackedBuffer) });
   for (const msg of mammothResult.messages) {
     warnings.push(`${msg.type}: ${msg.message}`);
   }
