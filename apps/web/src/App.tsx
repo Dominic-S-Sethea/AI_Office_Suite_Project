@@ -1007,7 +1007,7 @@ export function App() {
         {
           id: "certified_metrics",
           label: "Certified Metrics",
-          badge: "FIN-POL-V1",
+          badge: "V1",
           active: activeSubPanel === "certified_metrics",
           onSelect: () => toggleSubPanel("certified_metrics"),
         },

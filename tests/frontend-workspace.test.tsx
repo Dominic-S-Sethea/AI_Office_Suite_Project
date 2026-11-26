@@ -658,7 +658,7 @@ describe("Wave 1 Frontend & Tiptap Codec Verification (C8 & C9)", () => {
   it("3-Zone UI/UX Rework: preserves Top Master Studio Headers, opens Left Fixed-Header animated vertical Sub-Header accordions with Escape dismissal, runs Data Prep subpanel, and renders Center Workspace AI Dock", async () => {
     vi.stubGlobal(
       "fetch",
-      vi.fn(async (input: RequestInfo | URL) => {
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
         const url = String(input);
         if (url.includes("/api/health")) {
           return new Response(JSON.stringify({ status: "ok", authMode: "provisional-local" }), { status: 200 });
@@ -667,6 +667,10 @@ describe("Wave 1 Frontend & Tiptap Codec Verification (C8 & C9)", () => {
           return new Response(JSON.stringify({ documents: [sampleBilingualDoc], total: 1 }), { status: 200 });
         }
         if (url.includes("/api/data-prep/stage-and-profile")) {
+          const parsedBody = JSON.parse(String(init?.body ?? "{}"));
+          if (!parsedBody.filename || !parsedBody.csvText || parsedBody.profileScope !== "full") {
+            return new Response(JSON.stringify({ error: "Invalid data-prep staging payload", code: "VALIDATION_ERROR" }), { status: 400 });
+          }
           return new Response(
             JSON.stringify({ profile: { datasetId: "ds_workspace_preview", scope: "full", totalRows: 4 } }),
             { status: 200 },

@@ -93,9 +93,9 @@ function WorkspaceSubPanelInner({
         credentials: "include",
         headers: { "Content-Type": "application/json", ...apiHeaders },
         body: JSON.stringify({
-          datasetId: "ds_workspace_preview",
-          sourceFileName: "november-2026.csv",
+          filename: "november-2026.csv",
           csvText,
+          profileScope: "full",
         }),
       });
       const data = await safeReadJson(res);

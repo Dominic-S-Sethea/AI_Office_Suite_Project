@@ -901,14 +901,14 @@ textarea {
 
 .workspace-shell {
   display: grid;
-  grid-template-columns: 232px 1fr;
+  grid-template-columns: 260px 1fr;
   flex: 1;
   min-height: 0;
   position: relative;
 }
 
 .workspace-shell.docs-drawer-open {
-  grid-template-columns: 232px 236px 1fr;
+  grid-template-columns: 260px 236px 1fr;
 }
 
 .left-fixed-rail {
@@ -1113,8 +1113,8 @@ textarea {
   display: flex;
   flex-direction: column;
   gap: 3px;
-  margin-left: 22px;
-  padding: 6px 6px 8px 13px;
+  margin-left: 16px;
+  padding: 6px 4px 8px 10px;
 }
 
 /* Animated vertical connector line growing downward along sub-headers */
