@@ -1,5 +1,13 @@
 # Changelog — AI Office Suite
 
+## [0.6.0-v1.3-feasibility] — 2026-11-26 (V1.3 Bounded Feasibility: FR-11 `PA-00`, FR-09 `AIC-00`, FR-10 `VI-00` & Integrated Slice)
+
+### Added & Verified (`CR-007`, `TD-PA-01`, `TD-AIC-01`, `TD-VOICE-02`)
+- **Shared Platform Administration (`PA-00`, `PLT-T01..PLT-T36`):** Extended `packages/shared-contracts` (`governance.ts`), `platform/authorization` (8-role `PolicyDecisionEngine` with restricted workspace isolation, MFA step-up, and authorized-read preservation), `platform/database` (`paSchema.ts` with 9 `FORCE RLS` `pa_*` tables + append-only `pa_usage_ledger`, `governanceRepository.ts` `PlatformGovernanceService` with hashed invites, `FOR UPDATE` seat/quota serialization, fenced-lease jobs, mock signed billing webhooks, and Core+XI+PA backup/restore), and `platform/storage` (`LocalPrivateObjectStore` with tenant keys, signed ephemeral download tokens, quarantine, and orphan sweep).
+- **AI Intelligence Core (`AIC-00`, `AI-T01..AI-T28`):** Added `modules/ai/src/{providers,knowledgeRetrieval,toolRegistry,agentRuntime}.ts` providing app-owned `AIProviderAdapter`, fail-closed classification-aware `ModelRoutingPolicyEngine` (`PRIVACY_UNSAFE_FAILOVER_BLOCKED`, external LLMs locked `423`), two-stage ACL `CorporateKnowledgeIndex` with indirect prompt-injection sanitization & live citation recheck, versioned `ToolDefinitionRegistry` + independent exact `verifyFinalState()`, durable `AiIntelligenceCore` `AgentRun` orchestrator, and direct-adapter vs SDK wrapper benchmark.
+- **Advanced Voice Intelligence (`VI-00`, `VOC-T01..VOC-T30`):** Added `engines/speech/src/{voiceSession,criticalFields,terminology,voiceGovernance}.ts` providing strict `VoiceSessionManager` state machine, duplicate/late-event guards, dictation-vs-command isolation, bilingual EN/KM `validateVoiceCriticalFields` (Khmer numerals, USD/KHR ambiguity, format-vs-FX rate check, relative dates/targets), tenant-isolated `TerminologyRegistry`, ephemeral audio cleanup, and fail-closed P1/corpus gates (`VOC-T24..T30`).
+- **Integrated Golden Vertical Slice (`GOV-T01..GOV-T08`) & Exit Report:** Verified Section 5.1 two-tenant finance workflow end-to-end across PA-00, AIC-00, VI-00, and FR-08 `CrossModuleIntegrationEngine` (`$150k / $40k / 26.67% / +20.00%`), authored `documentation/INTEGRATED_FEASIBILITY_EXIT_REPORT.md` with honest 102-ID acceptance matrices, and stopped at exit gate for Founder/CTO review.
+
 ## [0.5.0-xi00] — 2026-11-26 (FR-08 XI-00 Cross-Module Integration Feasibility)
 
 ### Added & Verified
