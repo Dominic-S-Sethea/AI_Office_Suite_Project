@@ -26,8 +26,10 @@ import {
 } from "./components/DocumentEditor.tsx";
 import { AiVoicePanel } from "./components/AiVoicePanel.tsx";
 import { ErrorBoundary } from "./components/ErrorBoundary.tsx";
+import { LeftNavRail, type FixedHeaderId, type NavFixedHeaderGroup } from "./components/LeftNavRail.tsx";
 import { NewDocumentModal } from "./components/NewDocumentModal.tsx";
 import type { RevisionDiffPayload } from "./components/VersionAuditDrawer.tsx";
+import { WorkspaceSubPanel, type WorkspaceUtilityPanelId } from "./components/WorkspaceSubPanel.tsx";
 import {
   arrayBufferToBase64,
   formatApiErrorMessage,
@@ -39,6 +41,7 @@ const LazyVersionAuditDrawer = lazy(() => import("./components/VersionAuditDrawe
 
 type AuthMode = "provisional-local" | "jwt-pg";
 type BootState = "loading" | "ready" | "unreachable";
+type ActiveStudioId = "documents" | "spreadsheets" | "presentations" | "analytics";
 
 const PAGE_SIZE = 50;
 
@@ -57,6 +60,12 @@ export function App() {
   const [bootAttempt, setBootAttempt] = useState(0);
   const [sessionActor, setSessionActor] = useState<ActorContext | null>(null);
   const [prototypeRole, setPrototypeRole] = useState<WorkspaceRole>("editor");
+
+  // 3-zone workspace navigation state
+  const [activeStudio, setActiveStudio] = useState<ActiveStudioId>("documents");
+  const [openFixedHeader, setOpenFixedHeader] = useState<FixedHeaderId | null>(null);
+  const [docsDrawerOpen, setDocsDrawerOpen] = useState(true);
+  const [activeSubPanel, setActiveSubPanel] = useState<WorkspaceUtilityPanelId>(null);
 
   // jwt-pg sign-in form state
   const [loginEmail, setLoginEmail] = useState("");
@@ -95,9 +104,7 @@ export function App() {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const [isImportingDocx, setIsImportingDocx] = useState(false);
 
-  // Responsive panels & drawers (H27)
-  const [sidebarOpen, setSidebarOpen] = useState(true);
-  const [panelOpen, setPanelOpen] = useState(true);
+  // Version & audit drawer
   const [historyOpen, setHistoryOpen] = useState(false);
   const [versions, setVersions] = useState<DocumentVersion[]>([]);
   const [auditEvents, setAuditEvents] = useState<AuditEvent[]>([]);
@@ -854,87 +861,291 @@ export function App() {
   const hasPrevPage = docOffset > 0;
   const hasNextPage = docOffset + PAGE_SIZE < totalDocs;
 
+  const studioLabelMap: Record<string, string> = {
+    spreadsheets: "Spreadsheets",
+    presentations: "Presentations",
+    analytics: "Intelligence BI",
+  };
+
+  const navGroups: NavFixedHeaderGroup[] = [
+    {
+      id: "files",
+      label: "Files & Docs",
+      shortTag: "FD",
+      subHeaders: [
+        {
+          id: "all_docs",
+          label: docsDrawerOpen ? "Hide Document List" : "All Documents",
+          badge: String(totalDocs),
+          active: docsDrawerOpen,
+          onSelect: () => {
+            setActiveStudio("documents");
+            setDocsDrawerOpen((v) => !v);
+          },
+        },
+        {
+          id: "new_blank",
+          label: "+ New Blank",
+          disabled: readOnly,
+          onSelect: () => {
+            setActiveStudio("documents");
+            setNewDocError(null);
+            setNewDocModalOpen(true);
+          },
+        },
+        {
+          id: "seed_bilingual",
+          label: isSeeding ? "Creating..." : "Bilingual Sample",
+          disabled: readOnly || isSeeding,
+          onSelect: () => {
+            setActiveStudio("documents");
+            void handleSeedBilingual();
+          },
+        },
+        {
+          id: "import_docx",
+          label: isImportingDocx ? "Importing..." : "Import DOCX",
+          disabled: readOnly || isImportingDocx,
+          onSelect: () => {
+            setActiveStudio("documents");
+            fileInputRef.current?.click();
+          },
+        },
+        {
+          id: "save_doc",
+          label: isSaving ? "Saving..." : `Save${hasUnsavedChanges ? " *" : ""}`,
+          disabled: readOnly || !hasUnsavedChanges || isSaving,
+          onSelect: () => void handleSave(),
+        },
+        {
+          id: "export_docx",
+          label: isExporting === "docx" ? "Exporting..." : "Export DOCX",
+          disabled: !activeDoc || !canExport || isExporting !== null,
+          title: !canExport ? "Viewers cannot export files; Reviewer or Editor role required." : undefined,
+          onSelect: () => void handleExport("docx"),
+        },
+        {
+          id: "export_pdf",
+          label: isExporting === "pdf" ? "Rendering..." : "Export PDF",
+          disabled: !activeDoc || !canExport || isExporting !== null,
+          title: !canExport ? "Viewers cannot export files; Reviewer or Editor role required." : undefined,
+          onSelect: () => void handleExport("pdf"),
+        },
+      ],
+    },
+    {
+      id: "layout",
+      label: "Page & Style",
+      shortTag: "PS",
+      subHeaders: [
+        {
+          id: "page_size",
+          label: `Page Size (${effectiveActiveDoc?.layout.size ?? "A4"})`,
+          active: activeSubPanel === "page_layout",
+          disabled: !activeDoc,
+          onSelect: () => {
+            setActiveStudio("documents");
+            setActiveSubPanel((prev) => (prev === "page_layout" ? null : "page_layout"));
+          },
+        },
+        {
+          id: "orientation",
+          label: `Orientation (${effectiveActiveDoc?.layout.orientation ?? "portrait"})`,
+          disabled: readOnly || !effectiveActiveDoc,
+          onSelect: () => {
+            if (!effectiveActiveDoc) return;
+            setActiveStudio("documents");
+            setDraftLayout({
+              ...effectiveActiveDoc.layout,
+              orientation: effectiveActiveDoc.layout.orientation === "portrait" ? "landscape" : "portrait",
+            });
+          },
+        },
+        {
+          id: "khmer_fonts",
+          label: "Khmer Fonts & Headers",
+          active: activeSubPanel === "page_layout",
+          disabled: !activeDoc,
+          onSelect: () => {
+            setActiveStudio("documents");
+            setActiveSubPanel("page_layout");
+          },
+        },
+        {
+          id: "linked_metrics",
+          label: "Linked Metrics",
+          active: activeSubPanel === "certified_metrics",
+          onSelect: () => setActiveSubPanel((prev) => (prev === "certified_metrics" ? null : "certified_metrics")),
+        },
+      ],
+    },
+    {
+      id: "data",
+      label: "Data & Analytics",
+      shortTag: "DA",
+      subHeaders: [
+        {
+          id: "stage_profile",
+          label: "Stage & Profile",
+          badge: "API",
+          active: activeSubPanel === "data_prep",
+          onSelect: () => setActiveSubPanel((prev) => (prev === "data_prep" ? null : "data_prep")),
+        },
+        {
+          id: "certified_metrics",
+          label: "Certified Metrics",
+          badge: "FIN-POL-V1",
+          active: activeSubPanel === "certified_metrics",
+          onSelect: () => setActiveSubPanel((prev) => (prev === "certified_metrics" ? null : "certified_metrics")),
+        },
+        {
+          id: "duckdb_spill",
+          label: "DuckDB 1M Spill",
+          badge: "TF-04",
+          active: activeSubPanel === "certified_metrics",
+          onSelect: () => setActiveSubPanel("certified_metrics"),
+        },
+      ],
+    },
+    {
+      id: "workflows",
+      label: "Workflows",
+      shortTag: "WF",
+      subHeaders: [
+        {
+          id: "linked_objects",
+          label: "Linked Objects",
+          active: activeSubPanel === "workflows",
+          onSelect: () => setActiveSubPanel((prev) => (prev === "workflows" ? null : "workflows")),
+        },
+        {
+          id: "reporting_packages",
+          label: "Reporting Packages",
+          badge: "XI-00",
+          active: activeSubPanel === "workflows",
+          onSelect: () => setActiveSubPanel("workflows"),
+        },
+        {
+          id: "outbox_status",
+          label: "Publication Outbox",
+          active: activeSubPanel === "workflows",
+          onSelect: () => setActiveSubPanel("workflows"),
+        },
+      ],
+    },
+    {
+      id: "versions",
+      label: "Versions & Audit",
+      shortTag: "VA",
+      subHeaders: [
+        {
+          id: "version_history",
+          label: "Version History",
+          disabled: !activeDoc,
+          active: historyOpen,
+          onSelect: () => void openHistory(),
+        },
+        {
+          id: "revision_diff",
+          label: "Revision Diff",
+          disabled: !activeDoc,
+          onSelect: () => void openHistory(),
+        },
+        {
+          id: "audit_trail",
+          label: "Audit Trail",
+          disabled: !activeDoc,
+          onSelect: () => void openHistory(),
+        },
+        {
+          id: "backup_restore",
+          label: "Backup & Restore",
+          active: activeSubPanel === "admin_policies",
+          onSelect: () => setActiveSubPanel("admin_policies"),
+        },
+      ],
+    },
+    {
+      id: "admin",
+      label: "Admin & Governance",
+      shortTag: "AG",
+      subHeaders: [
+        {
+          id: "role_rbac",
+          label: `Role & RBAC (${effectiveRole})`,
+          active: activeSubPanel === "admin_rbac",
+          onSelect: () => setActiveSubPanel((prev) => (prev === "admin_rbac" ? null : "admin_rbac")),
+        },
+        {
+          id: "ai_voice_policy",
+          label: "AI & Voice Policy",
+          badge: "423",
+          active: activeSubPanel === "admin_policies",
+          onSelect: () => setActiveSubPanel((prev) => (prev === "admin_policies" ? null : "admin_policies")),
+        },
+        {
+          id: "quotas_jobs",
+          label: "Quotas & Jobs",
+          badge: "PA-00",
+          active: activeSubPanel === "admin_policies",
+          onSelect: () => setActiveSubPanel("admin_policies"),
+        },
+        {
+          id: "session_health",
+          label: "Session & Health",
+          active: activeSubPanel === "admin_health",
+          onSelect: () => setActiveSubPanel((prev) => (prev === "admin_health" ? null : "admin_health")),
+        },
+      ],
+    },
+  ];
+
   return (
     <div className="app-shell">
+      {/* Zone 1: Master Top Header — Preserves the 4 Master Studio Headers in place */}
       <header className="topbar">
         <div className="brand">
           <h1 className="brand-title">AI Office Suite</h1>
           <span className="badge">
-            {authMode === "jwt-pg" ? "Document Studio · JWT + PG RLS" : "Document Studio · D1 Prototype"}
+            {authMode === "jwt-pg" ? "JWT + PG RLS" : "Stage 1–3 Prototype"}
           </span>
         </div>
 
         <nav className="studio-tabs" aria-label="Workspace Studios">
-          <button type="button" className="studio-tab active" aria-current="page">
+          <button
+            type="button"
+            className={`studio-tab ${activeStudio === "documents" ? "active" : ""}`}
+            aria-current={activeStudio === "documents" ? "page" : undefined}
+            onClick={() => setActiveStudio("documents")}
+          >
             Document Studio
           </button>
-          {PLANNED_FUTURE_STUDIOS.map((studio) => (
-            <button
-              key={studio.studioId}
-              type="button"
-              className="studio-tab planned"
-              disabled
-              title="Planned for a future phase — gated pending founder approval"
-            >
-              {studio.studioId.charAt(0).toUpperCase() + studio.studioId.slice(1)} (Planned)
-            </button>
-          ))}
+          {PLANNED_FUTURE_STUDIOS.map((studio) => {
+            const tabId = studio.studioId as ActiveStudioId;
+            const isActive = activeStudio === tabId;
+            return (
+              <button
+                key={studio.studioId}
+                type="button"
+                className={`studio-tab ${isActive ? "active" : ""}`}
+                aria-current={isActive ? "page" : undefined}
+                title="Local Stage 1–3 engine verified; full production UI gated for S2/S3"
+                onClick={() => setActiveStudio(tabId)}
+              >
+                {studioLabelMap[studio.studioId] ?? studio.studioId}
+              </button>
+            );
+          })}
         </nav>
 
         <div className="topbar-controls">
-          {bootState === "ready" && isAuthenticated && (
-            <button
-              type="button"
-              className="btn mobile-drawer-toggle"
-              aria-expanded={sidebarOpen}
-              onClick={() => setSidebarOpen((v) => !v)}
-            >
-              {sidebarOpen ? "Hide Docs" : "Documents"}
-            </button>
-          )}
-          {authMode === "jwt-pg" ? (
-            sessionActor ? (
-              <>
-                <span className="badge badge-ok" title={`Tenant ${sessionActor.tenantId}`}>
-                  Role: {sessionActor.role}
-                </span>
-                <button type="button" className="btn" onClick={() => void handleLogout(false)}>
-                  Sign Out
-                </button>
-                <button
-                  type="button"
-                  className="btn"
-                  title="Increment token_version to revoke all active sessions"
-                  onClick={() => void handleLogout(true)}
-                >
-                  Revoke All
-                </button>
-              </>
-            ) : (
-              <span className="badge badge-warn">Not Signed In</span>
-            )
-          ) : (
-            <label className="role-selector-label">
-              Role:&nbsp;
-              <select
-                className="btn"
-                value={prototypeRole}
-                onChange={(e) => handlePrototypeRoleChange(e.target.value as WorkspaceRole)}
-              >
-                <option value="editor">Editor</option>
-                <option value="owner">Owner</option>
-                <option value="reviewer">Reviewer (Read-Only + Export)</option>
-                <option value="viewer">Viewer (Read-Only)</option>
-              </select>
-            </label>
-          )}
           <button
             type="button"
-            className="btn"
-            aria-expanded={panelOpen}
-            onClick={() => setPanelOpen((v) => !v)}
+            className="badge topbar-role-pill"
+            title="Open Role & RBAC controls in Governance"
+            onClick={() => setActiveSubPanel((prev) => (prev === "admin_rbac" ? null : "admin_rbac"))}
           >
-            {panelOpen ? "Hide AI Panel" : "Show AI Panel"}
+            Role: {effectiveRole}
           </button>
         </div>
       </header>
@@ -1046,82 +1257,30 @@ export function App() {
           </form>
         </main>
       ) : (
-        <>
-          <div className="toolbar" role="toolbar" aria-label="Workspace Actions">
-            <button
-              type="button"
-              className="btn primary"
-              disabled={readOnly}
-              onClick={() => {
-                setNewDocError(null);
-                setNewDocModalOpen(true);
-              }}
-            >
-              + New Document
-            </button>
-            <button
-              type="button"
-              className="btn"
-              disabled={readOnly || isSeeding}
-              onClick={() => void handleSeedBilingual()}
-            >
-              {isSeeding ? "Creating..." : "+ Bilingual EN/KM Sample"}
-            </button>
-            <button
-              type="button"
-              className="btn"
-              disabled={readOnly || isImportingDocx}
-              onClick={() => fileInputRef.current?.click()}
-            >
-              {isImportingDocx ? "Importing DOCX..." : "Import DOCX"}
-            </button>
-            <input
-              ref={fileInputRef}
-              type="file"
-              accept=".docx"
-              aria-label="Import DOCX file"
-              className="visually-hidden"
-              onChange={(e) => void handleDocxFileSelected(e)}
-            />
-            <button
-              type="button"
-              className="btn"
-              disabled={readOnly || !hasUnsavedChanges || isSaving}
-              title="Save current changes (Ctrl+S / Cmd+S)"
-              onClick={() => void handleSave()}
-            >
-              {isSaving ? "Saving..." : `Save${hasUnsavedChanges ? " *" : ""}`}
-            </button>
-            <button type="button" className="btn" disabled={!activeDoc} onClick={() => void openHistory()}>
-              Versions &amp; Audit
-            </button>
-            <button
-              type="button"
-              className="btn"
-              disabled={!activeDoc || !canExport || isExporting !== null}
-              title={!canExport ? "Viewers cannot export files; Reviewer or Editor role required." : undefined}
-              onClick={() => void handleExport("docx")}
-            >
-              {isExporting === "docx" ? "Exporting DOCX..." : "Export DOCX"}
-            </button>
-            <button
-              type="button"
-              className="btn"
-              disabled={!activeDoc || !canExport || isExporting !== null}
-              title={!canExport ? "Viewers cannot export files; Reviewer or Editor role required." : undefined}
-              onClick={() => void handleExport("pdf")}
-            >
-              {isExporting === "pdf" ? "Rendering PDF..." : "Export PDF"}
-            </button>
-          </div>
+        <div className={`workspace-shell ${docsDrawerOpen && activeStudio === "documents" ? "docs-drawer-open" : ""}`}>
+          {/* Hidden DOCX file input triggered via Files & Docs -> Import DOCX */}
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept=".docx"
+            aria-label="Import DOCX file"
+            className="visually-hidden"
+            onChange={(e) => void handleDocxFileSelected(e)}
+          />
 
-          <div
-            className={`workspace-body ${panelOpen ? "" : "panel-collapsed"} ${sidebarOpen ? "" : "sidebar-collapsed"}`}
-          >
-            {sidebarOpen && (
-              <aside className="sidebar" aria-label="Workspace Documents">
-                <div className="panel-header-row">
-                  <strong className="sidebar-title">Documents ({totalDocs})</strong>
+          {/* Zone 2: Left Fixed-Header Rail with Horizontal Dropdown Sub-Headers */}
+          <LeftNavRail
+            groups={navGroups}
+            openHeaderId={openFixedHeader}
+            onToggleHeader={setOpenFixedHeader}
+          />
+
+          {/* Optional Left Document Explorer (toggled via Files & Docs -> All Documents) */}
+          {docsDrawerOpen && activeStudio === "documents" && (
+            <aside className="sidebar" aria-label="Workspace Documents">
+              <div className="panel-header-row">
+                <strong className="sidebar-title">Documents ({totalDocs})</strong>
+                <div className="row-actions-tight">
                   <button
                     type="button"
                     className="btn btn-compact"
@@ -1130,170 +1289,207 @@ export function App() {
                   >
                     {isLoadingDocs ? "..." : "Refresh"}
                   </button>
-                </div>
-                <div className="sidebar-filters">
-                  <input
-                    type="search"
-                    className="input-field input-compact"
-                    placeholder="Search title..."
-                    aria-label="Search documents by title"
-                    value={searchQuery}
-                    onChange={(e) => {
-                      setSearchQuery(e.target.value);
-                      setDocOffset(0);
-                    }}
-                  />
-                  <select
-                    className="input-field input-compact"
-                    aria-label="Filter documents by language"
-                    value={languageFilter}
-                    onChange={(e) => {
-                      setLanguageFilter(e.target.value as "" | "en" | "km" | "bilingual");
-                      setDocOffset(0);
-                    }}
+                  <button
+                    type="button"
+                    className="btn btn-compact"
+                    aria-label="Collapse documents drawer"
+                    onClick={() => setDocsDrawerOpen(false)}
                   >
-                    <option value="">All Languages</option>
-                    <option value="bilingual">Bilingual (EN/KM)</option>
-                    <option value="en">English</option>
-                    <option value="km">ខ្មែរ (Khmer)</option>
-                  </select>
+                    ✕
+                  </button>
                 </div>
-                {isLoadingDocs && docs.length === 0 && (
-                  <div className="muted-text" role="status">
-                    Loading documents...
-                  </div>
-                )}
-                {!isLoadingDocs && docs.length === 0 && (
-                  <div className="muted-text">
-                    {searchQuery || languageFilter
-                      ? "No matching documents found."
-                      : 'No documents yet. Click "+ New Document" or "+ Bilingual EN/KM Sample".'}
-                  </div>
-                )}
-                {docs.map((d) => {
-                  const isSelected = activeDoc?.documentId === d.documentId;
-                  return (
-                    <button
-                      key={d.documentId}
-                      type="button"
-                      aria-current={isSelected ? "true" : undefined}
-                      className={`doc-item ${isSelected ? "selected" : ""}`}
-                      onClick={() => handleSelectDocument(d)}
-                    >
-                      <div className="strong-text">{d.title}</div>
-                      <div className="meta-caption">
-                        Rev {d.revision} · {d.language} · {d.layout.size}
-                      </div>
-                    </button>
-                  );
-                })}
-                {totalDocs > PAGE_SIZE && (
-                  <div className="pagination-bar" role="navigation" aria-label="Document pagination">
-                    <span className="meta-caption">
-                      {pageStart}–{pageEnd} of {totalDocs}
-                    </span>
-                    <div className="row-actions-tight">
-                      <button
-                        type="button"
-                        className="btn btn-compact"
-                        disabled={!hasPrevPage || isLoadingDocs}
-                        onClick={() => setDocOffset((prev) => Math.max(0, prev - PAGE_SIZE))}
-                      >
-                        Prev
-                      </button>
-                      <button
-                        type="button"
-                        className="btn btn-compact"
-                        disabled={!hasNextPage || isLoadingDocs}
-                        onClick={() => setDocOffset((prev) => prev + PAGE_SIZE)}
-                      >
-                        Next
-                      </button>
-                    </div>
-                  </div>
-                )}
-              </aside>
-            )}
-
-            <main className="canvas-area">
-              {effectiveActiveDoc && activeDoc ? (
-                <>
-                  <div className="doc-meta-bar" aria-label="Document Settings">
-                    <input
-                      type="text"
-                      className="input-field"
-                      disabled={readOnly}
-                      aria-label="Document title"
-                      value={effectiveActiveDoc.title}
-                      onChange={(e) => setDraftTitle(e.target.value)}
-                    />
-                    <select
-                      className="btn"
-                      disabled={readOnly}
-                      aria-label="Document language"
-                      value={effectiveActiveDoc.language}
-                      onChange={(e) => setDraftLanguage(e.target.value as StudioDocument["language"])}
-                    >
-                      <option value="bilingual">Bilingual</option>
-                      <option value="en">English</option>
-                      <option value="km">ខ្មែរ</option>
-                    </select>
-                    <select
-                      className="btn"
-                      disabled={readOnly}
-                      aria-label="Page size"
-                      value={effectiveActiveDoc.layout.size}
-                      onChange={(e) =>
-                        setDraftLayout({
-                          ...effectiveActiveDoc.layout,
-                          size: e.target.value as "A4" | "Letter",
-                        })
-                      }
-                    >
-                      <option value="A4">A4</option>
-                      <option value="Letter">Letter</option>
-                    </select>
-                    <select
-                      className="btn"
-                      disabled={readOnly}
-                      aria-label="Page orientation"
-                      value={effectiveActiveDoc.layout.orientation}
-                      onChange={(e) =>
-                        setDraftLayout({
-                          ...effectiveActiveDoc.layout,
-                          orientation: e.target.value as "portrait" | "landscape",
-                        })
-                      }
-                    >
-                      <option value="portrait">Portrait</option>
-                      <option value="landscape">Landscape</option>
-                    </select>
-                  </div>
-                  <ErrorBoundary scopeLabel="Document Editor">
-                    <DocumentEditor
-                      ref={editorRef}
-                      document={effectiveActiveDoc}
-                      tiptapContent={tiptapContent}
-                      readOnly={readOnly}
-                      onDirtyChange={setEditorDirty}
-                      onSelectionChange={setSelection}
-                    />
-                  </ErrorBoundary>
-                </>
-              ) : (
-                <div className="preview-card welcome-card">
-                  <strong>Welcome to AI Office Suite</strong>
-                  <span>
-                    Create a new document, import a <code>.docx</code> file, or load the bilingual English &amp; Khmer
-                    fixture to test Tiptap editing, controlled AI operations, mock voice commands (<code>isMock: true</code>),
-                    revision diffs, and HarfBuzz PDF export.
-                  </span>
+              </div>
+              <div className="sidebar-filters">
+                <input
+                  type="search"
+                  className="input-field input-compact"
+                  placeholder="Search title..."
+                  aria-label="Search documents by title"
+                  value={searchQuery}
+                  onChange={(e) => {
+                    setSearchQuery(e.target.value);
+                    setDocOffset(0);
+                  }}
+                />
+                <select
+                  className="input-field input-compact"
+                  aria-label="Filter documents by language"
+                  value={languageFilter}
+                  onChange={(e) => {
+                    setLanguageFilter(e.target.value as "" | "en" | "km" | "bilingual");
+                    setDocOffset(0);
+                  }}
+                >
+                  <option value="">All Languages</option>
+                  <option value="bilingual">Bilingual (EN/KM)</option>
+                  <option value="en">English</option>
+                  <option value="km">ខ្មែរ (Khmer)</option>
+                </select>
+              </div>
+              {isLoadingDocs && docs.length === 0 && (
+                <div className="muted-text" role="status">
+                  Loading documents...
                 </div>
               )}
-            </main>
+              {!isLoadingDocs && docs.length === 0 && (
+                <div className="muted-text">
+                  {searchQuery || languageFilter
+                    ? "No matching documents found."
+                    : 'No documents yet. Open "Files & Docs" on the left to create or seed a sample.'}
+                </div>
+              )}
+              {docs.map((d) => {
+                const isSelected = activeDoc?.documentId === d.documentId;
+                return (
+                  <button
+                    key={d.documentId}
+                    type="button"
+                    aria-current={isSelected ? "true" : undefined}
+                    className={`doc-item ${isSelected ? "selected" : ""}`}
+                    onClick={() => handleSelectDocument(d)}
+                  >
+                    <div className="strong-text">{d.title}</div>
+                    <div className="meta-caption">
+                      Rev {d.revision} · {d.language} · {d.layout.size}
+                    </div>
+                  </button>
+                );
+              })}
+              {totalDocs > PAGE_SIZE && (
+                <div className="pagination-bar" role="navigation" aria-label="Document pagination">
+                  <span className="meta-caption">
+                    {pageStart}–{pageEnd} of {totalDocs}
+                  </span>
+                  <div className="row-actions-tight">
+                    <button
+                      type="button"
+                      className="btn btn-compact"
+                      disabled={!hasPrevPage || isLoadingDocs}
+                      onClick={() => setDocOffset((prev) => Math.max(0, prev - PAGE_SIZE))}
+                    >
+                      Prev
+                    </button>
+                    <button
+                      type="button"
+                      className="btn btn-compact"
+                      disabled={!hasNextPage || isLoadingDocs}
+                      onClick={() => setDocOffset((prev) => prev + PAGE_SIZE)}
+                    >
+                      Next
+                    </button>
+                  </div>
+                </div>
+              )}
+            </aside>
+          )}
 
-            {panelOpen && activeDoc && (
+          {/* Zone 3: Center Workspace (Studio Canvas + Contextual Sub-Panels + Integrated AI & Voice Dock) */}
+          <main className="center-workspace" aria-label="Center Workspace">
+            <div className="workspace-scroll-stage">
+              <WorkspaceSubPanel
+                panelId={activeSubPanel}
+                onClose={() => setActiveSubPanel(null)}
+                authMode={authMode}
+                sessionActor={sessionActor}
+                prototypeRole={prototypeRole}
+                readOnly={readOnly}
+                activeDoc={effectiveActiveDoc}
+                apiHeaders={apiHeaders}
+                onRoleChange={handlePrototypeRoleChange}
+                onLogout={handleLogout}
+                onLayoutChange={setDraftLayout}
+                onLanguageChange={setDraftLanguage}
+              />
+
+              {activeStudio === "documents" ? (
+                effectiveActiveDoc && activeDoc ? (
+                  <>
+                    <div className="doc-meta-bar" aria-label="Document Settings">
+                      <input
+                        type="text"
+                        className="input-field"
+                        disabled={readOnly}
+                        aria-label="Document title"
+                        value={effectiveActiveDoc.title}
+                        onChange={(e) => setDraftTitle(e.target.value)}
+                      />
+                      <span className="meta-caption">
+                        Rev {effectiveActiveDoc.revision} · {effectiveActiveDoc.language} ·{" "}
+                        {effectiveActiveDoc.layout.size} {effectiveActiveDoc.layout.orientation}
+                      </span>
+                      <button
+                        type="button"
+                        className="btn primary btn-compact"
+                        disabled={readOnly || !hasUnsavedChanges || isSaving}
+                        title="Save current changes (Ctrl+S / Cmd+S)"
+                        onClick={() => void handleSave()}
+                      >
+                        {isSaving ? "Saving..." : `Save${hasUnsavedChanges ? " *" : ""}`}
+                      </button>
+                    </div>
+                    <ErrorBoundary scopeLabel="Document Editor">
+                      <DocumentEditor
+                        ref={editorRef}
+                        document={effectiveActiveDoc}
+                        tiptapContent={tiptapContent}
+                        readOnly={readOnly}
+                        onDirtyChange={setEditorDirty}
+                        onSelectionChange={setSelection}
+                      />
+                    </ErrorBoundary>
+                  </>
+                ) : (
+                  <div className="preview-card welcome-card">
+                    <strong>Welcome to AI Office Suite</strong>
+                    <span>
+                      Click <strong>Files &amp; Docs</strong> in the left fixed-header rail to create a blank document,
+                      import a <code>.docx</code> file, or load the bilingual English &amp; Khmer report.
+                    </span>
+                  </div>
+                )
+              ) : (
+                <div className="preview-card studio-engine-card">
+                  <div className="panel-header-row">
+                    <strong>
+                      {activeStudio === "spreadsheets" && "Spreadsheet Studio (SS-00 Local Engine Verified · S2 UI Gated)"}
+                      {activeStudio === "presentations" && "Presentation Studio (PS-00 Local Engine Verified · S3 UI Gated)"}
+                      {activeStudio === "analytics" && "Intelligence Studio BI (BI-00 Local Engine Verified · S3 UI Gated)"}
+                    </strong>
+                    <span className="badge badge-warn">Engine Verified · UI Gated</span>
+                  </div>
+                  <p className="muted-text">
+                    {activeStudio === "spreadsheets" &&
+                      "Deterministic 19-function prototype evaluator, protected formula guards, exceljs XLSX round-trip, and OWASP CSV safety are verified in tests/d1-spreadsheet-feasibility.test.ts. Production grid selection (Univer vs Handsontable+HyperFormula) awaits TF-03 / APPROVAL-04."}
+                    {activeStudio === "presentations" &&
+                      "Canonical StudioPresentation model, pptxgenjs native OOXML export, speaker-note disclosure controls (RC-T03), keyboard delivery order (RC-T04), and HarfBuzz PDF rendering are verified in tests/g1-ps00-presentation-feasibility.test.ts. Interactive slide editor is scheduled for Milestone S3."}
+                    {activeStudio === "analytics" &&
+                      "Shared ChartSpec, Apache ECharts SSR visuals, DataScopePolicy row/column isolation, and FIN-POL-V1 cross-studio reconciliation ($150k Net Sales / $40k Operating Profit / 26.67% Margin) are verified in tests/g1-bi00-intelligence-feasibility.test.ts. Interactive BI canvas is scheduled for Milestone S3."}
+                  </p>
+                  <div className="row-actions">
+                    <button
+                      type="button"
+                      className="btn primary"
+                      onClick={() => setActiveStudio("documents")}
+                    >
+                      Return to Document Studio
+                    </button>
+                    <button
+                      type="button"
+                      className="btn"
+                      onClick={() => setActiveSubPanel("certified_metrics")}
+                    >
+                      Inspect Certified FIN-POL-V1 Metrics
+                    </button>
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {/* Integrated AI & Voice Assistant Dock inside the Center Workspace */}
+            {activeDoc && activeStudio === "documents" && (
               <AiVoicePanel
+                variant="dock"
+                defaultCompact={true}
                 documentId={activeDoc.documentId}
                 revision={activeDoc.revision}
                 readOnly={readOnly}
@@ -1308,8 +1504,8 @@ export function App() {
                 apiHeaders={apiHeaders}
               />
             )}
-          </div>
-        </>
+          </main>
+        </div>
       )}
 
       <footer className="statusbar">

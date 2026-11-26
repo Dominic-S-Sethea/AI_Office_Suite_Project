@@ -654,4 +654,72 @@ describe("Wave 1 Frontend & Tiptap Codec Verification (C8 & C9)", () => {
       value: originalMediaDevices,
     });
   });
+
+  it("3-Zone UI/UX Rework: preserves Top Master Studio Headers, opens Left Fixed-Header horizontal Sub-Header flyouts with Escape dismissal, runs Data Prep subpanel, and renders Center Workspace AI Dock", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.includes("/api/health")) {
+          return new Response(JSON.stringify({ status: "ok", authMode: "provisional-local" }), { status: 200 });
+        }
+        if (url.includes("/api/documents")) {
+          return new Response(JSON.stringify({ documents: [sampleBilingualDoc], total: 1 }), { status: 200 });
+        }
+        if (url.includes("/api/data-prep/stage-and-profile")) {
+          return new Response(
+            JSON.stringify({ profile: { datasetId: "ds_workspace_preview", scope: "full", totalRows: 4 } }),
+            { status: 200 },
+          );
+        }
+        return new Response(JSON.stringify({}), { status: 200 });
+      }),
+    );
+
+    render(<App />);
+    await waitFor(() => {
+      expect(screen.getByRole("navigation", { name: "Workspace Studios" })).toBeTruthy();
+      expect(screen.getByRole("navigation", { name: "Workspace Sections" })).toBeTruthy();
+    });
+
+    // 1. All 4 Master Studio Headers remain in the top bar
+    expect(screen.getByRole("button", { name: "Document Studio" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Spreadsheets" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Presentations" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Intelligence BI" })).toBeTruthy();
+
+    // 2. Clicking a Left Fixed-Header opens its horizontal Sub-Header flyout; Escape closes it
+    const filesHeader = screen.getByRole("menuitem", { name: /Files & Docs/ });
+    expect(filesHeader.getAttribute("aria-expanded")).toBe("false");
+    fireEvent.click(filesHeader);
+    expect(filesHeader.getAttribute("aria-expanded")).toBe("true");
+    expect(screen.getByRole("menu", { name: "Files & Docs sub-headers" })).toBeTruthy();
+    expect(screen.getByRole("menuitem", { name: "+ New Blank" })).toBeTruthy();
+
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(filesHeader.getAttribute("aria-expanded")).toBe("false");
+    expect(screen.queryByRole("menu", { name: "Files & Docs sub-headers" })).toBeNull();
+
+    // 3. Open Data & Analytics -> Stage & Profile sub-header -> run live profile endpoint inside Center Workspace
+    fireEvent.click(screen.getByRole("menuitem", { name: /Data & Analytics/ }));
+    fireEvent.click(screen.getByRole("menuitem", { name: /Stage & Profile/ }));
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: "Run Stage & Profile" })).toBeTruthy();
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Run Stage & Profile" }));
+    await waitFor(() => {
+      expect(screen.getByText(/ds_workspace_preview/)).toBeTruthy();
+    });
+
+    // 4. Center Workspace contains the integrated AI & Voice Assistant Dock (starts compact, expands on click)
+    const workspaceMain = screen.getByRole("main", { name: "Center Workspace" });
+    await waitFor(() => {
+      expect(workspaceMain.querySelector('[aria-label="AI and Voice Assistant"]')).toBeTruthy();
+    });
+    const expandBtn = screen.getByRole("button", { name: "Expand AI Controls" });
+    fireEvent.click(expandBtn);
+    expect(screen.getByRole("button", { name: "Compact Dock" })).toBeTruthy();
+    expect(screen.getByText(/Explicit Mock Disclosure \(isMock: true\)/)).toBeTruthy();
+  });
 });
+

@@ -15,6 +15,8 @@ interface AiVoicePanelProps {
   onRevisionConflict?: (message: string) => void;
   onUnauthorized?: () => void;
   apiHeaders: Record<string, string>;
+  variant?: "panel" | "dock";
+  defaultCompact?: boolean;
 }
 
 function AiVoicePanelInner({
@@ -30,7 +32,10 @@ function AiVoicePanelInner({
   onRevisionConflict,
   onUnauthorized,
   apiHeaders,
+  variant = "panel",
+  defaultCompact = false,
 }: AiVoicePanelProps) {
+  const [expanded, setExpanded] = useState(!defaultCompact);
   const [inputLanguage, setInputLanguage] = useState<"en" | "km">("en");
   const [outputLanguage, setOutputLanguage] = useState<"match" | "en" | "km">("match");
   const [mode, setMode] = useState<"command" | "dictation" | "contextual">("contextual");
@@ -46,6 +51,7 @@ function AiVoicePanelInner({
   const [proposal, setProposal] = useState<DocumentOperationProposal | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
+  const textareaRef = useRef<HTMLTextAreaElement | null>(null);
 
   const busy = isTranscribing || isPlanning || isApplying;
 
@@ -54,6 +60,20 @@ function AiVoicePanelInner({
     setProposal(null);
     setErrorMsg(null);
   }, [documentId, revision]);
+
+  // Ctrl+K / Cmd+K focuses the integrated Workspace AI Dock
+  useEffect(() => {
+    if (variant !== "dock") return;
+    function onGlobalKeyDown(e: KeyboardEvent) {
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
+        e.preventDefault();
+        setExpanded(true);
+        textareaRef.current?.focus();
+      }
+    }
+    window.addEventListener("keydown", onGlobalKeyDown);
+    return () => window.removeEventListener("keydown", onGlobalKeyDown);
+  }, [variant]);
 
   // Always stop active microphone stream on unmount
   useEffect(() => {
@@ -281,186 +301,44 @@ function AiVoicePanelInner({
     }
   }
 
+  const isDock = variant === "dock";
+
   return (
-    <aside className="ai-panel" aria-label="AI and Voice Assistant">
+    <section
+      className={isDock ? `ai-workspace-dock ${expanded ? "is-expanded" : "is-compact"}` : "ai-panel"}
+      aria-label="AI and Voice Assistant"
+    >
       <div className="panel-header-row">
-        <strong>AI &amp; Voice Assistant</strong>
-        <span className="badge badge-warn">Mock Speech · Local Planner</span>
-      </div>
-
-      <div className="notice-mock" role="note">
-        <strong>Explicit Mock Disclosure (isMock: true):</strong> Voice buttons invoke the deterministic{" "}
-        <code>MockSpeechAdapter</code>; external cloud STT/LLM adapters fail closed (HTTP 423) until authorized.
-        Every mutation still enforces live backend RBAC, revision locks (409), and explicit preview approval.
-      </div>
-
-      {readOnly && (
-        <div className="notice-readonly" role="status">
-          Read-only role active: AI &amp; voice document mutations are disabled server-side and client-side.
+        <div className="row-actions wrap">
+          <strong>AI &amp; Voice Assistant</strong>
+          <span className="badge badge-warn">Mock Speech · Local Planner</span>
+          <span className="meta-caption">
+            Target: <code>{selectionBlockId ?? "auto"}</code>
+            {typeof selectionGraphemeCount === "number" && selectionGraphemeCount > 0
+              ? ` · ${selectionGraphemeCount} graphemes`
+              : ""}
+            {mode === "contextual" &&
+            typeof selectionStartOffset === "number" &&
+            typeof selectionEndOffset === "number" &&
+            selectionEndOffset > selectionStartOffset
+              ? ` · [${selectionStartOffset}..${selectionEndOffset}]`
+              : ""}
+          </span>
         </div>
-      )}
-
-      <div className="panel-grid-2">
-        <label className="field-label">
-          Input Language
-          <select
-            className="btn full-width-control"
-            value={inputLanguage}
-            onChange={(e) => setInputLanguage(e.target.value as "en" | "km")}
-          >
-            <option value="en">English (en-US)</option>
-            <option value="km">ខ្មែរ (km-KH)</option>
-          </select>
-        </label>
-        <label className="field-label">
-          Output Language
-          <select
-            className="btn full-width-control"
-            value={outputLanguage}
-            onChange={(e) => setOutputLanguage(e.target.value as "match" | "en" | "km")}
-          >
-            <option value="match">Match Input</option>
-            <option value="en">English</option>
-            <option value="km">ខ្មែរ (Khmer)</option>
-          </select>
-        </label>
-      </div>
-
-      <label className="field-label">
-        Interaction Mode
-        <select
-          className="btn full-width-control"
-          value={mode}
-          onChange={(e) => setMode(e.target.value as "command" | "dictation" | "contextual")}
-        >
-          <option value="contextual">Contextual (Selected Range / Block)</option>
-          <option value="command">Command Mode (Block / Document)</option>
-          <option value="dictation">Dictation Mode (Insert Text)</option>
-        </select>
-      </label>
-
-      <div className="preview-card">
-        <div className="strong-text">Active Selection Target</div>
-        <div className="muted-text">
-          Block: <code>{selectionBlockId ?? "auto"}</code>
-          {typeof selectionGraphemeCount === "number" && selectionGraphemeCount > 0
-            ? ` · ${selectionGraphemeCount} graphemes`
-            : ""}
-          {mode === "contextual" &&
-          typeof selectionStartOffset === "number" &&
-          typeof selectionEndOffset === "number" &&
-          selectionEndOffset > selectionStartOffset
-            ? ` · [${selectionStartOffset}..${selectionEndOffset}]`
-            : ""}
-        </div>
-        <div className="selection-excerpt">
-          {selectedText ? `"${selectedText}"` : "(Whole target block if no range highlighted)"}
-        </div>
-      </div>
-
-      <div className="row-actions wrap">
-        {!recording ? (
+        {isDock && (
           <button
             type="button"
-            className="btn"
-            disabled={readOnly || busy}
-            title="Tests browser microphone permission and runs MockSpeechAdapter (isMock: true) on stop"
-            onClick={() => void startPushToTalk()}
+            className="btn btn-compact"
+            aria-expanded={expanded}
+            onClick={() => setExpanded((v) => !v)}
           >
-            Mic Test (Mock STT)
-          </button>
-        ) : (
-          <button type="button" className="btn primary" disabled={busy} onClick={() => void stopPushToTalk()}>
-            Stop &amp; Run Mock STT
+            {expanded ? "Compact Dock" : "Expand AI Controls"}
           </button>
         )}
-        <button
-          type="button"
-          className="btn"
-          disabled={readOnly || busy}
-          onClick={() => void simulateVoiceFixture("en-translate-khmer")}
-        >
-          {isTranscribing ? "Transcribing..." : "Mock EN Voice"}
-        </button>
-        <button
-          type="button"
-          className="btn"
-          disabled={readOnly || busy}
-          onClick={() => void simulateVoiceFixture("km-insert-table")}
-        >
-          {isTranscribing ? "Transcribing..." : "Mock KM Voice"}
-        </button>
       </div>
-
-      {micStatus && (
-        <div className="mic-status-text" role="status">
-          {micStatus}
-        </div>
-      )}
-
-      {recognitionMeta && (
-        <div className="recognition-meta-box">
-          Provider: <strong>{recognitionMeta.provider}</strong> ·{" "}
-          <strong>{recognitionMeta.isMock ? "SIMULATED (isMock: true)" : "LIVE"}</strong>
-          {recognitionMeta.disclaimer ? ` · ${recognitionMeta.disclaimer}` : ""}
-        </div>
-      )}
-
-      <label className="field-label">
-        <span>
-          Editable Transcript / Typed Instruction{" "}
-          {source === "voice_command" && (
-            <span className="badge badge-ok">{voiceEdited ? "Voice (edited)" : "Voice"}</span>
-          )}
-        </span>
-        <textarea
-          rows={3}
-          className="btn command-textarea"
-          disabled={readOnly || busy}
-          placeholder="e.g. make bold | insert 3x3 table | ធ្វើឱ្យដិត | បញ្ចូលតារាង ៣x៣ | បកប្រែកថាខណ្ឌនេះជាភាសាខ្មែរ"
-          value={command}
-          onKeyDown={(e) => {
-            if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
-              e.preventDefault();
-              void handlePlan();
-            }
-          }}
-          onChange={(e) => {
-            const nextVal = e.target.value;
-            setCommand(nextVal);
-            // Preserve voice_command provenance when correcting a transcript; only reset when cleared (M16)
-            if (!nextVal.trim()) {
-              setSource("typed_ai");
-              setVoiceEdited(false);
-            } else if (source === "voice_command") {
-              setVoiceEdited(true);
-            }
-          }}
-        />
-      </label>
-
-      <div className="row-actions">
-        <button
-          type="button"
-          className="btn primary"
-          disabled={readOnly || busy || !command.trim()}
-          onClick={() => void handlePlan()}
-        >
-          {isPlanning ? "Planning..." : "Plan Operation"}
-        </button>
-        <button type="button" className="btn" disabled={readOnly || busy || revision <= 1} onClick={() => void handleUndoLast()}>
-          Undo Last Change
-        </button>
-      </div>
-
-      {errorMsg && (
-        <div className="banner-error" role="alert">
-          {errorMsg}
-        </div>
-      )}
 
       {proposal && (
-        <div className="preview-card">
+        <div className="preview-card dock-proposal-card">
           <div className="panel-header-row">
             <strong>Proposed Action: {proposal.action}</strong>
             <span className="badge">Risk: {proposal.riskLevel}</span>
@@ -483,7 +361,178 @@ function AiVoicePanelInner({
           </div>
         </div>
       )}
-    </aside>
+
+      {errorMsg && (
+        <div className="banner-error" role="alert">
+          {errorMsg}
+        </div>
+      )}
+
+      {readOnly && (
+        <div className="notice-readonly" role="status">
+          Read-only role active: AI &amp; voice document mutations are disabled server-side and client-side.
+        </div>
+      )}
+
+      {expanded && (
+        <>
+          <div className="notice-mock" role="note">
+            <strong>Explicit Mock Disclosure (isMock: true):</strong> Voice buttons invoke the deterministic{" "}
+            <code>MockSpeechAdapter</code>; external cloud STT/LLM adapters fail closed (HTTP 423) until authorized.
+            Every mutation still enforces live backend RBAC, revision locks (409), and explicit preview approval.
+          </div>
+
+          <div className={isDock ? "dock-controls-grid" : "panel-grid-2"}>
+            <label className="field-label">
+              Input Language
+              <select
+                className="btn full-width-control"
+                value={inputLanguage}
+                onChange={(e) => setInputLanguage(e.target.value as "en" | "km")}
+              >
+                <option value="en">English (en-US)</option>
+                <option value="km">ខ្មែរ (km-KH)</option>
+              </select>
+            </label>
+            <label className="field-label">
+              Output Language
+              <select
+                className="btn full-width-control"
+                value={outputLanguage}
+                onChange={(e) => setOutputLanguage(e.target.value as "match" | "en" | "km")}
+              >
+                <option value="match">Match Input</option>
+                <option value="en">English</option>
+                <option value="km">ខ្មែរ (Khmer)</option>
+              </select>
+            </label>
+            <label className="field-label">
+              Interaction Mode
+              <select
+                className="btn full-width-control"
+                value={mode}
+                onChange={(e) => setMode(e.target.value as "command" | "dictation" | "contextual")}
+              >
+                <option value="contextual">Contextual (Selected Range / Block)</option>
+                <option value="command">Command Mode (Block / Document)</option>
+                <option value="dictation">Dictation Mode (Insert Text)</option>
+              </select>
+            </label>
+          </div>
+
+          <div className="preview-card">
+            <div className="strong-text">Active Selection Target</div>
+            <div className="selection-excerpt">
+              {selectedText ? `"${selectedText}"` : "(Whole target block if no range highlighted)"}
+            </div>
+          </div>
+        </>
+      )}
+
+      <div className="dock-command-row">
+        <label className="field-label dock-input-wrap">
+          <span>
+            Editable Transcript / Typed Instruction{" "}
+            {source === "voice_command" && (
+              <span className="badge badge-ok">{voiceEdited ? "Voice (edited)" : "Voice"}</span>
+            )}
+          </span>
+          <textarea
+            ref={textareaRef}
+            rows={expanded ? 3 : 2}
+            className="btn command-textarea"
+            disabled={readOnly || busy}
+            placeholder="e.g. make bold | insert 3x3 table | ធ្វើឱ្យដិត | បញ្ចូលតារាង ៣x៣ | Ctrl+Enter to plan"
+            value={command}
+            onKeyDown={(e) => {
+              if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
+                e.preventDefault();
+                void handlePlan();
+              }
+            }}
+            onChange={(e) => {
+              const nextVal = e.target.value;
+              setCommand(nextVal);
+              // Preserve voice_command provenance when correcting a transcript; only reset when cleared (M16)
+              if (!nextVal.trim()) {
+                setSource("typed_ai");
+                setVoiceEdited(false);
+              } else if (source === "voice_command") {
+                setVoiceEdited(true);
+              }
+            }}
+          />
+        </label>
+
+        <div className="dock-action-stack">
+          <div className="row-actions wrap">
+            {!recording ? (
+              <button
+                type="button"
+                className="btn"
+                disabled={readOnly || busy}
+                title="Tests browser microphone permission and runs MockSpeechAdapter (isMock: true) on stop"
+                onClick={() => void startPushToTalk()}
+              >
+                Mic Test (Mock STT)
+              </button>
+            ) : (
+              <button type="button" className="btn primary" disabled={busy} onClick={() => void stopPushToTalk()}>
+                Stop &amp; Run Mock STT
+              </button>
+            )}
+            <button
+              type="button"
+              className="btn"
+              disabled={readOnly || busy}
+              onClick={() => void simulateVoiceFixture("en-translate-khmer")}
+            >
+              {isTranscribing ? "Transcribing..." : "Mock EN Voice"}
+            </button>
+            <button
+              type="button"
+              className="btn"
+              disabled={readOnly || busy}
+              onClick={() => void simulateVoiceFixture("km-insert-table")}
+            >
+              {isTranscribing ? "Transcribing..." : "Mock KM Voice"}
+            </button>
+          </div>
+          <div className="row-actions">
+            <button
+              type="button"
+              className="btn primary"
+              disabled={readOnly || busy || !command.trim()}
+              onClick={() => void handlePlan()}
+            >
+              {isPlanning ? "Planning..." : "Plan Operation"}
+            </button>
+            <button
+              type="button"
+              className="btn"
+              disabled={readOnly || busy || revision <= 1}
+              onClick={() => void handleUndoLast()}
+            >
+              Undo Last Change
+            </button>
+          </div>
+        </div>
+      </div>
+
+      {micStatus && (
+        <div className="mic-status-text" role="status">
+          {micStatus}
+        </div>
+      )}
+
+      {recognitionMeta && (
+        <div className="recognition-meta-box">
+          Provider: <strong>{recognitionMeta.provider}</strong> ·{" "}
+          <strong>{recognitionMeta.isMock ? "SIMULATED (isMock: true)" : "LIVE"}</strong>
+          {recognitionMeta.disclaimer ? ` · ${recognitionMeta.disclaimer}` : ""}
+        </div>
+      )}
+    </section>
   );
 }
 
