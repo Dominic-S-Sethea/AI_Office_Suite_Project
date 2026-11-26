@@ -1,10 +1,9 @@
-name: AI Office Suite — CI Validation & PostgreSQL 16 RLS
+name: AI Office Suite — CI Validation, PostgreSQL 16 RLS & Docker Smoke
 
 on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
@@ -15,12 +14,12 @@ permissions:
 
 jobs:
   validate:
-    name: Validate (hygiene, licenses, typecheck, build, tests, audit)
+    name: Validate (hygiene, licenses, typecheck, build, tests, benchmarks, audit)
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: "22"
           cache: npm
@@ -43,13 +42,16 @@ jobs:
       - name: Run full self-contained test suite
         run: npm test
 
+      - name: Verify performance regression budgets
+        run: npm run bench:check
+
       - name: Production dependency vulnerability audit
         run: npm audit --omit=dev --audit-level=high
 
   postgres16-rls:
-    name: Live PostgreSQL 16 RLS, Privilege & Migration Verification
+    name: Live PostgreSQL 16 RLS, Non-Superuser Runtime & Stress Suite
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     services:
       postgres:
         image: postgres:16-alpine
@@ -66,10 +68,13 @@ jobs:
           --health-retries=10
     env:
       DATABASE_URL: postgres://postgres:ci_ephemeral_pg16_password@127.0.0.1:5432/aios_ci
+      POSTGRES_APP_USER: aios_app
+      POSTGRES_APP_PASSWORD: ci_ephemeral_app_password_2026
       TEST_POSTGRES_URL: postgres://postgres:ci_ephemeral_pg16_password@127.0.0.1:5432/aios_ci
+      RUN_STRESS: "1"
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: "22"
           cache: npm
@@ -77,11 +82,42 @@ jobs:
       - name: Install dependencies
         run: npm ci --no-audit --no-fund
 
-      - name: Apply PostgreSQL 16 core + integration schemas
+      - name: Apply PostgreSQL 16 schemas & provision non-superuser aios_app login role
         run: npm run db:migrate
 
-      - name: Verify least-privilege app_runtime & FORCE RLS catalogs
+      - name: Verify least-privilege app_runtime & FORCE RLS catalogs (as non-superuser aios_app)
+        env:
+          DATABASE_URL: postgres://aios_app:ci_ephemeral_app_password_2026@127.0.0.1:5432/aios_ci
         run: npm run db:verify-rls
 
-      - name: Run live PostgreSQL 16 RLS, concurrency & backup/restore suite
-        run: npx vitest run tests/d2-live-postgres16-rls.test.ts
+      - name: Run live PostgreSQL 16 RLS, concurrency & backup/restore suite (must not skip)
+        run: |
+          npx vitest run tests/d2-live-postgres16-rls.test.ts --reporter=json --outputFile=/tmp/pg16-rls.json
+          node -e 'const r = JSON.parse(require("node:fs").readFileSync("/tmp/pg16-rls.json","utf8")); if (!r.numPassedTests || r.numPendingTests > 0) { console.error("Expected zero skipped PG16 RLS tests", r); process.exit(1); }'
+
+      - name: Run PostgreSQL 16 + pipeline stress soak suite
+        run: npx vitest run tests/stress-load-benchmarks.test.ts
+
+  docker-smoke:
+    name: Docker Compose, Image Builds & Nginx Config Smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Validate docker-compose.yml syntax & required variables
+        env:
+          POSTGRES_PASSWORD: ci_smoke_admin_password_2026
+          POSTGRES_APP_PASSWORD: ci_smoke_app_password_2026
+          JWT_SECRET: ci_smoke_jwt_secret_must_be_at_least_32_characters_long
+        run: docker compose config --quiet
+
+      - name: Build production API image and verify config boot import
+        run: |
+          docker build -f docker/Dockerfile.api -t aios-api:ci-smoke .
+          docker run --rm aios-api:ci-smoke node -e "import('./apps/api/src/config.ts').then(m => { const c = m.loadApiServerConfig({ AUTH_MODE: 'provisional-local', HOST: '127.0.0.1', NODE_ENV: 'development' }); if (c.port !== 4100) process.exit(1); console.log('API image config OK'); })"
+
+      - name: Build production Web image and validate nginx.conf
+        run: |
+          docker build -f docker/Dockerfile.web -t aios-web:ci-smoke .
+          docker run --rm --add-host=api:127.0.0.1 --entrypoint nginx aios-web:ci-smoke -t

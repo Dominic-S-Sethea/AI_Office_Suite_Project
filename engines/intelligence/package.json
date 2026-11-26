@@ -10,6 +10,7 @@
     "@ai-office-suite/analytics-engine": "*",
     "@ai-office-suite/audit": "*",
     "@ai-office-suite/authorization": "*",
+    "@ai-office-suite/file-conversion": "*",
     "@ai-office-suite/presentation-engine": "*",
     "@ai-office-suite/shared-contracts": "*",
     "@ai-office-suite/validation": "*",

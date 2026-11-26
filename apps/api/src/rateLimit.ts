@@ -66,8 +66,31 @@ export function createSlidingWindowRateLimiter(options: RateLimitOptions): Slidi
 
     active.push(now);
     if (!buckets.has(key) && buckets.size >= maxTrackedKeys) {
-      const oldestKey = buckets.keys().next().value;
-      if (oldestKey !== undefined) buckets.delete(oldestKey);
+      // Phase 1: sweep expired buckets first (H15 — never evict active throttled attackers when expired slots exist)
+      let evicted = 0;
+      for (const [candidateKey, timestamps] of buckets) {
+        const lastTs = timestamps[timestamps.length - 1] ?? 0;
+        if (lastTs <= cutoff) {
+          buckets.delete(candidateKey);
+          evicted++;
+          if (buckets.size < maxTrackedKeys) break;
+        }
+      }
+      // Phase 2: if still at capacity, evict the lowest-hit non-saturated bucket rather than a blocked attacker
+      if (evicted === 0 && buckets.size >= maxTrackedKeys) {
+        let victimKey: string | undefined;
+        let minHits = Number.POSITIVE_INFINITY;
+        for (const [candidateKey, timestamps] of buckets) {
+          const hits = timestamps.length;
+          if (hits < maxRequests && hits < minHits) {
+            minHits = hits;
+            victimKey = candidateKey;
+            if (hits <= 1) break;
+          }
+        }
+        const fallbackKey = victimKey ?? buckets.keys().next().value;
+        if (fallbackKey !== undefined) buckets.delete(fallbackKey);
+      }
     }
     buckets.set(key, active);
     totalAllowed++;

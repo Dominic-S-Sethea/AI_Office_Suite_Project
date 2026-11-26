@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from "node:crypto";
+import { createHash, createHmac, randomBytes, randomUUID } from "node:crypto";
 import type {
   ActorContext,
   CertifiedDatasetArtifact,
@@ -12,9 +12,31 @@ import type {
   ReconciliationReport,
 } from "@ai-office-suite/shared-contracts";
 import { assertCanPerform, assertTenantWorkspaceAccess } from "@ai-office-suite/authorization";
-import { scanForPromptInjection } from "@ai-office-suite/validation";
-import { unzipSync } from "fflate";
+import {
+  escapeSafeCsvCell,
+  inspectAndExtractOoxmlZip,
+  parseExactDecimalToMinorUnits,
+  scanForPromptInjection,
+} from "@ai-office-suite/validation";
 import ExcelJS from "exceljs";
+
+const EPHEMERAL_DEV_PII_KEY = randomBytes(32).toString("hex");
+const RESERVED_CSV_HEADERS = new Set(["__proto__", "constructor", "prototype", "tostring", "valueof"]);
+
+function resolvePiiPseudonymizationKey(): string {
+  const configured = process.env.PII_PSEUDONYMIZATION_KEY?.trim();
+  if (configured && configured.length >= 32) {
+    return configured;
+  }
+  if (process.env.NODE_ENV === "production") {
+    throw new DataPrepError(
+      500,
+      "MISSING_PII_HMAC_KEY",
+      "PII_PSEUDONYMIZATION_KEY (>= 32 chars) must be configured in production for hash_token pseudonymization.",
+    );
+  }
+  return EPHEMERAL_DEV_PII_KEY;
+}
 
 export class DataPrepError extends Error {
   readonly statusCode: number;
@@ -63,14 +85,217 @@ export interface XlsxStageOptions {
   sheetName?: string;
 }
 
+export type SchemaPatternPreset =
+  | "iso_date"
+  | "email"
+  | "khmer_phone"
+  | "uuid"
+  | "alphanumeric"
+  | "currency_code"
+  | "digits";
+
 export interface SchemaColumnRule {
   column: string;
   required?: boolean;
   type?: "string" | "number" | "date" | "enum";
   min?: number;
   max?: number;
+  preset?: SchemaPatternPreset;
   pattern?: string;
   allowedValues?: string[];
+}
+
+const NAMED_CONTRACT_PRESETS: Record<SchemaPatternPreset, RegExp> = {
+  iso_date: /^\d{4}-\d{2}-\d{2}$/,
+  email: /^[^\s@]{1,64}@[^\s@]{1,180}\.[^\s@]{2,24}$/,
+  khmer_phone: /^(?:\+855|0)[1-9]\d{7,8}$/,
+  uuid: /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i,
+  alphanumeric: /^[A-Za-z0-9_-]{1,128}$/,
+  currency_code: /^[A-Z]{3}$/,
+  digits: /^\d{1,32}$/,
+};
+
+const MAX_CONTRACT_PATTERN_LENGTH = 128;
+const MAX_CONTRACT_QUANTIFIER_BOUND = 64;
+const MAX_CONTRACT_REGEX_CELL_LENGTH = 1024;
+
+/**
+ * Compiles a user-supplied schema-contract regex only after verifying structural ReDoS safety:
+ * rejects backreferences, lookarounds, large bounded quantifiers, nested quantifiers on
+ * quantified/alternated groups, and ambiguous consecutive unbounded quantifiers.
+ */
+export function compileSafeContractPattern(rawPattern: string): RegExp {
+  if (typeof rawPattern !== "string" || rawPattern.length === 0 || rawPattern.length > MAX_CONTRACT_PATTERN_LENGTH) {
+    throw new DataPrepError(
+      400,
+      "INVALID_CONTRACT_PATTERN",
+      `Contract pattern must be a non-empty string <= ${MAX_CONTRACT_PATTERN_LENGTH} characters.`,
+    );
+  }
+
+  let inCharClass = false;
+  let prevWasUnboundedQuantifier = false;
+  let consecutiveUnboundedTokens = 0;
+  const groupStack: Array<{ hasQuantifier: boolean; hasAlternation: boolean }> = [];
+
+  for (let i = 0; i < rawPattern.length; i++) {
+    const ch = rawPattern[i]!;
+    if (ch === "\\") {
+      const next = rawPattern[i + 1];
+      if (!next) {
+        throw new DataPrepError(400, "INVALID_CONTRACT_PATTERN", "Trailing escape in contract pattern.");
+      }
+      if (!inCharClass && (/[1-9]/.test(next) || next === "k")) {
+        throw new DataPrepError(
+          400,
+          "UNSAFE_CONTRACT_PATTERN",
+          "Backreferences are prohibited in schema contract patterns (ReDoS protection).",
+        );
+      }
+      i++;
+      prevWasUnboundedQuantifier = false;
+      continue;
+    }
+
+    if (inCharClass) {
+      if (ch === "]") {
+        inCharClass = false;
+      }
+      continue;
+    }
+
+    if (ch === "[") {
+      inCharClass = true;
+      prevWasUnboundedQuantifier = false;
+      continue;
+    }
+
+    if (ch === "(") {
+      const next = rawPattern[i + 1];
+      if (next === "?") {
+        const afterQ = rawPattern[i + 2];
+        // Allow only non-capturing (?:...) groups; forbid lookarounds (?=, ?!, ?<=, ?<!) and named groups
+        if (afterQ !== ":") {
+          throw new DataPrepError(
+            400,
+            "UNSAFE_CONTRACT_PATTERN",
+            "Lookarounds and special regex group assertions are prohibited in schema contract patterns.",
+          );
+        }
+        i += 2;
+      }
+      if (groupStack.length >= 6) {
+        throw new DataPrepError(400, "UNSAFE_CONTRACT_PATTERN", "Regex group nesting exceeds safe limit.");
+      }
+      groupStack.push({ hasQuantifier: false, hasAlternation: false });
+      prevWasUnboundedQuantifier = false;
+      continue;
+    }
+
+    if (ch === "|") {
+      const top = groupStack[groupStack.length - 1];
+      if (top) top.hasAlternation = true;
+      prevWasUnboundedQuantifier = false;
+      consecutiveUnboundedTokens = 0;
+      continue;
+    }
+
+    if (ch === ")") {
+      const closed = groupStack.pop();
+      if (!closed) {
+        throw new DataPrepError(400, "INVALID_CONTRACT_PATTERN", "Unmatched ')' in schema contract pattern.");
+      }
+      const next = rawPattern[i + 1];
+      const groupFollowedByQuantifier = next === "+" || next === "*" || next === "?" || next === "{";
+      if (groupFollowedByQuantifier && (closed.hasQuantifier || closed.hasAlternation)) {
+        throw new DataPrepError(
+          400,
+          "UNSAFE_CONTRACT_PATTERN",
+          "Nested quantifiers or quantified alternations are prohibited (ReDoS protection).",
+        );
+      }
+      const parent = groupStack[groupStack.length - 1];
+      if (parent) {
+        if (closed.hasQuantifier || groupFollowedByQuantifier) parent.hasQuantifier = true;
+        if (closed.hasAlternation) parent.hasAlternation = true;
+      }
+      prevWasUnboundedQuantifier = false;
+      continue;
+    }
+
+    if (ch === "+" || ch === "*" || ch === "?") {
+      if (prevWasUnboundedQuantifier && ch !== "?") {
+        throw new DataPrepError(400, "UNSAFE_CONTRACT_PATTERN", "Stacked quantifiers are prohibited (ReDoS protection).");
+      }
+      const top = groupStack[groupStack.length - 1];
+      if (top && ch !== "?") top.hasQuantifier = true;
+      if (ch === "+" || ch === "*") {
+        consecutiveUnboundedTokens++;
+        if (consecutiveUnboundedTokens > 2) {
+          throw new DataPrepError(
+            400,
+            "UNSAFE_CONTRACT_PATTERN",
+            "Too many unbounded quantifiers in a single branch (ReDoS protection).",
+          );
+        }
+        prevWasUnboundedQuantifier = true;
+      }
+      continue;
+    }
+
+    if (ch === "{") {
+      const closeIdx = rawPattern.indexOf("}", i + 1);
+      if (closeIdx === -1) {
+        throw new DataPrepError(400, "INVALID_CONTRACT_PATTERN", "Unclosed '{' quantifier in schema contract pattern.");
+      }
+      const body = rawPattern.slice(i + 1, closeIdx);
+      const qMatch = body.match(/^(\d+)(?:,(\d*))?$/);
+      if (!qMatch) {
+        throw new DataPrepError(400, "INVALID_CONTRACT_PATTERN", `Invalid quantifier '{${body}}' in schema contract pattern.`);
+      }
+      const minBound = Number(qMatch[1]);
+      const hasComma = body.includes(",");
+      const maxBound = qMatch[2] ? Number(qMatch[2]) : hasComma ? Infinity : minBound;
+      if (minBound > MAX_CONTRACT_QUANTIFIER_BOUND || (Number.isFinite(maxBound) && maxBound > MAX_CONTRACT_QUANTIFIER_BOUND)) {
+        throw new DataPrepError(
+          400,
+          "UNSAFE_CONTRACT_PATTERN",
+          `Quantifier bound exceeds safe limit (${MAX_CONTRACT_QUANTIFIER_BOUND}).`,
+        );
+      }
+      if (hasComma && !qMatch[2]) {
+        consecutiveUnboundedTokens++;
+        if (consecutiveUnboundedTokens > 2) {
+          throw new DataPrepError(
+            400,
+            "UNSAFE_CONTRACT_PATTERN",
+            "Too many unbounded quantifiers in a single branch (ReDoS protection).",
+          );
+        }
+      }
+      const top = groupStack[groupStack.length - 1];
+      if (top && (hasComma || minBound > 1)) top.hasQuantifier = true;
+      i = closeIdx;
+      prevWasUnboundedQuantifier = true;
+      continue;
+    }
+
+    prevWasUnboundedQuantifier = false;
+  }
+
+  if (inCharClass || groupStack.length > 0) {
+    throw new DataPrepError(400, "INVALID_CONTRACT_PATTERN", "Unclosed character class or group in schema contract pattern.");
+  }
+
+  try {
+    return new RegExp(rawPattern);
+  } catch (err) {
+    throw new DataPrepError(
+      400,
+      "INVALID_CONTRACT_PATTERN",
+      `Invalid schema contract regex: ${err instanceof Error ? err.message : "syntax error"}.`,
+    );
+  }
 }
 
 export interface CertifiedCsvExportResult {
@@ -103,37 +328,21 @@ export function normalizeKhmerDigitsText(raw: string, stripCurrencySymbols = fal
 
 export function parseAmountToMinorUnitsBigInt(raw: unknown, scale: number): bigint | null {
   if (raw === null || raw === undefined || raw === "") return null;
-  let str = typeof raw === "number" ? (Number.isFinite(raw) ? raw.toString() : "") : String(raw).trim();
-  if (!str) return null;
-  str = str.replace(/,/g, "");
-  // Expand scientific notation cleanly if present
-  if (/^[+-]?\d+(?:\.\d+)?[eE][+-]?\d+$/.test(str)) {
-    const num = Number(str);
-    if (!Number.isFinite(num)) return null;
-    str = num.toFixed(Math.max(0, Math.min(8, scale + 2)));
-  }
-  const match = str.match(/^([+-])?(\d+)(?:\.(\d+))?$/);
-  if (!match) return null;
-  const neg = match[1] === "-";
-  const intPart = match[2]!;
-  const fracPart = match[3] ?? "";
-
-  if (scale === 0) {
-    let units = BigInt(intPart);
-    if (fracPart.length > 0 && Number(fracPart[0]) >= 5) {
-      units += 1n;
+  if (typeof raw === "number") {
+    if (!Number.isFinite(raw)) return null;
+    try {
+      return parseExactDecimalToMinorUnits(raw, scale);
+    } catch {
+      return null;
     }
-    return neg ? -units : units;
   }
-
-  const paddedFrac = fracPart.padEnd(scale + 1, "0");
-  const keptFrac = paddedFrac.slice(0, scale);
-  const roundDigit = Number(paddedFrac[scale] ?? "0");
-  let units = BigInt(intPart) * 10n ** BigInt(scale) + BigInt(keptFrac);
-  if (roundDigit >= 5) {
-    units += 1n;
+  const cleaned = String(raw).trim().replace(/,/g, "");
+  if (!cleaned) return null;
+  try {
+    return parseExactDecimalToMinorUnits(cleaned, scale);
+  } catch {
+    return null;
   }
-  return neg ? -units : units;
 }
 
 function minorUnitsToNumber(minor: bigint, scale: number): number {
@@ -258,6 +467,13 @@ function validateUniqueHeaders(headers: string[], filename: string): void {
     if (!h) {
       throw new DataPrepError(400, "EMPTY_HEADER_COLUMN", `Source '${filename}' has an empty header at column ${i + 1}.`);
     }
+    if (h.startsWith("__") || RESERVED_CSV_HEADERS.has(h.toLowerCase())) {
+      throw new DataPrepError(
+        400,
+        "RESERVED_HEADER_COLUMN",
+        `Source '${filename}' contains reserved or unsafe header column '${h}'.`,
+      );
+    }
     if (seen.has(h)) {
       throw new DataPrepError(400, "DUPLICATE_HEADER_COLUMN", `Source '${filename}' has duplicate header column '${h}'.`);
     }
@@ -373,75 +589,14 @@ export async function stageXlsxSource(
   filename: string,
   options: XlsxStageOptions = {},
 ): Promise<StagedDataset> {
-  const lower = filename.toLowerCase();
-  if (lower.endsWith(".xlsm") || lower.endsWith(".xlsb")) {
-    throw new DataPrepError(400, "MACRO_WORKBOOK_BLOCKED", `Macro-enabled workbook '${filename}' is blocked.`);
-  }
-  if (
-    buffer.byteLength >= 8 &&
-    buffer[0] === 0xd0 &&
-    buffer[1] === 0xcf &&
-    buffer[2] === 0x11 &&
-    buffer[3] === 0xe0 &&
-    buffer[4] === 0xa1 &&
-    buffer[5] === 0xb1 &&
-    buffer[6] === 0x1a &&
-    buffer[7] === 0xe1
-  ) {
-    throw new DataPrepError(400, "ENCRYPTED_WORKBOOK_UNSUPPORTED", "Encrypted or OLE2 binary Excel files are not supported.");
-  }
-  if (
-    buffer.byteLength < 4 ||
-    buffer[0] !== 0x50 ||
-    buffer[1] !== 0x4b ||
-    buffer[2] !== 0x03 ||
-    buffer[3] !== 0x04
-  ) {
-    throw new DataPrepError(400, "INVALID_XLSX_ZIP", "Uploaded XLSX is not a valid OOXML ZIP archive.");
-  }
-  let entryCount = 0;
-  let totalBytes = 0;
-  try {
-    unzipSync(buffer, {
-      filter: (f) => {
-        entryCount++;
-        if (entryCount > 600) {
-          throw new DataPrepError(400, "TOO_MANY_ARCHIVE_ENTRIES", "XLSX exceeds entry safety limit.");
-        }
-        if (
-          f.name.includes("..") ||
-          f.name.startsWith("/") ||
-          f.name.startsWith("\\") ||
-          /^[A-Za-z]:/.test(f.name) ||
-          f.name.includes("\0")
-        ) {
-          throw new DataPrepError(400, "ZIP_PATH_TRAVERSAL_BLOCKED", "XLSX archive contains unsafe path entries.");
-        }
-        if (/EncryptedPackage/i.test(f.name)) {
-          throw new DataPrepError(400, "ENCRYPTED_WORKBOOK_UNSUPPORTED", "Encrypted Excel files are not supported.");
-        }
-        if (/vbaProject\.bin|vbaData\.xml|\.xlm$/i.test(f.name)) {
-          throw new DataPrepError(400, "MACRO_WORKBOOK_BLOCKED", `Embedded macro part '${f.name}' blocked.`);
-        }
-        totalBytes += f.originalSize;
-        if (
-          f.originalSize > 25 * 1024 * 1024 ||
-          totalBytes > 64 * 1024 * 1024 ||
-          (f.originalSize > 1_048_576 && f.size > 0 && f.originalSize / f.size > 100)
-        ) {
-          throw new DataPrepError(400, "ZIP_BOMB_BLOCKED", "XLSX archive exceeds decompressed size or ratio bounds.");
-        }
-        return false;
-      },
-    });
-  } catch (err) {
-    if (err instanceof DataPrepError) throw err;
-    throw new DataPrepError(400, "INVALID_XLSX_ZIP", "Unable to inspect XLSX archive safely.");
+  const inspected = inspectAndExtractOoxmlZip(buffer, filename, "xlsx");
+  if (!inspected.ok) {
+    throw new DataPrepError(400, inspected.code, inspected.message);
   }
 
-  const sha256 = createHash("sha256").update(buffer).digest("hex");
+  const sha256 = inspected.originalSha256;
   const wb = new ExcelJS.Workbook();
-  await wb.xlsx.load(Buffer.from(buffer) as unknown as ExcelJS.Buffer);
+  await wb.xlsx.load(Buffer.from(inspected.repackedBuffer) as unknown as ExcelJS.Buffer);
   const ws = options.sheetName ? wb.getWorksheet(options.sheetName) : wb.worksheets[0];
   if (!ws) {
     throw new DataPrepError(
@@ -873,16 +1028,24 @@ export class DataPreparationPipeline {
         workingRows = surviving;
       } else if (step.op === "validate_schema_contract") {
         const rules = Array.isArray(step.params.rules) ? (step.params.rules as SchemaColumnRule[]) : [];
-        const compiledPatterns = new Map<string, RegExp>();
-        for (const rule of rules) {
-          if (rule.pattern) {
-            compiledPatterns.set(rule.column, new RegExp(rule.pattern));
+        const compiledRulePatterns: Array<RegExp | null> = rules.map((rule) => {
+          if (rule.preset) {
+            const presetRe = NAMED_CONTRACT_PRESETS[rule.preset];
+            if (!presetRe) {
+              throw new DataPrepError(400, "INVALID_CONTRACT_PRESET", `Unknown schema contract preset '${String(rule.preset)}'.`);
+            }
+            return presetRe;
           }
-        }
+          if (rule.pattern !== undefined) {
+            return compileSafeContractPattern(rule.pattern);
+          }
+          return null;
+        });
         const surviving: StagedRow[] = [];
         for (const row of workingRows) {
           let violation: string | null = null;
-          for (const rule of rules) {
+          for (let rIdx = 0; rIdx < rules.length; rIdx++) {
+            const rule = rules[rIdx]!;
             const val = row[rule.column];
             const isEmpty = val === null || val === undefined || val === "";
             if (rule.required && isEmpty) {
@@ -917,10 +1080,17 @@ export class DataPreparationPipeline {
               }
             }
 
-            const regex = compiledPatterns.get(rule.column);
-            if (regex && !regex.test(String(val))) {
-              violation = `Column '${rule.column}' value '${String(val)}' failed contract regex.`;
-              break;
+            const regex = compiledRulePatterns[rIdx];
+            if (regex) {
+              const strVal = String(val);
+              if (strVal.length > MAX_CONTRACT_REGEX_CELL_LENGTH) {
+                violation = `Column '${rule.column}' value exceeds safe regex evaluation length (${MAX_CONTRACT_REGEX_CELL_LENGTH}).`;
+                break;
+              }
+              if (!regex.test(strVal)) {
+                violation = `Column '${rule.column}' value '${strVal.slice(0, 64)}' failed contract pattern.`;
+                break;
+              }
             }
           }
 
@@ -945,6 +1115,7 @@ export class DataPreparationPipeline {
         const columns = Array.isArray(step.params.columns) ? (step.params.columns as string[]) : [];
         const mode = step.params.mode === "hash_token" ? "hash_token" : "redact";
         const salt = typeof step.params.salt === "string" ? step.params.salt : `${actor.tenantId}:${recipe.recipeId}`;
+        const hmacKey = mode === "hash_token" ? resolvePiiPseudonymizationKey() : "";
         workingRows = workingRows.map((row) => {
           const next = { ...row };
           for (const col of columns) {
@@ -952,7 +1123,10 @@ export class DataPreparationPipeline {
             if (raw === null || raw === undefined || raw === "") continue;
             const s = String(raw).trim();
             if (mode === "hash_token") {
-              const digest = createHash("sha256").update(`${salt}::${col}::${s}`).digest("hex").slice(0, 16);
+              const digest = createHmac("sha256", hmacKey)
+                .update(`${actor.tenantId}::${salt}::${col}::${s}`)
+                .digest("hex")
+                .slice(0, 16);
               next[col] = `pii_${digest}`;
             } else {
               next[col] = maskPiiStringValue(s);
@@ -1201,21 +1375,6 @@ function maskPiiStringValue(raw: string): string {
   return "***REDACTED***";
 }
 
-function escapeSafeCsvCell(value: unknown): string {
-  if (value === null || value === undefined) return "";
-  if (typeof value === "number") return Number.isFinite(value) ? String(value) : "";
-  if (typeof value === "boolean") return value ? "true" : "false";
-  let s = String(value);
-  // OWASP CSV formula-injection neutralization for string payloads
-  if (/^[\s\t\r]*[=+\-@]/.test(s) || s.startsWith("\t") || s.startsWith("\r")) {
-    s = `'${s}`;
-  }
-  if (/[",\n\r]/.test(s)) {
-    return `"${s.replace(/"/g, '""')}"`;
-  }
-  return s;
-}
-
 export function exportCertifiedDatasetToSafeCsv(
   artifact: CertifiedDatasetArtifact,
   columns?: string[],
@@ -1225,9 +1384,9 @@ export function exportCertifiedDatasetToSafeCsv(
       ? columns
       : Array.from(new Set(artifact.rows.flatMap((r) => Object.keys(r)))).sort();
 
-  const lines: string[] = [colNames.map(escapeSafeCsvCell).join(",")];
+  const lines: string[] = [colNames.map((c) => escapeSafeCsvCell(c).cell).join(",")];
   for (const row of artifact.rows) {
-    lines.push(colNames.map((c) => escapeSafeCsvCell(row[c])).join(","));
+    lines.push(colNames.map((c) => escapeSafeCsvCell(row[c]).cell).join(","));
   }
   const csv = `${lines.join("\r\n")}\r\n`;
   const csvSha256 = createHash("sha256").update(csv, "utf8").digest("hex");

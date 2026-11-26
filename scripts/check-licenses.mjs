@@ -39,42 +39,129 @@ const VERIFIED_LEGACY_TRANSITIVE = new Set([
   "nodejs-polars-android-arm64@0.26.2",
 ]);
 
-const DISALLOWED_PATTERNS = [
-  /\bAGPL\b/i,
-  /\bSSPL\b/i,
-  /\bBUSL\b/i,
-  /\bBSL-1\.1\b/i,
-  /\bUNLICENSED\b/i,
+const DISALLOWED_IDENTIFIERS = [
+  /^AGPL/i,
+  /^SSPL/i,
+  /^BUSL/i,
+  /^BSL-1\.1/i,
+  /^UNLICENSED$/i,
 ];
 
-function isPermissiveOrDualAllowed(licenseStr) {
-  if (!licenseStr || typeof licenseStr !== "string") return false;
-  const trimmed = licenseStr.trim();
-  if (ALLOWED_EXACT.has(trimmed)) return true;
-  if (DISALLOWED_PATTERNS.some((p) => p.test(trimmed))) return false;
-  const unwrapped = trimmed.replace(/^\(|\)$/g, "");
-  // Allow SPDX OR expressions where at least one branch is permissive (e.g., jszip: MIT OR GPL-3.0-or-later)
-  if (/\bOR\b/i.test(unwrapped)) {
-    const parts = unwrapped.split(/\s+OR\s+/i);
-    return parts.some((part) => isPermissiveOrDualAllowed(part.trim()));
+function tokenizeSpdx(expr) {
+  const tokens = [];
+  let i = 0;
+  while (i < expr.length) {
+    const ch = expr[i];
+    if (/\s/.test(ch)) {
+      i++;
+      continue;
+    }
+    if (ch === "(" || ch === ")") {
+      tokens.push({ type: ch, value: ch });
+      i++;
+      continue;
+    }
+    let j = i;
+    while (j < expr.length && !/[\s()]/.test(expr[j])) j++;
+    const word = expr.slice(i, j);
+    const upper = word.toUpperCase();
+    if (upper === "AND" || upper === "OR" || upper === "WITH") {
+      tokens.push({ type: upper, value: upper });
+    } else {
+      tokens.push({ type: "ID", value: word });
+    }
+    i = j;
   }
-  // Allow SPDX AND expressions where EVERY clause is permissive (e.g., pako: MIT AND Zlib)
-  if (/\bAND\b/i.test(unwrapped)) {
-    const parts = unwrapped.split(/\s+AND\s+/i);
-    return parts.every((part) => isPermissiveOrDualAllowed(part.trim()));
-  }
-  return false;
+  return tokens;
 }
 
-function collectDirectDependencies() {
-  const pkgPaths = [path.join(rootDir, "package.json")];
+/**
+ * Recursive-descent SPDX license expression evaluator (H31):
+ * Properly respects parentheses and SPDX operator precedence (`WITH` > `AND` > `OR`).
+ * Returns true iff the expression can be satisfied using exclusively approved permissive licenses.
+ */
+export function isPermissiveOrDualAllowed(licenseStr) {
+  if (!licenseStr || typeof licenseStr !== "string") return false;
+  const trimmed = licenseStr.trim();
+  if (!trimmed) return false;
+  if (ALLOWED_EXACT.has(trimmed)) return true;
+
+  const tokens = tokenizeSpdx(trimmed);
+  if (tokens.length === 0) return false;
+
+  let pos = 0;
+  const peek = () => tokens[pos];
+  const consume = () => tokens[pos++];
+
+  function parseOr() {
+    let left = parseAnd();
+    while (peek()?.type === "OR") {
+      consume();
+      const right = parseAnd();
+      left = left || right;
+    }
+    return left;
+  }
+
+  function parseAnd() {
+    let left = parsePrimary();
+    while (peek()?.type === "AND") {
+      consume();
+      const right = parsePrimary();
+      left = left && right;
+    }
+    return left;
+  }
+
+  function parsePrimary() {
+    const tok = peek();
+    if (!tok) throw new Error("Unexpected end of SPDX expression");
+    if (tok.type === "(") {
+      consume();
+      const inner = parseOr();
+      if (peek()?.type !== ")") {
+        throw new Error("Unbalanced parenthesis in SPDX expression");
+      }
+      consume();
+      return inner;
+    }
+    if (tok.type === "ID") {
+      consume();
+      const baseId = tok.value.replace(/\+$/, "");
+      // Consume optional `WITH <exception>` clause (exception must not be disallowed)
+      if (peek()?.type === "WITH") {
+        consume();
+        const exc = consume();
+        if (!exc || exc.type !== "ID") {
+          throw new Error("Expected exception identifier after WITH");
+        }
+      }
+      if (DISALLOWED_IDENTIFIERS.some((re) => re.test(baseId))) return false;
+      return ALLOWED_EXACT.has(baseId);
+    }
+    throw new Error(`Unexpected token '${tok.value}' in SPDX expression`);
+  }
+
+  try {
+    const result = parseOr();
+    if (pos !== tokens.length) return false;
+    return result;
+  } catch {
+    return false;
+  }
+}
+
+function listWorkspacePackageDirs(baseDir) {
+  const dirs = [baseDir];
   for (const group of ["packages", "platform", "engines", "modules", "apps"]) {
-    const groupDir = path.join(rootDir, group);
+    const groupDir = path.join(baseDir, group);
     try {
       for (const entry of readdirSync(groupDir)) {
-        const candidate = path.join(groupDir, entry, "package.json");
+        const candidateDir = path.join(groupDir, entry);
         try {
-          if (statSync(candidate).isFile()) pkgPaths.push(candidate);
+          if (statSync(path.join(candidateDir, "package.json")).isFile()) {
+            dirs.push(candidateDir);
+          }
         } catch {
           // ignore
         }
@@ -83,9 +170,13 @@ function collectDirectDependencies() {
       // ignore
     }
   }
+  return dirs;
+}
+
+function collectDirectDependencies(workspaceDirs) {
   const direct = new Set();
-  for (const pkgPath of pkgPaths) {
-    const pkg = JSON.parse(readFileSync(pkgPath, "utf8"));
+  for (const dir of workspaceDirs) {
+    const pkg = JSON.parse(readFileSync(path.join(dir, "package.json"), "utf8"));
     for (const dep of Object.keys(pkg.dependencies ?? {})) {
       if (!dep.startsWith("@ai-office-suite/")) direct.add(dep);
     }
@@ -142,51 +233,58 @@ function walkNodeModules(dir, results = []) {
   return results;
 }
 
-const directDeps = collectDirectDependencies();
-const allPackages = [
-  ...walkNodeModules(path.join(rootDir, "node_modules")),
-  ...walkNodeModules(path.join(rootDir, "apps", "web", "node_modules")),
-];
-
-const seen = new Map();
-for (const pkg of allPackages) {
-  const key = `${pkg.name}@${pkg.version}`;
-  if (!seen.has(key)) seen.set(key, pkg);
-}
-
-const directViolations = [];
-const transitiveWarnings = [];
-const transitiveViolations = [];
-
-for (const pkg of seen.values()) {
-  const isDirect = directDeps.has(pkg.name);
-  const pkgKey = `${pkg.name}@${pkg.version}`;
-  const ok = isPermissiveOrDualAllowed(pkg.license) || (!isDirect && VERIFIED_LEGACY_TRANSITIVE.has(pkgKey));
-  if (!ok) {
-    if (isDirect) directViolations.push(pkg);
-    else transitiveViolations.push(pkg);
-  } else if (isDirect && /\bGPL\b/i.test(pkg.license)) {
-    directViolations.push(pkg);
-  } else if (!isDirect && /\bGPL\b/i.test(pkg.license)) {
-    transitiveWarnings.push(pkg);
+const isMain = process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+if (isMain) {
+  const workspaceDirs = listWorkspacePackageDirs(rootDir);
+  const directDeps = collectDirectDependencies(workspaceDirs);
+  const allPackages = [];
+  // Walk root AND every workspace's node_modules (H31)
+  for (const wsDir of workspaceDirs) {
+    walkNodeModules(path.join(wsDir, "node_modules"), allPackages);
   }
-}
 
-console.log(`License audit scanned ${seen.size} installed third-party package versions (${directDeps.size} direct dependencies).`);
-
-if (transitiveWarnings.length > 0) {
-  console.log("Transitive dual-licensed packages (permissive branch selected):");
-  for (const w of transitiveWarnings) {
-    console.log(`  - ${w.name}@${w.version}: ${w.license}`);
+  const seen = new Map();
+  for (const pkg of allPackages) {
+    const key = `${pkg.name}@${pkg.version}`;
+    if (!seen.has(key)) seen.set(key, pkg);
   }
-}
 
-if (directViolations.length > 0 || transitiveViolations.length > 0) {
-  console.error("DISALLOWED LICENSES FOUND:");
-  for (const v of [...directViolations, ...transitiveViolations]) {
-    console.error(`  - ${v.name}@${v.version}: ${v.license}`);
+  const directViolations = [];
+  const transitiveWarnings = [];
+  const transitiveViolations = [];
+
+  for (const pkg of seen.values()) {
+    const isDirect = directDeps.has(pkg.name);
+    const pkgKey = `${pkg.name}@${pkg.version}`;
+    const ok = isPermissiveOrDualAllowed(pkg.license) || (!isDirect && VERIFIED_LEGACY_TRANSITIVE.has(pkgKey));
+    if (!ok) {
+      if (isDirect) directViolations.push(pkg);
+      else transitiveViolations.push(pkg);
+    } else if (isDirect && /\bGPL\b/i.test(pkg.license)) {
+      directViolations.push(pkg);
+    } else if (!isDirect && /\bGPL\b/i.test(pkg.license)) {
+      transitiveWarnings.push(pkg);
+    }
   }
-  process.exit(1);
-}
 
-console.log("PASS: Zero disallowed (AGPL/GPL-only/commercial-restricted) licenses detected.");
+  console.log(
+    `License audit scanned ${seen.size} installed third-party package versions across ${workspaceDirs.length} workspaces (${directDeps.size} direct dependencies).`,
+  );
+
+  if (transitiveWarnings.length > 0) {
+    console.log("Transitive dual-licensed packages (permissive branch selected):");
+    for (const w of transitiveWarnings) {
+      console.log(`  - ${w.name}@${w.version}: ${w.license}`);
+    }
+  }
+
+  if (directViolations.length > 0 || transitiveViolations.length > 0) {
+    console.error("DISALLOWED LICENSES FOUND:");
+    for (const v of [...directViolations, ...transitiveViolations]) {
+      console.error(`  - ${v.name}@${v.version}: ${v.license}`);
+    }
+    process.exit(1);
+  }
+
+  console.log("PASS: Zero disallowed (AGPL/GPL-only/commercial-restricted) licenses detected.");
+}

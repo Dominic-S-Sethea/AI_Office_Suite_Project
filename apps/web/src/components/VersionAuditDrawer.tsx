@@ -1,5 +1,6 @@
-import { useEffect, useState } from "react";
+import { memo, useEffect, useRef, useState } from "react";
 import type { AuditEvent, DocumentVersion } from "@ai-office-suite/shared-contracts";
+import { trapDialogTabKey } from "../lib/apiClient.ts";
 
 export interface RevisionDiffPayload {
   documentId: string;
@@ -14,12 +15,13 @@ export interface RevisionDiffPayload {
     added: number;
     removed: number;
     modified: number;
+    moved?: number;
     unchanged: number;
   };
   blocks: Array<{
     blockId: string;
     blockType: string;
-    changeType: "added" | "removed" | "modified";
+    changeType: "added" | "removed" | "modified" | "moved";
     beforeText?: string;
     afterText?: string;
   }>;
@@ -37,7 +39,7 @@ interface VersionAuditDrawerProps {
   onClose: () => void;
 }
 
-export function VersionAuditDrawer({
+function VersionAuditDrawerInner({
   versions,
   auditEvents,
   currentRevision,
@@ -50,23 +52,42 @@ export function VersionAuditDrawer({
 }: VersionAuditDrawerProps) {
   const [diffResult, setDiffResult] = useState<RevisionDiffPayload | null>(null);
   const [diffLoadingRev, setDiffLoadingRev] = useState<number | null>(null);
+  const drawerRef = useRef<HTMLDivElement | null>(null);
+  const closeBtnRef = useRef<HTMLButtonElement | null>(null);
+  const compareSeqRef = useRef(0);
 
   useEffect(() => {
+    const previouslyFocused = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    closeBtnRef.current?.focus();
+
     const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onClose();
+      if (e.key === "Escape") {
+        e.preventDefault();
+        onClose();
+        return;
+      }
+      trapDialogTabKey(drawerRef.current, e);
     };
     window.addEventListener("keydown", onKeyDown);
-    return () => window.removeEventListener("keydown", onKeyDown);
+    return () => {
+      window.removeEventListener("keydown", onKeyDown);
+      previouslyFocused?.focus();
+    };
   }, [onClose]);
 
   async function handleCompare(fromRev: number) {
     if (!onCompareRevision || currentRevision === undefined) return;
+    const seq = ++compareSeqRef.current;
     setDiffLoadingRev(fromRev);
     try {
       const diff = await onCompareRevision(fromRev, currentRevision);
-      setDiffResult(diff);
+      if (seq === compareSeqRef.current) {
+        setDiffResult(diff);
+      }
     } finally {
-      setDiffLoadingRev(null);
+      if (seq === compareSeqRef.current) {
+        setDiffLoadingRev(null);
+      }
     }
   }
 
@@ -75,22 +96,24 @@ export function VersionAuditDrawer({
       className="drawer-backdrop"
       role="dialog"
       aria-modal="true"
-      aria-label="Version and Audit History"
+      aria-labelledby="drawer-history-title"
       onClick={(e) => {
         if (e.target === e.currentTarget) onClose();
       }}
     >
-      <div className="drawer-panel">
-        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-          <h3 style={{ margin: 0 }}>Version &amp; Audit History</h3>
-          <button type="button" className="btn" onClick={onClose}>
+      <div ref={drawerRef} className="drawer-panel">
+        <div className="panel-header-row">
+          <h2 id="drawer-history-title" className="modal-title">
+            Version &amp; Audit History
+          </h2>
+          <button ref={closeBtnRef} type="button" className="btn" onClick={onClose}>
             Close
           </button>
         </div>
 
         {diffResult && (
           <section className="diff-card" aria-label="Revision Diff Summary">
-            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+            <div className="panel-header-row">
               <strong>
                 Diff: Rev {diffResult.fromRevision} → Rev {diffResult.toRevision}
               </strong>
@@ -98,26 +121,30 @@ export function VersionAuditDrawer({
                 Clear Diff
               </button>
             </div>
-            <div style={{ fontSize: 11, color: "#475569" }}>
+            <div className="meta-caption">
               +{diffResult.summary.added} added · -{diffResult.summary.removed} removed · ~{diffResult.summary.modified}{" "}
-              modified · {diffResult.summary.unchanged} unchanged
+              modified
+              {typeof diffResult.summary.moved === "number" && diffResult.summary.moved > 0
+                ? ` · ↕${diffResult.summary.moved} moved`
+                : ""}{" "}
+              · {diffResult.summary.unchanged} unchanged
               {diffResult.metadataChanged.titleChanged ? " · Title changed" : ""}
               {diffResult.metadataChanged.layoutChanged ? " · Layout changed" : ""}
             </div>
             {diffResult.blocks.length === 0 ? (
-              <div style={{ fontSize: 12, color: "#64748b" }}>No block content changes between these revisions.</div>
+              <div className="muted-text">No block content changes between these revisions.</div>
             ) : (
-              <div style={{ display: "flex", flexDirection: "column", gap: 6, maxHeight: 220, overflowY: "auto" }}>
+              <div className="diff-list">
                 {diffResult.blocks.map((b) => (
                   <div key={`${b.blockId}-${b.changeType}`} className={`diff-row diff-${b.changeType}`}>
-                    <div style={{ fontWeight: 600, fontSize: 11 }}>
+                    <div className="diff-row-header">
                       [{b.changeType.toUpperCase()}] {b.blockType} ({b.blockId})
                     </div>
                     {b.beforeText !== undefined && (
-                      <div style={{ color: "#991b1b" }}>- {b.beforeText || "(empty)"}</div>
+                      <div className="diff-before">- {b.beforeText || "(empty)"}</div>
                     )}
                     {b.afterText !== undefined && (
-                      <div style={{ color: "#166534" }}>+ {b.afterText || "(empty)"}</div>
+                      <div className="diff-after">+ {b.afterText || "(empty)"}</div>
                     )}
                   </div>
                 ))}
@@ -133,27 +160,27 @@ export function VersionAuditDrawer({
         ) : (
           <>
             <section>
-              <h4 style={{ margin: "0 0 8px 0" }}>Immutable Versions ({versions.length})</h4>
+              <h3 className="drawer-section-heading">Immutable Versions ({versions.length})</h3>
               {versions.length === 0 ? (
-                <div className="preview-card" style={{ color: "#64748b" }}>
+                <div className="preview-card muted-text">
                   No saved revisions recorded for this document yet.
                 </div>
               ) : (
-                <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                <div className="stack-sm">
                   {[...versions].reverse().map((v) => {
                     const isCurrent = currentRevision !== undefined && v.revision === currentRevision;
                     const isRestoringThis = restoringRevision === v.revision;
                     const isDiffLoading = diffLoadingRev === v.revision;
                     return (
                       <div key={v.versionId} className="preview-card">
-                        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 6 }}>
+                        <div className="panel-header-row">
                           <strong>
                             Revision {v.revision} ({v.source})
                           </strong>
                           {isCurrent ? (
                             <span className="badge badge-ok">Current</span>
                           ) : (
-                            <div style={{ display: "flex", gap: 4 }}>
+                            <div className="row-actions-tight">
                               {onCompareRevision && currentRevision !== undefined && (
                                 <button
                                   type="button"
@@ -176,7 +203,7 @@ export function VersionAuditDrawer({
                           )}
                         </div>
                         <div>{v.summary}</div>
-                        <div style={{ fontSize: 11, color: "#64748b" }}>
+                        <div className="meta-caption">
                           Actor: {v.actorId} · {new Date(v.createdAt).toLocaleString()}
                         </div>
                       </div>
@@ -187,13 +214,13 @@ export function VersionAuditDrawer({
             </section>
 
             <section>
-              <h4 style={{ margin: "0 0 8px 0" }}>Append-Only Audit Log ({auditEvents.length})</h4>
+              <h3 className="drawer-section-heading">Append-Only Audit Log ({auditEvents.length})</h3>
               {auditEvents.length === 0 ? (
-                <div className="preview-card" style={{ color: "#64748b" }}>
+                <div className="preview-card muted-text">
                   No audit events recorded for this document yet.
                 </div>
               ) : (
-                <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                <div className="stack-sm">
                   {auditEvents.map((ev) => {
                     const badgeClass =
                       ev.outcome === "success"
@@ -203,12 +230,12 @@ export function VersionAuditDrawer({
                           : "badge badge-warn";
                     return (
                       <div key={ev.auditId} className="preview-card">
-                        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8 }}>
+                        <div className="panel-header-row">
                           <strong>{ev.action}</strong>
                           <span className={badgeClass}>{ev.outcome}</span>
                         </div>
                         <div>{ev.summary}</div>
-                        <div style={{ fontSize: 11, color: "#64748b" }}>
+                        <div className="meta-caption">
                           {ev.actorId} ({ev.actorRole}) · {ev.source} · {new Date(ev.createdAt).toLocaleTimeString()}
                         </div>
                       </div>
@@ -223,3 +250,6 @@ export function VersionAuditDrawer({
     </div>
   );
 }
+
+export const VersionAuditDrawer = memo(VersionAuditDrawerInner);
+export default VersionAuditDrawer;

@@ -1,5 +1,8 @@
 import type { PgDatabaseAdapter, PgQueryExecutor } from "./adapter.ts";
 
+export const CORE_SCHEMA_VERSION = "2026.11.v2-core";
+const CORE_SCHEMA_LOCK_KEY = 84102001;
+
 export const D2_POSTGRESQL_SCHEMA_SQL = `
 DO $$
 BEGIN
@@ -8,6 +11,11 @@ BEGIN
   END IF;
 END
 $$;
+
+CREATE TABLE IF NOT EXISTS schema_migrations (
+  version     TEXT PRIMARY KEY,
+  applied_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 
 CREATE TABLE IF NOT EXISTS organizations (
   tenant_id   UUID PRIMARY KEY,
@@ -25,21 +33,22 @@ CREATE TABLE IF NOT EXISTS users (
   created_at     TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-CREATE TABLE IF NOT EXISTS memberships (
-  tenant_id   UUID NOT NULL REFERENCES organizations(tenant_id),
-  workspace_id UUID NOT NULL,
-  user_id     UUID NOT NULL REFERENCES users(user_id),
-  role        TEXT NOT NULL CHECK (role IN ('owner', 'administrator', 'editor', 'reviewer', 'viewer')),
-  created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
-  PRIMARY KEY (tenant_id, workspace_id, user_id)
-);
-
 CREATE TABLE IF NOT EXISTS workspaces (
   tenant_id     UUID NOT NULL REFERENCES organizations(tenant_id),
   workspace_id  UUID NOT NULL,
   name          TEXT NOT NULL,
   created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
   PRIMARY KEY (tenant_id, workspace_id)
+);
+
+CREATE TABLE IF NOT EXISTS memberships (
+  tenant_id    UUID NOT NULL REFERENCES organizations(tenant_id),
+  workspace_id UUID NOT NULL,
+  user_id      UUID NOT NULL REFERENCES users(user_id),
+  role         TEXT NOT NULL CHECK (role IN ('owner', 'administrator', 'editor', 'reviewer', 'viewer')),
+  created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (tenant_id, workspace_id, user_id),
+  FOREIGN KEY (tenant_id, workspace_id) REFERENCES workspaces(tenant_id, workspace_id)
 );
 
 CREATE TABLE IF NOT EXISTS documents (
@@ -66,12 +75,17 @@ CREATE TABLE IF NOT EXISTS document_versions (
   content_sha256          CHAR(64) NOT NULL,
   source_import_sha256    CHAR(64) NULL,
   restored_from_revision  INTEGER NULL,
+  source                  TEXT NOT NULL DEFAULT 'manual',
+  summary                 TEXT NOT NULL DEFAULT '',
   snapshot_json           JSONB NOT NULL,
   created_by              UUID NOT NULL REFERENCES users(user_id),
   created_at              TIMESTAMPTZ NOT NULL DEFAULT now(),
   PRIMARY KEY (tenant_id, document_id, revision),
   FOREIGN KEY (tenant_id, document_id) REFERENCES documents(tenant_id, document_id)
 );
+
+ALTER TABLE document_versions ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'manual';
+ALTER TABLE document_versions ADD COLUMN IF NOT EXISTS summary TEXT NOT NULL DEFAULT '';
 
 CREATE TABLE IF NOT EXISTS idempotency_keys (
   tenant_id          UUID NOT NULL,
@@ -98,8 +112,11 @@ CREATE TABLE IF NOT EXISTS audit_logs (
   revision_before  INTEGER NULL,
   revision_after   INTEGER NULL,
   summary          TEXT NOT NULL,
+  metadata         JSONB NULL,
   created_at       TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS metadata JSONB NULL;
 
 CREATE TABLE IF NOT EXISTS ai_applied_operations (
   tenant_id        UUID NOT NULL,
@@ -114,18 +131,29 @@ CREATE TABLE IF NOT EXISTS ai_applied_operations (
 );
 
 CREATE TABLE IF NOT EXISTS migration_batches (
-  batch_id           UUID PRIMARY KEY,
-  target_tenant_id   UUID NOT NULL REFERENCES organizations(tenant_id),
+  batch_id            UUID PRIMARY KEY,
+  target_tenant_id    UUID NOT NULL REFERENCES organizations(tenant_id),
   target_workspace_id UUID NOT NULL,
-  source_dir         TEXT NOT NULL,
-  manifest_json      JSONB NOT NULL,
-  status             TEXT NOT NULL CHECK (status IN ('applied', 'rolled_back')),
-  created_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
-  rolled_back_at     TIMESTAMPTZ NULL
+  source_dir          TEXT NOT NULL,
+  manifest_json       JSONB NOT NULL,
+  status              TEXT NOT NULL CHECK (status IN ('applied', 'rolled_back')),
+  created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+  rolled_back_at      TIMESTAMPTZ NULL,
+  FOREIGN KEY (target_tenant_id, target_workspace_id) REFERENCES workspaces(tenant_id, workspace_id)
 );
+
+-- Secondary & case-insensitive unique indexes (H6)
+CREATE UNIQUE INDEX IF NOT EXISTS users_email_lower_uidx ON users (lower(email));
+CREATE INDEX IF NOT EXISTS memberships_user_idx ON memberships (user_id, tenant_id, workspace_id);
+CREATE INDEX IF NOT EXISTS documents_tenant_ws_updated_idx ON documents (tenant_id, workspace_id, updated_at DESC);
+CREATE INDEX IF NOT EXISTS documents_tenant_ws_lang_idx ON documents (tenant_id, workspace_id, language);
+CREATE INDEX IF NOT EXISTS audit_logs_tenant_ws_target_created_idx ON audit_logs (tenant_id, workspace_id, target_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS ai_applied_ops_doc_idx ON ai_applied_operations (tenant_id, document_id);
+CREATE INDEX IF NOT EXISTS idempotency_keys_expires_idx ON idempotency_keys (expires_at);
 
 GRANT USAGE ON SCHEMA public TO app_runtime;
 GRANT SELECT, INSERT, UPDATE ON organizations, users, memberships, workspaces, documents, idempotency_keys TO app_runtime;
+GRANT DELETE ON idempotency_keys TO app_runtime;
 GRANT SELECT, INSERT ON document_versions, audit_logs, ai_applied_operations TO app_runtime;
 REVOKE UPDATE, DELETE ON audit_logs FROM app_runtime;
 REVOKE UPDATE, DELETE ON document_versions FROM app_runtime;
@@ -135,15 +163,39 @@ ALTER TABLE workspaces ENABLE ROW LEVEL SECURITY;
 ALTER TABLE workspaces FORCE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS tenant_isolation_workspaces ON workspaces;
 CREATE POLICY tenant_isolation_workspaces ON workspaces
-  USING (tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')::uuid)
-  WITH CHECK (tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')::uuid);
+  USING (
+    tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')::uuid
+    AND (
+      NULLIF(current_setting('app.current_workspace_id', true), '') IS NULL
+      OR workspace_id = NULLIF(current_setting('app.current_workspace_id', true), '')::uuid
+    )
+  )
+  WITH CHECK (
+    tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')::uuid
+    AND (
+      NULLIF(current_setting('app.current_workspace_id', true), '') IS NULL
+      OR workspace_id = NULLIF(current_setting('app.current_workspace_id', true), '')::uuid
+    )
+  );
 
 ALTER TABLE documents ENABLE ROW LEVEL SECURITY;
 ALTER TABLE documents FORCE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS tenant_isolation_documents ON documents;
 CREATE POLICY tenant_isolation_documents ON documents
-  USING (tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')::uuid)
-  WITH CHECK (tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')::uuid);
+  USING (
+    tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')::uuid
+    AND (
+      NULLIF(current_setting('app.current_workspace_id', true), '') IS NULL
+      OR workspace_id = NULLIF(current_setting('app.current_workspace_id', true), '')::uuid
+    )
+  )
+  WITH CHECK (
+    tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')::uuid
+    AND (
+      NULLIF(current_setting('app.current_workspace_id', true), '') IS NULL
+      OR workspace_id = NULLIF(current_setting('app.current_workspace_id', true), '')::uuid
+    )
+  );
 
 ALTER TABLE document_versions ENABLE ROW LEVEL SECURITY;
 ALTER TABLE document_versions FORCE ROW LEVEL SECURITY;
@@ -163,19 +215,125 @@ ALTER TABLE audit_logs ENABLE ROW LEVEL SECURITY;
 ALTER TABLE audit_logs FORCE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS tenant_isolation_audit_logs ON audit_logs;
 CREATE POLICY tenant_isolation_audit_logs ON audit_logs
-  USING (tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')::uuid)
-  WITH CHECK (tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')::uuid);
+  USING (
+    tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')::uuid
+    AND (
+      NULLIF(current_setting('app.current_workspace_id', true), '') IS NULL
+      OR workspace_id = NULLIF(current_setting('app.current_workspace_id', true), '')::uuid
+    )
+  )
+  WITH CHECK (
+    tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')::uuid
+    AND (
+      NULLIF(current_setting('app.current_workspace_id', true), '') IS NULL
+      OR workspace_id = NULLIF(current_setting('app.current_workspace_id', true), '')::uuid
+    )
+  );
 
 ALTER TABLE ai_applied_operations ENABLE ROW LEVEL SECURITY;
 ALTER TABLE ai_applied_operations FORCE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS tenant_isolation_ai_applied_operations ON ai_applied_operations;
 CREATE POLICY tenant_isolation_ai_applied_operations ON ai_applied_operations
-  USING (tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')::uuid)
-  WITH CHECK (tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')::uuid);
+  USING (
+    tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')::uuid
+    AND (
+      NULLIF(current_setting('app.current_workspace_id', true), '') IS NULL
+      OR workspace_id = NULLIF(current_setting('app.current_workspace_id', true), '')::uuid
+    )
+  )
+  WITH CHECK (
+    tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')::uuid
+    AND (
+      NULLIF(current_setting('app.current_workspace_id', true), '') IS NULL
+      OR workspace_id = NULLIF(current_setting('app.current_workspace_id', true), '')::uuid
+    )
+  );
 `;
 
-export async function initializePostgreSqlSchema(db: PgDatabaseAdapter): Promise<void> {
-  await db.exec(D2_POSTGRESQL_SCHEMA_SQL);
+export async function initializePostgreSqlSchema(
+  db: PgDatabaseAdapter,
+  options: { force?: boolean } = {},
+): Promise<{ applied: boolean; version: string }> {
+  return db.withTransaction(async (tx) => {
+    await tx.query("SELECT pg_advisory_xact_lock($1)", [CORE_SCHEMA_LOCK_KEY]);
+    await tx.exec(`
+      CREATE TABLE IF NOT EXISTS schema_migrations (
+        version     TEXT PRIMARY KEY,
+        applied_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+      );
+    `);
+    if (!options.force) {
+      const existing = await tx.query<{ version: string; core_present: boolean }>(
+        "SELECT version, (to_regclass('public.organizations') IS NOT NULL) AS core_present FROM schema_migrations WHERE version = $1",
+        [CORE_SCHEMA_VERSION],
+      );
+      if (existing.rows.length > 0 && existing.rows[0]?.core_present) {
+        return { applied: false, version: CORE_SCHEMA_VERSION };
+      }
+    }
+    await tx.exec(D2_POSTGRESQL_SCHEMA_SQL);
+    await tx.query(
+      "INSERT INTO schema_migrations (version) VALUES ($1) ON CONFLICT (version) DO NOTHING",
+      [CORE_SCHEMA_VERSION],
+    );
+    return { applied: true, version: CORE_SCHEMA_VERSION };
+  });
+}
+
+/**
+ * Removes expired rows from `idempotency_keys` (M7). Intended for periodic maintenance jobs.
+ */
+export async function purgeExpiredIdempotencyKeys(db: PgDatabaseAdapter): Promise<number> {
+  const res = await db.query("DELETE FROM idempotency_keys WHERE expires_at < now()");
+  return res.rowCount;
+}
+
+const SAFE_PG_ROLE_IDENT = /^[a-z_][a-z0-9_]{1,62}$/;
+
+/**
+ * Provisions or updates a dedicated non-superuser, NOBYPASSRLS login role granted `app_runtime`.
+ * Intended to be run by the out-of-band migration/admin principal so runtime API containers
+ * never connect to PostgreSQL as a superuser or table owner.
+ */
+export async function provisionAppRuntimeLoginRole(
+  db: PgDatabaseAdapter,
+  params: { roleName: string; password: string },
+): Promise<void> {
+  const roleName = params.roleName.trim();
+  if (!SAFE_PG_ROLE_IDENT.test(roleName) || roleName === "postgres" || roleName === "app_runtime") {
+    throw new Error(`Invalid least-privilege login role name '${roleName}'.`);
+  }
+  if (!params.password || params.password.length < 12) {
+    throw new Error("App runtime login role password must be at least 12 characters.");
+  }
+
+  await db.withTransaction(async (tx) => {
+    await tx.query("SELECT set_config('app.provision_role', $1, true)", [roleName]);
+    await tx.query("SELECT set_config('app.provision_pw', $1, true)", [params.password]);
+    await tx.exec(`
+      DO $$
+      DECLARE
+        r_name TEXT := current_setting('app.provision_role');
+        r_pw   TEXT := current_setting('app.provision_pw');
+      BEGIN
+        IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = r_name) THEN
+          EXECUTE format(
+            'CREATE ROLE %I LOGIN INHERIT NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE PASSWORD %L',
+            r_name,
+            r_pw
+          );
+        ELSE
+          EXECUTE format(
+            'ALTER ROLE %I LOGIN INHERIT NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE PASSWORD %L',
+            r_name,
+            r_pw
+          );
+        END IF;
+        EXECUTE format('GRANT app_runtime TO %I', r_name);
+      END
+      $$;
+    `);
+  });
 }
 
 export interface DatabaseReadinessReport {
@@ -184,6 +342,7 @@ export interface DatabaseReadinessReport {
   checks: {
     connectivity: boolean;
     appRuntimeLeastPrivilege: boolean;
+    currentConnectionLeastPrivilege: boolean;
     coreForceRlsEnabled: boolean;
     missingForceRlsTables: string[];
   };
@@ -198,9 +357,13 @@ const CORE_RLS_TABLES = [
   "ai_applied_operations",
 ] as const;
 
-export async function verifyDatabaseRlsReadiness(db: PgDatabaseAdapter): Promise<DatabaseReadinessReport> {
+export async function verifyDatabaseRlsReadiness(
+  db: PgDatabaseAdapter,
+  options: { requireNonSuperuserConnection?: boolean } = {},
+): Promise<DatabaseReadinessReport> {
   let connectivity = false;
   let appRuntimeLeastPrivilege = false;
+  let currentConnectionLeastPrivilege = false;
   let coreForceRlsEnabled = false;
   let missingForceRlsTables: string[] = [...CORE_RLS_TABLES];
 
@@ -208,11 +371,17 @@ export async function verifyDatabaseRlsReadiness(db: PgDatabaseAdapter): Promise
     const ping = await db.query<{ ok: number }>("SELECT 1 AS ok");
     connectivity = ping.rows[0]?.ok === 1;
 
-    const roleRes = await db.query<{ rolsuper: boolean; rolbypassrls: boolean }>(
-      "SELECT rolsuper, rolbypassrls FROM pg_roles WHERE rolname = 'app_runtime'",
+    const roleRes = await db.query<{ rolname: string; rolsuper: boolean; rolbypassrls: boolean; is_current: boolean }>(
+      `SELECT rolname, rolsuper, rolbypassrls, (rolname = current_user) AS is_current
+       FROM pg_roles
+       WHERE rolname = 'app_runtime' OR rolname = current_user`,
     );
-    const roleRow = roleRes.rows[0];
-    appRuntimeLeastPrivilege = Boolean(roleRow && roleRow.rolsuper === false && roleRow.rolbypassrls === false);
+    const appRoleRow = roleRes.rows.find((r) => r.rolname === "app_runtime");
+    const curRoleRow = roleRes.rows.find((r) => r.is_current);
+    appRuntimeLeastPrivilege = Boolean(appRoleRow && appRoleRow.rolsuper === false && appRoleRow.rolbypassrls === false);
+    currentConnectionLeastPrivilege = Boolean(
+      curRoleRow && curRoleRow.rolsuper === false && curRoleRow.rolbypassrls === false,
+    );
 
     const rlsRes = await db.query<{ relname: string; relrowsecurity: boolean; relforcerowsecurity: boolean }>(
       `SELECT c.relname, c.relrowsecurity, c.relforcerowsecurity
@@ -232,12 +401,15 @@ export async function verifyDatabaseRlsReadiness(db: PgDatabaseAdapter): Promise
     connectivity = false;
   }
 
+  const connectionPrivilegeOk = options.requireNonSuperuserConnection ? currentConnectionLeastPrivilege : true;
+
   return {
-    ready: connectivity && appRuntimeLeastPrivilege && coreForceRlsEnabled,
+    ready: connectivity && appRuntimeLeastPrivilege && connectionPrivilegeOk && coreForceRlsEnabled,
     engine: db.engine,
     checks: {
       connectivity,
       appRuntimeLeastPrivilege,
+      currentConnectionLeastPrivilege,
       coreForceRlsEnabled,
       missingForceRlsTables,
     },
@@ -248,15 +420,20 @@ const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{
 
 /**
  * Executes queries inside an explicit transaction using the least-privilege non-superuser
- * role `app_runtime` and setting `app.current_tenant_id` locally for fail-closed RLS.
+ * role `app_runtime` and setting `app.current_tenant_id` (and optionally `app.current_workspace_id`)
+ * locally for fail-closed tenant + workspace RLS.
  */
 export async function withTenantTransaction<T>(
   db: PgDatabaseAdapter,
   tenantId: string | null,
   fn: (tx: PgQueryExecutor) => Promise<T>,
+  workspaceId?: string | null,
 ): Promise<T> {
   if (tenantId !== null && !UUID_PATTERN.test(tenantId)) {
     throw new Error(`Invalid tenant UUID '${tenantId}' for PostgreSQL RLS context.`);
+  }
+  if (workspaceId !== undefined && workspaceId !== null && !UUID_PATTERN.test(workspaceId)) {
+    throw new Error(`Invalid workspace UUID '${workspaceId}' for PostgreSQL RLS context.`);
   }
   return db.withTransaction(async (tx) => {
     await tx.exec("SET LOCAL ROLE app_runtime");
@@ -264,6 +441,11 @@ export async function withTenantTransaction<T>(
       await tx.query("SELECT set_config('app.current_tenant_id', $1, true)", [tenantId]);
     } else {
       await tx.query("SELECT set_config('app.current_tenant_id', '', true)");
+    }
+    if (workspaceId) {
+      await tx.query("SELECT set_config('app.current_workspace_id', $1, true)", [workspaceId]);
+    } else {
+      await tx.query("SELECT set_config('app.current_workspace_id', '', true)");
     }
     return fn(tx);
   });

@@ -4,7 +4,8 @@
   "private": true,
   "type": "module",
   "exports": {
-    ".": "./src/index.ts"
+    ".": "./src/index.ts",
+    "./pg-persistence": "./src/pgPersistence.ts"
   },
   "dependencies": {
     "@ai-office-suite/analytics-engine": "*",
@@ -12,7 +13,6 @@
     "@ai-office-suite/authorization": "*",
     "@ai-office-suite/calculation-engine": "*",
     "@ai-office-suite/database": "*",
-    "@ai-office-suite/document-engine": "*",
     "@ai-office-suite/documents-module": "*",
     "@ai-office-suite/intelligence-engine": "*",
     "@ai-office-suite/presentation-engine": "*",

@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "tsx watch src/server.ts",
     "build": "tsc -p tsconfig.build.json",
-    "start": "node dist/apps/api/src/server.js"
+    "start": "node src/server.ts"
   },
   "dependencies": {
     "@ai-office-suite/shared-contracts": "*",
@@ -24,6 +24,7 @@
     "@ai-office-suite/ai-module": "*",
     "cors": "^2.8.5",
     "express": "^4.21.2",
-    "helmet": "^8.1.0"
+    "helmet": "^8.1.0",
+    "zod": "^4.0.0"
   }
 }

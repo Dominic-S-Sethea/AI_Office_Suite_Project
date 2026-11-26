@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { NextFunction, Request, Response } from "express";
+import type { ActorContext } from "@ai-office-suite/shared-contracts";
 import { redactAuditValue } from "@ai-office-suite/audit";
 
 const SAFE_REQUEST_ID_PATTERN = /^[A-Za-z0-9._-]{4,128}$/;
@@ -23,13 +24,28 @@ export interface RequestMetricsSnapshot {
   memoryRssMb: number;
 }
 
+export interface DbPoolMetricInput {
+  totalCount: number;
+  idleCount: number;
+  waitingCount: number;
+}
+
 export interface ApiObservabilityHandle {
   middleware: (req: Request, res: Response, next: NextFunction) => void;
   getMetrics: () => RequestMetricsSnapshot;
+  formatPrometheusMetrics: (dbPool?: DbPoolMetricInput) => string;
   logEvent: (level: "info" | "warn" | "error", event: string, fields?: Record<string, unknown>) => void;
 }
 
-export function createApiObservability(options: { enableStructuredLogs?: boolean; sink?: (line: string) => void } = {}): ApiObservabilityHandle {
+type ObservedRequest = Request & {
+  requestId?: string;
+  actor?: ActorContext;
+  authSource?: "bearer" | "cookie";
+};
+
+export function createApiObservability(
+  options: { enableStructuredLogs?: boolean; sink?: (line: string) => void } = {},
+): ApiObservabilityHandle {
   const startedAtMs = Date.now();
   const enableLogs = options.enableStructuredLogs ?? process.env.NODE_ENV !== "test";
   const sink = options.sink ?? ((line: string) => process.stdout.write(`${line}\n`));
@@ -56,7 +72,8 @@ export function createApiObservability(options: { enableStructuredLogs?: boolean
     const inboundId = typeof req.headers["x-request-id"] === "string" ? req.headers["x-request-id"].trim() : "";
     const requestId = SAFE_REQUEST_ID_PATTERN.test(inboundId) ? inboundId : randomUUID();
     res.setHeader("X-Request-Id", requestId);
-    (req as Request & { requestId?: string }).requestId = requestId;
+    const observedReq = req as ObservedRequest;
+    observedReq.requestId = requestId;
 
     const startNs = process.hrtime.bigint();
     res.on("finish", () => {
@@ -73,12 +90,25 @@ export function createApiObservability(options: { enableStructuredLogs?: boolean
       }
       latencySamples.push(Math.round(durationMs * 100) / 100);
 
+      const routeTemplate =
+        req.route && typeof (req.route as { path?: unknown }).path === "string"
+          ? `${req.baseUrl}${(req.route as { path: string }).path}`
+          : req.path;
+
       logEvent(res.statusCode >= 500 ? "error" : res.statusCode >= 400 ? "warn" : "info", "http.request", {
         requestId,
         method: req.method,
+        route: routeTemplate,
         path: req.path,
         statusCode: res.statusCode,
         durationMs: Math.round(durationMs * 100) / 100,
+        ...(observedReq.actor
+          ? {
+              tenantId: observedReq.actor.tenantId,
+              role: observedReq.actor.role,
+              authSource: observedReq.authSource ?? "provisional",
+            }
+          : {}),
       });
     });
 
@@ -107,5 +137,44 @@ export function createApiObservability(options: { enableStructuredLogs?: boolean
     };
   };
 
-  return { middleware, getMetrics, logEvent };
+  const formatPrometheusMetrics = (dbPool?: DbPoolMetricInput): string => {
+    const m = getMetrics();
+    const lines = [
+      "# HELP aios_uptime_seconds Process uptime in seconds.",
+      "# TYPE aios_uptime_seconds gauge",
+      `aios_uptime_seconds ${m.uptimeSeconds}`,
+      "# HELP aios_http_requests_total Total HTTP requests handled.",
+      "# TYPE aios_http_requests_total counter",
+      `aios_http_requests_total ${m.requestsTotal}`,
+      "# HELP aios_http_responses_total HTTP responses grouped by status class.",
+      "# TYPE aios_http_responses_total counter",
+      `aios_http_responses_total{status_class="2xx"} ${m.statusClasses["2xx"]}`,
+      `aios_http_responses_total{status_class="3xx"} ${m.statusClasses["3xx"]}`,
+      `aios_http_responses_total{status_class="4xx"} ${m.statusClasses["4xx"]}`,
+      `aios_http_responses_total{status_class="5xx"} ${m.statusClasses["5xx"]}`,
+      "# HELP aios_rate_limited_total Total HTTP 429 rate-limited responses.",
+      "# TYPE aios_rate_limited_total counter",
+      `aios_rate_limited_total ${m.rateLimitedTotal}`,
+      "# HELP aios_http_request_duration_ms Observed HTTP request latency quantiles in milliseconds.",
+      "# TYPE aios_http_request_duration_ms gauge",
+      `aios_http_request_duration_ms{quantile="0.5"} ${m.latencyMs.p50}`,
+      `aios_http_request_duration_ms{quantile="0.95"} ${m.latencyMs.p95}`,
+      `aios_http_request_duration_ms{quantile="max"} ${m.latencyMs.max}`,
+      "# HELP aios_process_memory_rss_mb Resident set size memory in megabytes.",
+      "# TYPE aios_process_memory_rss_mb gauge",
+      `aios_process_memory_rss_mb ${m.memoryRssMb}`,
+    ];
+    if (dbPool) {
+      lines.push(
+        "# HELP aios_db_pool_connections PostgreSQL connection pool counts.",
+        "# TYPE aios_db_pool_connections gauge",
+        `aios_db_pool_connections{state="total"} ${dbPool.totalCount}`,
+        `aios_db_pool_connections{state="idle"} ${dbPool.idleCount}`,
+        `aios_db_pool_connections{state="waiting"} ${dbPool.waitingCount}`,
+      );
+    }
+    return `${lines.join("\n")}\n`;
+  };
+
+  return { middleware, getMetrics, formatPrometheusMetrics, logEvent };
 }

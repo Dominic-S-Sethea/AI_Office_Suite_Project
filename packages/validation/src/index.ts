@@ -1,17 +1,10 @@
 import { z } from "zod";
 import type {
+  DocumentBlock,
   DocumentOperationProposal,
   ReportingPackageManifest,
   StudioDocument,
 } from "@ai-office-suite/shared-contracts";
-
-export const workspaceRoleSchema = z.enum([
-  "owner",
-  "administrator",
-  "editor",
-  "reviewer",
-  "viewer",
-]);
 
 export const textMarksSchema = z.object({
   bold: z.boolean().optional(),
@@ -24,44 +17,54 @@ export const textMarksSchema = z.object({
 });
 
 export const textRunSchema = z.object({
-  text: z.string().max(100000),
+  text: z.string().max(100_000),
   marks: textMarksSchema.optional(),
 });
 
 export const alignmentSchema = z.enum(["left", "center", "right", "justify"]);
+
+const filterContextSchema = z
+  .record(z.string().min(1).max(64), z.string().max(200))
+  .refine((obj) => Object.keys(obj).length <= 32, {
+    message: "filterContext cannot exceed 32 keys.",
+  });
 
 export const documentBlockSchema = z.discriminatedUnion("type", [
   z.object({
     id: z.string().min(1).max(120),
     type: z.literal("paragraph"),
     alignment: alignmentSchema.optional(),
-    runs: z.array(textRunSchema),
+    runs: z.array(textRunSchema).max(500),
   }),
   z.object({
     id: z.string().min(1).max(120),
     type: z.literal("heading"),
     level: z.union([z.literal(1), z.literal(2), z.literal(3)]),
     alignment: alignmentSchema.optional(),
-    runs: z.array(textRunSchema),
+    runs: z.array(textRunSchema).max(500),
   }),
   z.object({
     id: z.string().min(1).max(120),
     type: z.enum(["bullet_list", "ordered_list"]),
-    items: z.array(z.array(textRunSchema)),
+    items: z.array(z.array(textRunSchema).max(200)).max(500),
   }),
   z.object({
     id: z.string().min(1).max(120),
     type: z.literal("table"),
     hasHeaderRow: z.boolean(),
-    rows: z.array(
-      z.array(
-        z.object({
-          runs: z.array(textRunSchema),
-          colspan: z.number().int().min(1).max(20).optional(),
-          rowspan: z.number().int().min(1).max(50).optional(),
-        }),
-      ),
-    ),
+    rows: z
+      .array(
+        z
+          .array(
+            z.object({
+              runs: z.array(textRunSchema).max(100),
+              colspan: z.number().int().min(1).max(20).optional(),
+              rowspan: z.number().int().min(1).max(50).optional(),
+            }),
+          )
+          .max(50),
+      )
+      .max(500),
   }),
   z.object({
     id: z.string().min(1).max(120),
@@ -71,27 +74,63 @@ export const documentBlockSchema = z.discriminatedUnion("type", [
     id: z.string().min(1).max(120),
     type: z.literal("linked_metric_placeholder"),
     metric: z.object({
-      datasetId: z.string().min(1),
-      datasetVersion: z.string().min(1),
-      metricId: z.string().min(1),
-      metricVersion: z.string().min(1),
-      reportingPeriod: z.string().min(1),
-      filterContext: z.record(z.string(), z.string()),
-      unit: z.string().min(1),
-      currency: z.string().optional(),
+      datasetId: z.string().min(1).max(160),
+      datasetVersion: z.string().min(1).max(64),
+      metricId: z.string().min(1).max(160),
+      metricVersion: z.string().min(1).max(64),
+      reportingPeriod: z.string().min(1).max(120),
+      filterContext: filterContextSchema,
+      unit: z.string().min(1).max(40),
+      currency: z.string().max(16).optional(),
       approvalStatus: z.enum(["draft", "certified", "published_snapshot"]),
-      freshnessTimestamp: z.string().min(1),
+      freshnessTimestamp: z.string().min(1).max(80),
       mode: z.enum(["live_draft", "published_snapshot"]),
-      displayLabel: z.string().min(1),
-      cachedFormattedValue: z.string(),
-      provenanceId: z.string().min(1).optional(),
-      calculationEngineVersion: z.string().min(1).optional(),
-      precisionPolicyId: z.string().min(1).optional(),
+      displayLabel: z.string().min(1).max(300),
+      cachedFormattedValue: z.string().max(200),
+      provenanceId: z.string().min(1).max(160).optional(),
+      calculationEngineVersion: z.string().min(1).max(80).optional(),
+      precisionPolicyId: z.string().min(1).max(80).optional(),
       status: z.enum(["available", "unavailable"]).optional(),
-      unavailableReason: z.string().optional(),
+      unavailableReason: z.string().max(400).optional(),
+      bindingMode: z.enum(["independent_copy", "refreshable_link", "pinned_snapshot"]).optional(),
+      linkState: z
+        .enum([
+          "current",
+          "update_available",
+          "refreshing",
+          "stale",
+          "incompatible",
+          "access_restricted",
+          "source_unavailable",
+          "detached",
+          "pinned",
+        ])
+        .optional(),
+      sourceArtifactId: z.string().min(1).max(160).optional(),
+      resultReferenceId: z.string().min(1).max(160).optional(),
+      effectivePolicyScope: z.string().min(1).max(200).optional(),
+      policyVersion: z.number().int().min(1).max(1_000_000).optional(),
     }),
   }),
-]);
+]) satisfies z.ZodType<DocumentBlock>;
+
+const uniqueDocumentBlocksSchema = z
+  .array(documentBlockSchema)
+  .max(2000)
+  .superRefine((blocks, ctx) => {
+    const seen = new Set<string>();
+    for (let i = 0; i < blocks.length; i++) {
+      const id = blocks[i]!.id;
+      if (seen.has(id)) {
+        ctx.addIssue({
+          code: "custom",
+          path: [i, "id"],
+          message: `Duplicate block id '${id}' is not permitted.`,
+        });
+      }
+      seen.add(id);
+    }
+  });
 
 export const pageLayoutSchema = z.object({
   size: z.enum(["A4", "Letter"]),
@@ -111,44 +150,48 @@ export const createDocumentSchema = z.object({
   title: z.string().trim().min(1).max(200),
   language: z.enum(["en", "km", "bilingual"]).default("bilingual"),
   layout: pageLayoutSchema.optional(),
-  blocks: z.array(documentBlockSchema).optional(),
+  blocks: uniqueDocumentBlocksSchema.optional(),
 });
 
 export const updateDocumentSchema = z.object({
   title: z.string().trim().min(1).max(200).optional(),
   language: z.enum(["en", "km", "bilingual"]).optional(),
-  expectedRevision: z.number().int().min(1),
+  expectedRevision: z.number().int().min(1).max(2_147_483_647),
   layout: pageLayoutSchema.optional(),
-  blocks: z.array(documentBlockSchema).max(2000),
+  blocks: uniqueDocumentBlocksSchema,
   summary: z.string().max(300).optional(),
 });
 
 export const aiPlanRequestSchema = z.object({
   command: z.string().trim().min(1).max(2000),
-  expectedRevision: z.number().int().min(1),
+  expectedRevision: z.number().int().min(1).max(2_147_483_647),
   inputLanguage: z.enum(["en", "km"]).default("en"),
   outputLanguage: z.enum(["en", "km", "match"]).default("match"),
   source: z.enum(["typed_ai", "voice_command"]).default("typed_ai"),
   selection: z
     .object({
       blockId: z.string().min(1).max(120),
-      startOffset: z.number().int().min(0).optional(),
-      endOffset: z.number().int().min(0).optional(),
+      startOffset: z.number().int().min(0).max(100_000).optional(),
+      endOffset: z.number().int().min(0).max(100_000).optional(),
       selectedText: z.string().max(20000).optional(),
       selectionHash: z.string().max(128).optional(),
     })
+    .refine(
+      (s) => s.startOffset === undefined || s.endOffset === undefined || s.startOffset <= s.endOffset,
+      { message: "selection.startOffset must be <= selection.endOffset." },
+    )
     .optional(),
 });
 
 export const documentOperationProposalSchema = z.object({
   operationId: z.string().min(1).max(120),
   documentId: z.string().min(1).max(120),
-  expectedRevision: z.number().int().min(1),
+  expectedRevision: z.number().int().min(1).max(2_147_483_647),
   selection: z
     .object({
       blockId: z.string().min(1).max(120),
-      startOffset: z.number().int().min(0).optional(),
-      endOffset: z.number().int().min(0).optional(),
+      startOffset: z.number().int().min(0).max(100_000).optional(),
+      endOffset: z.number().int().min(0).max(100_000).optional(),
       selectedText: z.string().max(20000).optional(),
       selectionHash: z.string().max(128).optional(),
     })
@@ -162,23 +205,26 @@ export const documentOperationProposalSchema = z.object({
     "insert_table",
     "undo_last",
   ]),
-  params: z.record(z.string(), z.unknown()),
-  requestedBy: z.string().min(1),
+  params: z
+    .record(z.string().max(64), z.unknown())
+    .refine((obj) => Object.keys(obj).length <= 32, { message: "params cannot exceed 32 keys." }),
+  requestedBy: z.string().min(1).max(160),
   riskLevel: z.enum(["low", "medium", "high"]),
   requiresApproval: z.boolean(),
   source: z.enum(["manual", "typed_ai", "voice_command"]),
   inputLanguage: z.enum(["en", "km"]),
   outputLanguage: z.enum(["en", "km", "match"]),
-  originalCommand: z.string().min(1),
-  explanation: z.string().min(1),
+  originalCommand: z.string().min(1).max(2000),
+  explanation: z.string().min(1).max(2000),
   previewDiff: z.object({
-    blockId: z.string().optional(),
-    beforeText: z.string(),
-    afterText: z.string(),
-    summary: z.string(),
+    blockId: z.string().max(120).optional(),
+    beforeText: z.string().max(100_000),
+    afterText: z.string().max(100_000),
+    summary: z.string().max(500),
   }),
-  createdAt: z.string().min(1),
-}) satisfies z.ZodType<DocumentOperationProposal>;
+  createdAt: z.string().min(1).max(80),
+  proposalSignature: z.string().max(256).optional(),
+}) satisfies z.ZodType<DocumentOperationProposal & { proposalSignature?: string }>;
 
 export const aiApplyRequestSchema = z.object({
   proposal: documentOperationProposalSchema,
@@ -198,9 +244,14 @@ export const speechTranscribeRequestSchema = z.object({
   durationMs: z.number().int().min(0).max(300_000).optional(),
 });
 
+// 10 MB binary cap = ceil(10 * 1024 * 1024 / 3) * 4 = 13,981,016 base64 chars (M8)
 export const importDocxRequestSchema = z.object({
   filename: z.string().trim().min(1).max(255),
-  contentBase64: z.string().min(4).max(20_000_000),
+  contentBase64: z
+    .string()
+    .min(4)
+    .max(13_981_016)
+    .regex(/^[A-Za-z0-9+/\r\n]+=*$/, "contentBase64 must be valid base64 data."),
 });
 
 const INJECTION_PATTERNS: ReadonlyArray<{ id: string; pattern: RegExp; reason: string }> = [
@@ -381,9 +432,10 @@ const UNSAFE_ANALYTICAL_PATTERNS: ReadonlyArray<{ id: string; pattern: RegExp; r
 
 export function scanForUnsafeAnalyticalInput(input: string): PromptSafetyScanResult {
   const base = scanForPromptInjection(input);
+  const normalized = normalizeForPromptScan(input);
   const reasons = [...base.reasons];
   for (const rule of UNSAFE_ANALYTICAL_PATTERNS) {
-    if (rule.pattern.test(input)) {
+    if (rule.pattern.test(normalized)) {
       reasons.push(rule.reason);
     }
   }
@@ -476,8 +528,9 @@ export function validateChartSpecSafety(spec: {
     if (!promptCheck.safe) {
       reasons.push(...promptCheck.reasons);
     }
+    const normalized = normalizeForPromptScan(t);
     for (const rule of UNSAFE_CHART_SPEC_PATTERNS) {
-      if (rule.pattern.test(t)) {
+      if (rule.pattern.test(normalized)) {
         reasons.push(rule.reason);
       }
     }
@@ -487,6 +540,8 @@ export function validateChartSpecSafety(spec: {
     reasons: Array.from(new Set(reasons)),
   };
 }
+
+export * from "./ooxmlSafety.ts";
 
 export function validateReportingManifestSafety(manifest: ReportingPackageManifest): {
   valid: boolean;
@@ -551,4 +606,4 @@ export const dataPrepStageProfileSchema = z.object({
 });
 
 export type ValidatedStudioDocument = StudioDocument;
-
+export * from "./decimalPrecision.ts";

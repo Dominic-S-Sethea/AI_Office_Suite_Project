@@ -115,14 +115,23 @@ describe("Phase 2 — Security, Precision & Cross-Engine Edge-Case Hardening", (
     });
 
     async function login(email: string, tenantId: string, workspaceId: string) {
-      const res = await fetch(`${baseUrl}/api/auth/login`, {
+      const cookieRes = await fetch(`${baseUrl}/api/auth/login`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ email, password: "HardenedPass!2026", tenantId, workspaceId }),
       });
-      expect(res.status).toBe(200);
-      const setCookie = res.headers.get("set-cookie") ?? "";
-      const body = (await res.json()) as { token: string };
+      expect(cookieRes.status).toBe(200);
+      const setCookie = cookieRes.headers.get("set-cookie") ?? "";
+      const cookieBody = (await cookieRes.json()) as { token?: string };
+      expect(cookieBody.token).toBeUndefined();
+
+      const tokenRes = await fetch(`${baseUrl}/api/auth/token`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email, password: "HardenedPass!2026", tenantId, workspaceId }),
+      });
+      expect(tokenRes.status).toBe(200);
+      const body = (await tokenRes.json()) as { token: string };
       return { token: body.token, cookiePair: setCookie.split(";")[0]! };
     }
 

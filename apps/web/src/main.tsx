@@ -9,9 +9,12 @@ import "@fontsource/kantumruy-pro/400.css";
 import "@fontsource/kantumruy-pro/700.css";
 import "./styles.css";
 import { App } from "./App.tsx";
+import { ErrorBoundary } from "./components/ErrorBoundary.tsx";
 
 createRoot(document.getElementById("root")!).render(
   <StrictMode>
-    <App />
+    <ErrorBoundary scopeLabel="AI Office Suite">
+      <App />
+    </ErrorBoundary>
   </StrictMode>,
 );

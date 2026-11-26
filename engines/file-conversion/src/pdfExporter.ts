@@ -5,6 +5,7 @@ import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import type { DocumentBlock, StudioDocument, TextRun } from "@ai-office-suite/shared-contracts";
+import { escapeHtml } from "@ai-office-suite/validation";
 
 const execFileAsync = promisify(execFile);
 
@@ -72,26 +73,6 @@ export function detectChromiumBinary(): string | null {
   return findInSystemPath(pathNames);
 }
 
-export function detectLibreOfficeBinary(): string | null {
-  const envPath = process.env.LIBREOFFICE_PATH?.trim();
-  if (envPath && existsSync(envPath)) return envPath;
-
-  const candidates =
-    process.platform === "win32"
-      ? [
-          "C:\\Program Files\\LibreOffice\\program\\soffice.exe",
-          "C:\\Program Files (x86)\\LibreOffice\\program\\soffice.exe",
-        ]
-      : process.platform === "darwin"
-        ? ["/Applications/LibreOffice.app/Contents/MacOS/soffice"]
-        : ["/usr/bin/soffice", "/usr/bin/libreoffice", "/usr/local/bin/soffice"];
-
-  const fixedMatch = candidates.find((p) => existsSync(p));
-  if (fixedMatch) return fixedMatch;
-
-  return findInSystemPath(process.platform === "win32" ? ["soffice.exe"] : ["soffice", "libreoffice"]);
-}
-
 const SAFE_CSS_NAMED_COLORS = new Set([
   "black",
   "white",
@@ -117,11 +98,12 @@ const SAFE_CSS_NAMED_COLORS = new Set([
 ]);
 
 export const PDF_RENDER_CSP_META =
-  `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; font-src data: file:; img-src data:;" />`;
+  `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; font-src data:; img-src data:;" />`;
 
 export const HARDENED_CHROMIUM_BASE_ARGS: readonly string[] = [
   "--headless=new",
   "--disable-gpu",
+  "--disable-dev-shm-usage",
   "--no-sandbox",
   "--no-first-run",
   "--disable-extensions",
@@ -130,7 +112,31 @@ export const HARDENED_CHROMIUM_BASE_ARGS: readonly string[] = [
   "--disable-default-apps",
   "--disable-component-update",
   "--metrics-recording-only",
+  "--proxy-server=http://127.0.0.1:0",
 ];
+
+/**
+ * Builds a minimal, secret-free environment for untrusted-content child processes (Chromium, etc.)
+ * so parent secrets (DATABASE_URL, JWT_SECRET, cloud keys) are never leaked into subprocess memory.
+ */
+export function buildSanitizedSubprocessEnv(tmpDir: string): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {
+    PATH: process.env.PATH ?? "/usr/local/bin:/usr/bin:/bin",
+    HOME: tmpDir,
+    TMPDIR: tmpDir,
+    TMP: tmpDir,
+    TEMP: tmpDir,
+    XDG_CONFIG_HOME: tmpDir,
+    XDG_CACHE_HOME: tmpDir,
+    LANG: process.env.LANG ?? "C.UTF-8",
+  };
+  if (process.platform === "win32") {
+    if (process.env.SystemRoot) env.SystemRoot = process.env.SystemRoot;
+    if (process.env.WINDIR) env.WINDIR = process.env.WINDIR;
+    if (process.env.LOCALAPPDATA) env.LOCALAPPDATA = tmpDir;
+  }
+  return env;
+}
 
 export function sanitizeCssColor(raw: unknown): string | null {
   if (typeof raw !== "string") return null;
@@ -173,15 +179,6 @@ export function sanitizeSafeImageDataUri(raw: unknown): string | null {
 function sanitizeAlignment(raw: unknown): "left" | "center" | "right" | "justify" {
   if (raw === "center" || raw === "right" || raw === "justify") return raw;
   return "left";
-}
-
-function escapeHtml(text: string): string {
-  return text
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&#39;");
 }
 
 function renderRunsHtml(runs: TextRun[]): string {
@@ -408,7 +405,7 @@ export async function exportToPdfBuffer(doc: StudioDocument): Promise<PdfExportR
         `--print-to-pdf=${pdfPath}`,
         fileUrl,
       ],
-      { timeout: 25_000, windowsHide: true },
+      { timeout: 25_000, windowsHide: true, env: buildSanitizedSubprocessEnv(tmpDir) },
     );
 
     if (!existsSync(pdfPath)) {
@@ -461,7 +458,7 @@ export async function renderDocumentScreenshot(
         `--screenshot=${path.resolve(outputPngPath)}`,
         fileUrl,
       ],
-      { timeout: 25_000, windowsHide: true },
+      { timeout: 25_000, windowsHide: true, env: buildSanitizedSubprocessEnv(tmpDir) },
     );
 
     if (!existsSync(outputPngPath)) {

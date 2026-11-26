@@ -1,13 +1,17 @@
+import { randomBytes, randomUUID } from "node:crypto";
 import bcrypt from "bcryptjs";
-import jwt, { type JwtPayload } from "jsonwebtoken";
-import type { NextFunction, Request, Response } from "express";
+import jwt, { type JwtPayload, type SignOptions } from "jsonwebtoken";
 import type { ActorContext, WorkspaceRole } from "@ai-office-suite/shared-contracts";
 import { isWorkspaceRole } from "@ai-office-suite/authorization";
 import type { PgDatabaseAdapter } from "@ai-office-suite/database";
 
 export const SESSION_COOKIE_NAME = "aios_session";
-const SESSION_COOKIE_MAX_AGE_SECONDS = 604800; // 7 days
-const STATE_CHANGING_METHODS = new Set(["POST", "PUT", "PATCH", "DELETE"]);
+export const SESSION_COOKIE_MAX_AGE_SECONDS = 43_200; // 12 hours
+export const JWT_ISSUER = "ai-office-suite-api";
+export const JWT_AUDIENCE = "ai-office-suite-workspace";
+
+// Per-process CSPRNG fallback for test/dev only — never hardcoded, never used in production (H4)
+const EPHEMERAL_DEV_JWT_SECRET = randomBytes(32).toString("hex");
 
 export class AuthenticationError extends Error {
   readonly statusCode: number;
@@ -19,11 +23,6 @@ export class AuthenticationError extends Error {
     this.statusCode = statusCode;
     this.code = code;
   }
-}
-
-export interface AuthenticatedRequest extends Request {
-  actor?: ActorContext;
-  authSource?: "bearer" | "cookie";
 }
 
 export function getJwtSecret(): string {
@@ -42,7 +41,7 @@ export function getJwtSecret(): string {
     return secret;
   }
   if (process.env.NODE_ENV === "test" || process.env.ALLOW_DEV_JWT_SECRET === "true") {
-    return "aios-ephemeral-test-jwt-secret-min-32-chars-only";
+    return EPHEMERAL_DEV_JWT_SECRET;
   }
   throw new Error("JWT_SECRET (>= 32 chars) is required outside tests.");
 }
@@ -76,86 +75,6 @@ export function parseCookie(cookieHeader: string | undefined, name: string): str
   return null;
 }
 
-export function setSessionCookie(req: Request, res: Response, token: string): void {
-  const parts = [
-    `${SESSION_COOKIE_NAME}=${encodeURIComponent(token)}`,
-    "HttpOnly",
-    "SameSite=Lax",
-    "Path=/",
-    `Max-Age=${SESSION_COOKIE_MAX_AGE_SECONDS}`,
-  ];
-  if (process.env.NODE_ENV === "production" || req.secure) {
-    parts.push("Secure");
-  }
-  res.append("Set-Cookie", parts.join("; "));
-}
-
-export function clearSessionCookie(req: Request, res: Response): void {
-  const parts = [
-    `${SESSION_COOKIE_NAME}=`,
-    "HttpOnly",
-    "SameSite=Lax",
-    "Path=/",
-    "Max-Age=0",
-  ];
-  if (process.env.NODE_ENV === "production" || req.secure) {
-    parts.push("Secure");
-  }
-  res.append("Set-Cookie", parts.join("; "));
-}
-
-function normalizeOrigin(raw: string): string | null {
-  try {
-    const parsed = new URL(raw);
-    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return null;
-    return parsed.origin.toLowerCase();
-  } catch {
-    return null;
-  }
-}
-
-export function verifyCookieCsrf(
-  req: Request,
-  res: Response,
-  allowedOrigins: readonly string[],
-): boolean {
-  const fetchSite = req.headers["sec-fetch-site"];
-  if (typeof fetchSite === "string" && fetchSite.trim().toLowerCase() === "cross-site") {
-    res.status(403).json({ error: "Cross-site request rejected", code: "CSRF_ORIGIN_REJECTED" });
-    return false;
-  }
-
-  const originHeader = typeof req.headers.origin === "string" ? req.headers.origin.trim() : "";
-  const refererHeader = typeof req.headers.referer === "string" ? req.headers.referer.trim() : "";
-  const requestOrigin = originHeader
-    ? normalizeOrigin(originHeader)
-    : refererHeader
-      ? normalizeOrigin(refererHeader)
-      : null;
-
-  if (!requestOrigin) {
-    res.status(403).json({ error: "Missing origin for cookie mutation", code: "CSRF_ORIGIN_REJECTED" });
-    return false;
-  }
-
-  const allowed = new Set<string>();
-  for (const orig of allowedOrigins) {
-    const n = normalizeOrigin(orig);
-    if (n) allowed.add(n);
-  }
-  const host = typeof req.headers.host === "string" ? req.headers.host.trim().toLowerCase() : "";
-  if (host) {
-    allowed.add(`http://${host}`);
-    allowed.add(`https://${host}`);
-  }
-
-  if (!allowed.has(requestOrigin)) {
-    res.status(403).json({ error: "Origin not allowed", code: "CSRF_ORIGIN_REJECTED" });
-    return false;
-  }
-  return true;
-}
-
 export interface SessionTokenClaims {
   userId: string;
   email: string;
@@ -163,9 +82,13 @@ export interface SessionTokenClaims {
   workspaceId: string;
   role: WorkspaceRole;
   tv: number;
+  jti?: string;
 }
 
-export function signSessionToken(claims: SessionTokenClaims): string {
+export function signSessionToken(
+  claims: SessionTokenClaims,
+  options: { expiresIn?: SignOptions["expiresIn"] } = {},
+): string {
   return jwt.sign(
     {
       sub: claims.userId,
@@ -176,7 +99,13 @@ export function signSessionToken(claims: SessionTokenClaims): string {
       tv: claims.tv,
     },
     getJwtSecret(),
-    { algorithm: "HS256", expiresIn: "7d" },
+    {
+      algorithm: "HS256",
+      expiresIn: options.expiresIn ?? "12h",
+      issuer: JWT_ISSUER,
+      audience: JWT_AUDIENCE,
+      jwtid: claims.jti ?? randomUUID(),
+    },
   );
 }
 
@@ -184,7 +113,11 @@ const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{
 
 export function verifySessionToken(token: string): SessionTokenClaims | null {
   try {
-    const decoded = jwt.verify(token, getJwtSecret(), { algorithms: ["HS256"] });
+    const decoded = jwt.verify(token, getJwtSecret(), {
+      algorithms: ["HS256"],
+      issuer: JWT_ISSUER,
+      audience: JWT_AUDIENCE,
+    });
     if (typeof decoded === "string") return null;
     const p = decoded as JwtPayload;
     if (
@@ -198,7 +131,9 @@ export function verifySessionToken(token: string): SessionTokenClaims | null {
       typeof p.role !== "string" ||
       !isWorkspaceRole(p.role) ||
       typeof p.tv !== "number" ||
-      !Number.isInteger(p.tv)
+      !Number.isInteger(p.tv) ||
+      typeof p.jti !== "string" ||
+      p.jti.length < 8
     ) {
       return null;
     }
@@ -209,6 +144,7 @@ export function verifySessionToken(token: string): SessionTokenClaims | null {
       workspaceId: p.workspace_id,
       role: p.role,
       tv: p.tv,
+      jti: p.jti,
     };
   } catch {
     return null;
@@ -224,6 +160,7 @@ export async function authenticateUserWithPassword(params: {
   password: string;
   tenantId: string;
   workspaceId: string;
+  tokenExpiresIn?: SignOptions["expiresIn"];
 }): Promise<{ token: string; actor: ActorContext }> {
   const userRes = await params.db.query<{
     user_id: string;
@@ -237,11 +174,9 @@ export async function authenticateUserWithPassword(params: {
   );
   const user = userRes.rows[0];
   const passwordOk = await verifyPassword(params.password, user ? user.password_hash : DUMMY_BCRYPT_HASH);
-  if (!user || !passwordOk) {
+  if (!user || !passwordOk || user.status !== "active") {
+    // Uniform 401 prevents account status & credential enumeration (H4)
     throw new AuthenticationError(401, "INVALID_CREDENTIALS", "Invalid email or password.");
-  }
-  if (user.status !== "active") {
-    throw new AuthenticationError(403, "ACCOUNT_INACTIVE", "User account is not active.");
   }
 
   const memRes = await params.db.query<{ role: string }>(
@@ -253,7 +188,8 @@ export async function authenticateUserWithPassword(params: {
   );
   const membership = memRes.rows[0];
   if (!membership || !isWorkspaceRole(membership.role)) {
-    throw new AuthenticationError(403, "WORKSPACE_MEMBERSHIP_DENIED", "User is not a member of the requested tenant/workspace.");
+    // Uniform 401 prevents workspace/tenant membership enumeration (H4)
+    throw new AuthenticationError(401, "INVALID_CREDENTIALS", "Invalid email or password.");
   }
 
   const actor: ActorContext = {
@@ -262,11 +198,14 @@ export async function authenticateUserWithPassword(params: {
     userId: user.user_id,
     role: membership.role,
   };
-  const token = signSessionToken({
-    ...actor,
-    email: user.email,
-    tv: user.token_version,
-  });
+  const token = signSessionToken(
+    {
+      ...actor,
+      email: user.email,
+      tv: user.token_version,
+    },
+    params.tokenExpiresIn ? { expiresIn: params.tokenExpiresIn } : undefined,
+  );
   return { token, actor };
 }
 
@@ -282,100 +221,3 @@ export async function revokeUserSessions(db: PgDatabaseAdapter, userId: string):
   return row.token_version;
 }
 
-export function createJwtAuthMiddleware(
-  db: PgDatabaseAdapter,
-  allowedOrigins: readonly string[],
-) {
-  return async (req: AuthenticatedRequest, res: Response, next: NextFunction): Promise<void> => {
-    const authHeader = req.headers.authorization;
-    const bearerToken = authHeader?.startsWith("Bearer ") ? authHeader.slice(7).trim() : "";
-
-    let token = "";
-    let authSource: "bearer" | "cookie";
-    if (bearerToken) {
-      token = bearerToken;
-      authSource = "bearer";
-    } else {
-      const cookieToken = parseCookie(req.headers.cookie, SESSION_COOKIE_NAME);
-      if (!cookieToken) {
-        res.status(401).json({ error: "Authentication required", code: "MISSING_TOKEN" });
-        return;
-      }
-      token = cookieToken;
-      authSource = "cookie";
-    }
-
-    if (authSource === "cookie" && STATE_CHANGING_METHODS.has(req.method.toUpperCase())) {
-      if (!verifyCookieCsrf(req, res, allowedOrigins)) return;
-    }
-
-    const claims = verifySessionToken(token);
-    if (!claims) {
-      res.status(401).json({ error: "Invalid or expired session token", code: "INVALID_TOKEN" });
-      return;
-    }
-
-    // Reject forged tenant/workspace headers that conflict with authenticated JWT claims
-    const headerTenant = req.header("x-tenant-id")?.trim();
-    const headerWorkspace = req.header("x-workspace-id")?.trim();
-    if (
-      (headerTenant && headerTenant !== claims.tenantId) ||
-      (headerWorkspace && headerWorkspace !== claims.workspaceId)
-    ) {
-      res.status(403).json({
-        error: "Cross-tenant or cross-workspace header mismatch denied.",
-        code: "TENANT_ISOLATION_DENIED",
-      });
-      return;
-    }
-
-    // Live PostgreSQL re-verification of user status, org status, epoch `token_version`, and live RBAC role
-    try {
-      const liveRes = await db.query<{
-        status: string;
-        token_version: number;
-        role: string;
-        org_status: string;
-      }>(
-        `SELECT u.status, u.token_version, m.role, o.status AS org_status
-         FROM users u
-         JOIN memberships m ON m.user_id = u.user_id
-         JOIN organizations o ON o.tenant_id = m.tenant_id
-         WHERE u.user_id = $1::uuid AND m.tenant_id = $2::uuid AND m.workspace_id = $3::uuid`,
-        [claims.userId, claims.tenantId, claims.workspaceId],
-      );
-      const live = liveRes.rows[0];
-      if (!live) {
-        res.status(403).json({ error: "Account or workspace membership revoked", code: "ACCOUNT_REVOKED" });
-        return;
-      }
-      if (live.org_status !== "active") {
-        res.status(403).json({ error: "Organization is suspended", code: "ORGANIZATION_SUSPENDED" });
-        return;
-      }
-      if (live.status !== "active") {
-        res.status(403).json({ error: "Account is inactive or deleted", code: "ACCOUNT_INACTIVE" });
-        return;
-      }
-      if (claims.tv !== live.token_version) {
-        res.status(401).json({ error: "Session revoked; please sign in again", code: "TOKEN_REVOKED" });
-        return;
-      }
-      if (!isWorkspaceRole(live.role)) {
-        res.status(403).json({ error: "Invalid workspace role", code: "FORBIDDEN_ROLE" });
-        return;
-      }
-
-      req.actor = {
-        tenantId: claims.tenantId,
-        workspaceId: claims.workspaceId,
-        userId: claims.userId,
-        role: live.role,
-      };
-      req.authSource = authSource;
-      next();
-    } catch {
-      res.status(500).json({ error: "Authentication check failed", code: "AUTH_BACKEND_ERROR" });
-    }
-  };
-}

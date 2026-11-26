@@ -2,14 +2,16 @@ import { createHash } from "node:crypto";
 import { readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import {
+  createPgPoolConfigFromEnv,
   exportLogicalBackupSnapshot,
   initializePostgreSqlSchema,
   NodePgDatabaseAdapter,
+  provisionAppRuntimeLoginRole,
   restoreLogicalBackupSnapshot,
   verifyDatabaseRlsReadiness,
 } from "../platform/database/src/index.ts";
-import { initializeIntegrationSchema } from "../engines/integration/src/index.ts";
-import { hashPassword } from "../platform/identity/src/index.ts";
+import { initializeIntegrationSchema } from "../engines/integration/src/pgPersistence.ts";
+import { hashPassword } from "../platform/identity/src/authService.ts";
 
 const ALL_TENANT_RLS_TABLES = [
   "workspaces",
@@ -48,11 +50,37 @@ function requireDatabaseUrl() {
 async function cmdMigrate(db) {
   await initializePostgreSqlSchema(db);
   await initializeIntegrationSchema(db);
+  let provisionedRole = null;
+  const appRole = process.env.POSTGRES_APP_USER?.trim();
+  const appPw = process.env.POSTGRES_APP_PASSWORD?.trim();
+  if (appRole && appPw) {
+    await provisionAppRuntimeLoginRole(db, { roleName: appRole, password: appPw });
+    provisionedRole = appRole;
+  }
   console.log(
     JSON.stringify({
       ok: true,
       command: "migrate",
       schemas: ["core-d2", "integration-xi00"],
+      ...(provisionedRole ? { provisionedAppRole: provisionedRole } : {}),
+      timestamp: new Date().toISOString(),
+    }),
+  );
+}
+
+async function cmdProvisionAppRole(db) {
+  const roleName = process.env.POSTGRES_APP_USER?.trim() || "aios_app";
+  const password = process.env.POSTGRES_APP_PASSWORD?.trim();
+  if (!password) {
+    console.error("ERROR: POSTGRES_APP_PASSWORD (>= 12 chars) is required for provision-app-role.");
+    process.exit(1);
+  }
+  await provisionAppRuntimeLoginRole(db, { roleName, password });
+  console.log(
+    JSON.stringify({
+      ok: true,
+      command: "provision-app-role",
+      roleName,
       timestamp: new Date().toISOString(),
     }),
   );
@@ -163,7 +191,11 @@ async function cmdSeedDev(db) {
     console.error("REFUSED: seed-dev cannot execute when NODE_ENV=production.");
     process.exit(1);
   }
-  const devPassword = process.env.DEV_SEED_PASSWORD?.trim() || "DevLocalPass!2026";
+  const devPassword = process.env.DEV_SEED_PASSWORD?.trim();
+  if (!devPassword || devPassword.length < 12) {
+    console.error("REFUSED: DEV_SEED_PASSWORD (>= 12 chars) must be explicitly provided for seed-dev.");
+    process.exit(1);
+  }
   const pwHash = await hashPassword(devPassword);
 
   const tenantId = "11111111-1111-4111-8111-111111111111";
@@ -209,15 +241,19 @@ async function cmdSeedDev(db) {
 }
 
 const [command, arg1] = process.argv.slice(2);
-if (!command || !["migrate", "verify-rls", "backup", "restore", "seed-dev"].includes(command)) {
-  console.error("Usage: node scripts/db-cli.mjs <migrate|verify-rls|backup|restore|seed-dev> [file]");
+if (
+  !command ||
+  !["migrate", "verify-rls", "provision-app-role", "backup", "restore", "seed-dev"].includes(command)
+) {
+  console.error("Usage: node scripts/db-cli.mjs <migrate|verify-rls|provision-app-role|backup|restore|seed-dev> [file]");
   process.exit(1);
 }
 
-const db = new NodePgDatabaseAdapter(requireDatabaseUrl());
+const db = new NodePgDatabaseAdapter(requireDatabaseUrl(), createPgPoolConfigFromEnv(process.env));
 try {
   if (command === "migrate") await cmdMigrate(db);
   else if (command === "verify-rls") await cmdVerifyRls(db);
+  else if (command === "provision-app-role") await cmdProvisionAppRole(db);
   else if (command === "backup") await cmdBackup(db, arg1);
   else if (command === "restore") await cmdRestore(db, arg1);
   else if (command === "seed-dev") await cmdSeedDev(db);

@@ -1617,7 +1617,7 @@ export class CrossModuleIntegrationEngine {
       assertTenantWorkspaceAccess(actor, local.tenantId, local.workspaceId);
       return structuredClone(local);
     }
-    const row = await loadWorkflowRunRow(this.db, actor.tenantId, runId);
+    const row = await loadWorkflowRunRow(this.db, actor.tenantId, runId, actor.workspaceId);
     if (!row) {
       throw new IntegrationError(404, "WORKFLOW_NOT_FOUND", `Workflow run '${runId}' not found in PostgreSQL.`);
     }

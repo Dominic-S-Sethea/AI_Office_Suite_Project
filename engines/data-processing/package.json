@@ -10,7 +10,6 @@
     "@ai-office-suite/shared-contracts": "*",
     "@ai-office-suite/validation": "*",
     "@ai-office-suite/authorization": "*",
-    "@ai-office-suite/audit": "*",
     "@duckdb/node-api": "1.4.5-r.1",
     "exceljs": "^4.4.0",
     "nodejs-polars": "0.26.2"

@@ -53,7 +53,7 @@ describe("Phase 6 — Stress, Concurrency & Soak Benchmarks", () => {
         await db.exec(`
           DROP TABLE IF EXISTS
             ai_applied_operations, migration_batches, audit_logs, idempotency_keys,
-            document_versions, documents, memberships, workspaces, users, organizations
+            document_versions, documents, memberships, workspaces, users, organizations, schema_migrations
           CASCADE;
         `);
       }
@@ -104,7 +104,7 @@ describe("Phase 6 — Stress, Concurrency & Soak Benchmarks", () => {
         const baseUrl = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
         for (let i = 0; i < tenants.length; i++) {
           const t = tenants[i]!;
-          const loginRes = await fetch(`${baseUrl}/api/auth/login`, {
+          const loginRes = await fetch(`${baseUrl}/api/auth/token`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({

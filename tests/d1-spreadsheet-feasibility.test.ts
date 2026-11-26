@@ -1,8 +1,14 @@
-import { mkdirSync, writeFileSync } from "node:fs";
+import { writeFileSync } from "node:fs";
 import path from "node:path";
-import { describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it } from "vitest";
 import { zipSync } from "fflate";
 import type { SpreadsheetWorkbook } from "@ai-office-suite/shared-contracts";
+import { createTestArtifactsDir } from "./helpers/artifactsDir.ts";
+
+const artifactsHandle = createTestArtifactsDir("aios-spreadsheet-");
+afterAll(() => {
+  artifactsHandle.cleanup();
+});
 import {
   applySpreadsheetProposal,
   exportSheetToSafeCsv,
@@ -90,8 +96,7 @@ describe("FR-03 / SS-00 — Spreadsheet Calculation Engine, XLSX/CSV & Bilingual
 
     // SHT-T01/T05/T13: real XLSX export & re-import preserves Khmer text, leading-zero IDs, formulas, and USD/KHR tags
     const xlsxBuffer = await exportWorkbookToXlsxBuffer(afterChange.workbook);
-    const artifactsDir = path.resolve(process.cwd(), "tests", "artifacts");
-    mkdirSync(artifactsDir, { recursive: true });
+    const artifactsDir = artifactsHandle.dir;
     writeFileSync(path.join(artifactsDir, "bilingual-finance-workbook.xlsx"), xlsxBuffer);
 
     const reimported = await importWorkbookFromXlsxBuffer(xlsxBuffer, "bilingual-finance-workbook.xlsx");

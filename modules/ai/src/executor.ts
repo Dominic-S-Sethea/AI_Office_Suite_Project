@@ -6,9 +6,9 @@ import type {
 } from "@ai-office-suite/shared-contracts";
 import { assertCanPerform } from "@ai-office-suite/authorization";
 import type { AuditStore } from "@ai-office-suite/audit";
-import { previewDocumentOperation } from "@ai-office-suite/document-engine";
+import { previewDocumentOperation, resolveUndoTargetRevision } from "@ai-office-suite/document-engine";
 import type { DocumentService } from "@ai-office-suite/documents-module";
-import { AiPlanningError } from "./planner.ts";
+import { AiPlanningError, verifyDocumentProposalSignature } from "./planner.ts";
 
 export interface ApplyProposalResult {
   document: StudioDocument;
@@ -59,6 +59,29 @@ export class AiDocumentExecutor {
       );
     }
 
+    // Verify HMAC signature issued by server planner (H16 — blocks forged/tampered proposals)
+    if (!verifyDocumentProposalSignature(actor, proposal)) {
+      this.audit.append({
+        auditId: `aud_${randomUUID()}`,
+        tenantId: actor.tenantId,
+        workspaceId: actor.workspaceId,
+        documentId: proposal.documentId,
+        actorId: actor.userId,
+        actorRole: actor.role,
+        source: proposal.source,
+        action: "ai.operation_tampered_signature",
+        outcome: "denied",
+        operationId: proposal.operationId,
+        summary: `Rejected AI proposal '${proposal.operationId}' with missing or invalid server HMAC signature.`,
+        createdAt: new Date().toISOString(),
+      });
+      throw new AiPlanningError(
+        400,
+        "INVALID_PROPOSAL_SIGNATURE",
+        "Proposal signature verification denied: missing, tampered, or cross-tenant signature. Re-plan through /ai/plan before applying.",
+      );
+    }
+
     // Tenant/workspace/document-scoped idempotency guard preventing cross-tenant BOLA leaks (D4.05 / AI-07)
     const idempotencyCacheKey = `${actor.tenantId}::${actor.workspaceId}::${proposal.documentId}::${proposal.operationId}`;
     const cached = this.appliedOperations.get(idempotencyCacheKey);
@@ -71,10 +94,14 @@ export class AiDocumentExecutor {
     }
 
     const currentDoc = await this.documents.getDocument(actor, proposal.documentId);
-    const priorVersion =
-      proposal.action === "undo_last" && currentDoc.revision > 1
-        ? await this.documents.getVersion(actor, proposal.documentId, currentDoc.revision - 1)
-        : null;
+    let priorVersion = null;
+    if (proposal.action === "undo_last" && currentDoc.revision > 1) {
+      const versions = await this.documents.listVersions(actor, proposal.documentId);
+      const targetRev = resolveUndoTargetRevision(versions);
+      if (targetRev !== null) {
+        priorVersion = versions.find((v) => v.revision === targetRev) ?? null;
+      }
+    }
 
     const { nextDoc, preview } = previewDocumentOperation(
       currentDoc,
@@ -91,7 +118,9 @@ export class AiDocumentExecutor {
       summary: `[${proposal.source}] ${proposal.action}: ${preview.summary}`,
       source: proposal.source === "voice_command" ? "voice_command" : "typed_ai",
       operationId: proposal.operationId,
-      ...(proposal.action === "undo_last" && priorVersion ? { undoneRevision: currentDoc.revision } : {}),
+      ...(proposal.action === "undo_last" && priorVersion
+        ? { undoneRevision: currentDoc.revision, restoredFromRevision: priorVersion.revision }
+        : {}),
     });
 
     if (this.appliedOperations.size >= 1000) {

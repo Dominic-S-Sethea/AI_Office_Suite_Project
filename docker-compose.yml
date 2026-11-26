@@ -3,16 +3,46 @@ services:
     image: postgres:16-alpine
     restart: unless-stopped
     environment:
-      POSTGRES_USER: ${POSTGRES_USER:-aios}
+      POSTGRES_USER: ${POSTGRES_USER:-aios_admin}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
       POSTGRES_DB: ${POSTGRES_DB:-aios_suite}
     volumes:
       - aios_pg16_data:/var/lib/postgresql/data
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 1g
+    pids_limit: 256
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-aios} -d ${POSTGRES_DB:-aios_suite}"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-aios_admin} -d ${POSTGRES_DB:-aios_suite}"]
       interval: 5s
       timeout: 5s
       retries: 10
+    networks:
+      - aios_internal
+
+  migrate:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.api
+    restart: "no"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: ["node", "scripts/db-cli.mjs", "migrate"]
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: postgres://${POSTGRES_USER:-aios_admin}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/${POSTGRES_DB:-aios_suite}
+      POSTGRES_APP_USER: ${POSTGRES_APP_USER:-aios_app}
+      POSTGRES_APP_PASSWORD: ${POSTGRES_APP_PASSWORD:?Set a strong >=12-char POSTGRES_APP_PASSWORD in .env}
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,noexec,nosuid
+    mem_limit: 512m
+    pids_limit: 128
     networks:
       - aios_internal
 
@@ -22,21 +52,37 @@ services:
       dockerfile: docker/Dockerfile.api
     restart: unless-stopped
     depends_on:
-      postgres:
-        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
     environment:
       NODE_ENV: production
       AUTH_MODE: jwt-pg
       HOST: 0.0.0.0
       PORT: 4100
-      DATABASE_URL: postgres://${POSTGRES_USER:-aios}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/${POSTGRES_DB:-aios_suite}
+      TRUST_PROXY: ${TRUST_PROXY:-1}
+      DATABASE_URL: postgres://${POSTGRES_APP_USER:-aios_app}:${POSTGRES_APP_PASSWORD:?Set a strong >=12-char POSTGRES_APP_PASSWORD in .env}@postgres:5432/${POSTGRES_DB:-aios_suite}
+      REQUIRE_NON_SUPERUSER_DB: "true"
       JWT_SECRET: ${JWT_SECRET:?Set a strong >=32-char JWT_SECRET in .env}
+      PII_PSEUDONYMIZATION_KEY: ${PII_PSEUDONYMIZATION_KEY:-}
+      AI_PROPOSAL_SIGNING_SECRET: ${AI_PROPOSAL_SIGNING_SECRET:-}
       CORS_ORIGIN: ${CORS_ORIGIN:-http://localhost:8080,http://127.0.0.1:8080}
-      AUTO_MIGRATE_ON_START: ${AUTO_MIGRATE_ON_START:-true}
+      AUTO_MIGRATE_ON_START: "false"
       PG_POOL_MAX: ${PG_POOL_MAX:-10}
       PG_STATEMENT_TIMEOUT_MS: ${PG_STATEMENT_TIMEOUT_MS:-15000}
+      PG_SSL_MODE: ${PG_SSL_MODE:-disable}
+      MAX_CONCURRENT_PDF_EXPORTS: ${MAX_CONCURRENT_PDF_EXPORTS:-2}
+      MAX_CONCURRENT_DATA_PREP: ${MAX_CONCURRENT_DATA_PREP:-2}
       ALLOW_LIVE_SPEECH_PROVIDERS: "false"
-      ALLOW_LIVE_AI_PROVIDERS: "false"
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp:size=256m,nosuid
+    mem_limit: 1g
+    cpus: "2.0"
+    pids_limit: 256
     networks:
       - aios_internal
 
@@ -50,6 +96,17 @@ services:
         condition: service_healthy
     ports:
       - "${WEB_BIND_HOST:-127.0.0.1}:${WEB_PORT:-8080}:8080"
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,noexec,nosuid
+      - /var/cache/nginx:size=64m,noexec,nosuid
+    mem_limit: 256m
+    cpus: "1.0"
+    pids_limit: 128
     networks:
       - aios_internal
 

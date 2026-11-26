@@ -105,20 +105,117 @@ function findTargetBlockIndex(doc: StudioDocument, blockId?: string): number {
   return lastTextIdx >= 0 ? lastTextIdx : 0;
 }
 
+function marksEqual(a?: TextRun["marks"], b?: TextRun["marks"]): boolean {
+  if (!a && !b) return true;
+  if (!a || !b) return false;
+  return (
+    Boolean(a.bold) === Boolean(b.bold) &&
+    Boolean(a.italic) === Boolean(b.italic) &&
+    Boolean(a.underline) === Boolean(b.underline) &&
+    (a.highlight ?? "") === (b.highlight ?? "") &&
+    (a.fontFamily ?? "") === (b.fontFamily ?? "") &&
+    (a.fontSizePt ?? 0) === (b.fontSizePt ?? 0) &&
+    (a.color ?? "") === (b.color ?? "")
+  );
+}
+
+/**
+ * Replaces `[startOffset, endOffset)` at safe grapheme cluster boundaries while preserving
+ * inline formatting (`marks`) of all untouched runs before and after the edited slice (H18).
+ */
 function mutateBlockRunsText(
   runs: TextRun[],
   startOffset: number,
   endOffset: number,
   replacement: string,
 ): TextRun[] {
-  const full = normalizeDocumentText(runs.map((r) => r.text).join(""));
+  const normalizedRuns = runs.map((r) => ({
+    text: normalizeDocumentText(r.text),
+    ...(r.marks ? { marks: { ...r.marks } } : {}),
+  }));
+  const full = normalizedRuns.map((r) => r.text).join("");
   const safeRange = snapRangeToGraphemeBoundaries(full, startOffset, endOffset);
-  const nextText =
-    full.slice(0, safeRange.start) +
-    normalizeDocumentText(replacement) +
-    full.slice(safeRange.end);
-  const inheritedMarks = runs[0]?.marks ? { ...runs[0].marks } : undefined;
-  return [{ text: nextText, ...(inheritedMarks ? { marks: inheritedMarks } : {}) }];
+  const normReplacement = normalizeDocumentText(replacement);
+
+  const out: TextRun[] = [];
+  let cursor = 0;
+  let inserted = false;
+  let replacementMarks: TextRun["marks"] | undefined = normalizedRuns[0]?.marks
+    ? { ...normalizedRuns[0].marks }
+    : undefined;
+
+  const pushRun = (text: string, marks?: TextRun["marks"]) => {
+    if (!text) return;
+    const prev = out[out.length - 1];
+    if (prev && marksEqual(prev.marks, marks)) {
+      prev.text += text;
+    } else {
+      out.push({ text, ...(marks ? { marks: { ...marks } } : {}) });
+    }
+  };
+
+  for (const run of normalizedRuns) {
+    const runStart = cursor;
+    const runEnd = cursor + run.text.length;
+    cursor = runEnd;
+
+    if (runEnd <= safeRange.start) {
+      pushRun(run.text, run.marks);
+      if (runEnd === safeRange.start) {
+        replacementMarks = run.marks ? { ...run.marks } : undefined;
+      }
+      continue;
+    }
+
+    if (runStart >= safeRange.end) {
+      if (!inserted) {
+        pushRun(normReplacement, replacementMarks);
+        inserted = true;
+      }
+      pushRun(run.text, run.marks);
+      continue;
+    }
+
+    // Run overlaps [safeRange.start, safeRange.end)
+    if (runStart < safeRange.start) {
+      pushRun(run.text.slice(0, safeRange.start - runStart), run.marks);
+    }
+    if (!inserted) {
+      replacementMarks = run.marks ? { ...run.marks } : replacementMarks;
+      pushRun(normReplacement, replacementMarks);
+      inserted = true;
+    }
+    if (runEnd > safeRange.end) {
+      pushRun(run.text.slice(safeRange.end - runStart), run.marks);
+    }
+  }
+
+  if (!inserted) {
+    pushRun(normReplacement, replacementMarks);
+  }
+
+  return out.length > 0 ? out : [{ text: "" }];
+}
+
+/**
+ * Resolves the prior target revision for `undo_last` without flip-flopping between two revisions
+ * on consecutive undo commands (H18). Walks back past previously restored revisions cleanly.
+ */
+export function resolveUndoTargetRevision(
+  versions: ReadonlyArray<{ revision: number; restoredFromRevision?: number | null }>,
+): number | null {
+  if (versions.length < 2) return null;
+  const sorted = [...versions].sort((a, b) => a.revision - b.revision);
+  const latest = sorted[sorted.length - 1]!;
+  if (typeof latest.restoredFromRevision === "number" && latest.restoredFromRevision >= 1) {
+    const targetRev = latest.restoredFromRevision - 1;
+    if (targetRev < 1) return null;
+    const exact = sorted.find((v) => v.revision === targetRev);
+    if (exact) return exact.revision;
+    const earlier = [...sorted].reverse().find((v) => v.revision < latest.restoredFromRevision!);
+    return earlier ? earlier.revision : null;
+  }
+  return sorted[sorted.length - 2]?.revision ?? null;
 }
 
 export function previewDocumentOperation(
@@ -172,13 +269,21 @@ export function previewDocumentOperation(
     throw new DocumentEngineError(400, "EMPTY_DOCUMENT", "Document has no target block.");
   }
 
-  // Selection integrity check when caller specifies a selectionHash
+  // Selection integrity check with consistent NFC normalization + grapheme-boundary snapping (H18)
   if (proposal.selection?.selectionHash) {
-    const actualText = getBlockPlainText(currentBlock);
-    const slice =
-      typeof proposal.selection.startOffset === "number" && typeof proposal.selection.endOffset === "number"
-        ? actualText.slice(proposal.selection.startOffset, proposal.selection.endOffset)
-        : actualText;
+    const actualText = normalizeDocumentText(getBlockPlainText(currentBlock));
+    let slice = actualText;
+    if (
+      typeof proposal.selection.startOffset === "number" &&
+      typeof proposal.selection.endOffset === "number"
+    ) {
+      const snapped = snapRangeToGraphemeBoundaries(
+        actualText,
+        proposal.selection.startOffset,
+        proposal.selection.endOffset,
+      );
+      slice = actualText.slice(snapped.start, snapped.end);
+    }
     const actualHash = hashTextSelection(slice);
     if (actualHash !== proposal.selection.selectionHash) {
       throw new DocumentEngineError(
@@ -189,11 +294,14 @@ export function previewDocumentOperation(
     }
   }
 
-  const beforeText = getBlockPlainText(currentBlock);
+  const beforeText = normalizeDocumentText(getBlockPlainText(currentBlock));
 
   switch (proposal.action) {
     case "insert_text": {
-      const textToInsert = normalizeDocumentText(String(proposal.params.text ?? ""));
+      if (typeof proposal.params.text !== "string") {
+        throw new DocumentEngineError(400, "INVALID_PARAMS", "insert_text requires string text parameter.");
+      }
+      const textToInsert = normalizeDocumentText(proposal.params.text);
       if (!textToInsert) {
         throw new DocumentEngineError(400, "INVALID_PARAMS", "insert_text requires non-empty text.");
       }
@@ -237,7 +345,10 @@ export function previewDocumentOperation(
       if (currentBlock.type !== "paragraph" && currentBlock.type !== "heading") {
         throw new DocumentEngineError(400, "UNSUPPORTED_TARGET", "replace_selection requires a paragraph or heading block.");
       }
-      const replacement = normalizeDocumentText(String(proposal.params.replacement ?? ""));
+      if (typeof proposal.params.replacement !== "string") {
+        throw new DocumentEngineError(400, "INVALID_PARAMS", "replace_selection requires string replacement parameter.");
+      }
+      const replacement = normalizeDocumentText(proposal.params.replacement);
       if (!replacement) {
         throw new DocumentEngineError(400, "INVALID_PARAMS", "replace_selection requires replacement text.");
       }
@@ -263,7 +374,10 @@ export function previewDocumentOperation(
       if (currentBlock.type !== "paragraph" && currentBlock.type !== "heading") {
         throw new DocumentEngineError(400, "UNSUPPORTED_TARGET", "set_heading requires a paragraph or heading block.");
       }
-      const rawLevel = Number(proposal.params.level ?? 1);
+      const rawLevel = proposal.params.level === undefined ? 1 : Number(proposal.params.level);
+      if (!Number.isInteger(rawLevel) || rawLevel < 0 || rawLevel > 3) {
+        throw new DocumentEngineError(400, "INVALID_PARAMS", "set_heading level must be an integer between 0 and 3.");
+      }
       if (rawLevel === 0) {
         const converted: ParagraphBlock = {
           id: currentBlock.id,
@@ -282,7 +396,7 @@ export function previewDocumentOperation(
           },
         };
       }
-      const level = (rawLevel === 2 ? 2 : rawLevel === 3 ? 3 : 1) as 1 | 2 | 3;
+      const level = rawLevel as 1 | 2 | 3;
       const heading: HeadingBlock = {
         id: currentBlock.id,
         type: "heading",
@@ -305,6 +419,9 @@ export function previewDocumentOperation(
     case "toggle_bold": {
       if (currentBlock.type !== "paragraph" && currentBlock.type !== "heading") {
         throw new DocumentEngineError(400, "UNSUPPORTED_TARGET", "toggle_bold requires a paragraph or heading block.");
+      }
+      if (proposal.params.bold !== undefined && typeof proposal.params.bold !== "boolean") {
+        throw new DocumentEngineError(400, "INVALID_PARAMS", "toggle_bold bold parameter must be a boolean.");
       }
       const forceBold =
         typeof proposal.params.bold === "boolean"
@@ -347,8 +464,13 @@ export function previewDocumentOperation(
     }
 
     case "insert_table": {
-      const rows = Math.max(1, Math.min(20, Number(proposal.params.rows ?? 3)));
-      const cols = Math.max(1, Math.min(10, Number(proposal.params.cols ?? 3)));
+      const rawRows = proposal.params.rows === undefined ? 3 : Number(proposal.params.rows);
+      const rawCols = proposal.params.cols === undefined ? 3 : Number(proposal.params.cols);
+      if (!Number.isFinite(rawRows) || !Number.isFinite(rawCols)) {
+        throw new DocumentEngineError(400, "INVALID_PARAMS", "insert_table rows and cols must be finite numbers.");
+      }
+      const rows = Math.max(1, Math.min(20, Math.trunc(rawRows)));
+      const cols = Math.max(1, Math.min(10, Math.trunc(rawCols)));
       const customHeaders = Array.isArray(proposal.params.headers) ? (proposal.params.headers as string[]) : null;
       const tableRows = Array.from({ length: rows }, (_, r) =>
         Array.from({ length: cols }, (_, c) => ({
@@ -388,9 +510,11 @@ export function previewDocumentOperation(
 export interface DocumentBlockDiffEntry {
   blockId: string;
   blockType: DocumentBlock["type"];
-  changeType: "added" | "removed" | "modified";
+  changeType: "added" | "removed" | "modified" | "moved";
   beforeText?: string;
   afterText?: string;
+  fromIndex?: number;
+  toIndex?: number;
 }
 
 export interface DocumentRevisionDiff {
@@ -406,6 +530,7 @@ export interface DocumentRevisionDiff {
     added: number;
     removed: number;
     modified: number;
+    moved?: number;
     unchanged: number;
   };
   blocks: DocumentBlockDiffEntry[];
@@ -415,26 +540,44 @@ export function computeDocumentRevisionDiff(
   fromDoc: StudioDocument,
   toDoc: StudioDocument,
 ): DocumentRevisionDiff {
-  const fromMap = new Map<string, DocumentBlock>(fromDoc.blocks.map((b) => [b.id, b]));
-  const toMap = new Map<string, DocumentBlock>(toDoc.blocks.map((b) => [b.id, b]));
+  const fromMap = new Map<string, { block: DocumentBlock; index: number }>();
+  for (let i = 0; i < fromDoc.blocks.length; i++) {
+    const b = fromDoc.blocks[i]!;
+    if (!fromMap.has(b.id)) fromMap.set(b.id, { block: b, index: i });
+  }
+  const toMap = new Map<string, { block: DocumentBlock; index: number }>();
+  for (let i = 0; i < toDoc.blocks.length; i++) {
+    const b = toDoc.blocks[i]!;
+    if (!toMap.has(b.id)) toMap.set(b.id, { block: b, index: i });
+  }
+
+  // Compute relative order among shared blocks so pure insertions/deletions do not trigger false move flags (H18)
+  const sharedFromOrder = fromDoc.blocks.filter((b) => toMap.has(b.id)).map((b) => b.id);
+  const sharedToOrder = toDoc.blocks.filter((b) => fromMap.has(b.id)).map((b) => b.id);
+  const sharedFromPos = new Map(sharedFromOrder.map((id, idx) => [id, idx]));
+  const sharedToPos = new Map(sharedToOrder.map((id, idx) => [id, idx]));
 
   const diffs: DocumentBlockDiffEntry[] = [];
   let added = 0;
   let removed = 0;
   let modified = 0;
+  let moved = 0;
   let unchanged = 0;
 
-  for (const oldBlock of fromDoc.blocks) {
-    const nextBlock = toMap.get(oldBlock.id);
-    if (!nextBlock) {
+  for (let i = 0; i < fromDoc.blocks.length; i++) {
+    const oldBlock = fromDoc.blocks[i]!;
+    const nextEntry = toMap.get(oldBlock.id);
+    if (!nextEntry) {
       removed++;
       diffs.push({
         blockId: oldBlock.id,
         blockType: oldBlock.type,
         changeType: "removed",
         beforeText: normalizeDocumentText(getBlockPlainText(oldBlock)),
+        fromIndex: i,
       });
     } else {
+      const nextBlock = nextEntry.block;
       const beforeJson = JSON.stringify(oldBlock);
       const afterJson = JSON.stringify(nextBlock);
       if (beforeJson !== afterJson) {
@@ -445,6 +588,20 @@ export function computeDocumentRevisionDiff(
           changeType: "modified",
           beforeText: normalizeDocumentText(getBlockPlainText(oldBlock)),
           afterText: normalizeDocumentText(getBlockPlainText(nextBlock)),
+          fromIndex: i,
+          toIndex: nextEntry.index,
+        });
+      } else if (sharedFromPos.get(oldBlock.id) !== sharedToPos.get(oldBlock.id)) {
+        moved++;
+        const text = normalizeDocumentText(getBlockPlainText(nextBlock));
+        diffs.push({
+          blockId: nextBlock.id,
+          blockType: nextBlock.type,
+          changeType: "moved",
+          beforeText: text,
+          afterText: text,
+          fromIndex: i,
+          toIndex: nextEntry.index,
         });
       } else {
         unchanged++;
@@ -452,7 +609,8 @@ export function computeDocumentRevisionDiff(
     }
   }
 
-  for (const nextBlock of toDoc.blocks) {
+  for (let i = 0; i < toDoc.blocks.length; i++) {
+    const nextBlock = toDoc.blocks[i]!;
     if (!fromMap.has(nextBlock.id)) {
       added++;
       diffs.push({
@@ -460,6 +618,7 @@ export function computeDocumentRevisionDiff(
         blockType: nextBlock.type,
         changeType: "added",
         afterText: normalizeDocumentText(getBlockPlainText(nextBlock)),
+        toIndex: i,
       });
     }
   }
@@ -473,7 +632,7 @@ export function computeDocumentRevisionDiff(
       languageChanged: fromDoc.language !== toDoc.language,
       layoutChanged: JSON.stringify(fromDoc.layout) !== JSON.stringify(toDoc.layout),
     },
-    summary: { added, removed, modified, unchanged },
+    summary: { added, removed, modified, moved, unchanged },
     blocks: diffs,
   };
 }

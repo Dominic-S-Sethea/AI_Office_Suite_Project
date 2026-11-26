@@ -80,8 +80,16 @@ export class LocalJsonlAuditStore implements AuditStore {
 
 export class InMemoryAuditStore implements AuditStore {
   private readonly events: AuditEvent[] = [];
+  private readonly maxEvents: number;
+
+  constructor(maxEvents = 5_000) {
+    this.maxEvents = Math.max(100, Math.trunc(maxEvents));
+  }
 
   append(event: AuditEvent): void {
+    if (this.events.length >= this.maxEvents) {
+      this.events.splice(0, this.events.length - this.maxEvents + 1);
+    }
     this.events.push(redactAuditValue(event) as AuditEvent);
   }
 

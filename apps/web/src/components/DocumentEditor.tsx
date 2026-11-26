@@ -1,4 +1,5 @@
-import { useEffect, useRef } from "react";
+import { forwardRef, memo, useEffect, useImperativeHandle, useRef } from "react";
+import { Extension, mergeAttributes, Node as TiptapCustomNode } from "@tiptap/core";
 import { EditorContent, useEditor } from "@tiptap/react";
 import StarterKit from "@tiptap/starter-kit";
 import TextAlign from "@tiptap/extension-text-align";
@@ -6,19 +7,93 @@ import { Table, TableCell, TableHeader, TableRow } from "@tiptap/extension-table
 import Highlight from "@tiptap/extension-highlight";
 import { Color, FontFamily, TextStyle } from "@tiptap/extension-text-style";
 import Placeholder from "@tiptap/extension-placeholder";
-import type { DocumentBlock, StudioDocument } from "@ai-office-suite/shared-contracts";
+import type { DocumentBlock, LinkedMetricReference, StudioDocument } from "@ai-office-suite/shared-contracts";
+
+const BlockIdAndFontSizeExtension = Extension.create({
+  name: "blockIdAndFontSize",
+  addGlobalAttributes() {
+    return [
+      {
+        types: ["paragraph", "heading", "bulletList", "orderedList", "table", "horizontalRule"],
+        attributes: {
+          blockId: {
+            default: null,
+            parseHTML: (element) => element.getAttribute("data-block-id"),
+            renderHTML: (attributes) => {
+              if (!attributes.blockId) return {};
+              return { "data-block-id": String(attributes.blockId) };
+            },
+          },
+        },
+      },
+      {
+        types: ["textStyle"],
+        attributes: {
+          fontSize: {
+            default: null,
+            parseHTML: (element) => element.style.fontSize || null,
+            renderHTML: (attributes) => {
+              if (!attributes.fontSize) return {};
+              return { style: `font-size: ${String(attributes.fontSize)}` };
+            },
+          },
+        },
+      },
+    ];
+  },
+});
+
+const LinkedMetricPlaceholderNode = TiptapCustomNode.create({
+  name: "linkedMetricPlaceholder",
+  group: "block",
+  atom: true,
+  selectable: true,
+  draggable: false,
+  addAttributes() {
+    return {
+      blockId: { default: null },
+      metric: { default: null },
+    };
+  },
+  parseHTML() {
+    return [{ tag: 'div[data-type="linked-metric-placeholder"]' }];
+  },
+  renderHTML({ node, HTMLAttributes }) {
+    const metric = node.attrs.metric as LinkedMetricReference | null;
+    const label = metric
+      ? `[Linked Metric · ${metric.displayLabel}: ${metric.cachedFormattedValue} (${metric.mode})]`
+      : "[Linked Metric Placeholder]";
+    return [
+      "div",
+      mergeAttributes(HTMLAttributes, {
+        "data-type": "linked-metric-placeholder",
+        "data-block-id": node.attrs.blockId ?? "",
+        contenteditable: "false",
+        class: "metric-pill-node",
+      }),
+      label,
+    ];
+  },
+});
 
 export interface EditorSelectionState {
   blockId?: string;
   selectedText: string;
   graphemeCount?: number;
+  startOffset?: number;
+  endOffset?: number;
+}
+
+export interface DocumentEditorHandle {
+  getCurrentTiptapJson: () => Record<string, unknown> | null;
 }
 
 interface DocumentEditorProps {
   document: StudioDocument;
   tiptapContent: Record<string, unknown>;
   readOnly: boolean;
-  onDocChange: (tiptapJson: Record<string, unknown>) => void;
+  onDocChange?: (tiptapJson: Record<string, unknown>) => void;
+  onDirtyChange?: (dirty: boolean) => void;
   onSelectionChange: (sel: EditorSelectionState) => void;
 }
 
@@ -38,7 +113,15 @@ function countGraphemes(text: string): number {
   return count;
 }
 
-function findCurrentBlockId(blocks: DocumentBlock[], selectedText: string, anchorIndex: number): string | undefined {
+function findCurrentBlockId(
+  blocks: DocumentBlock[],
+  selectedText: string,
+  anchorIndex: number,
+  nodeAttrBlockId?: string | null,
+): string | undefined {
+  if (typeof nodeAttrBlockId === "string" && nodeAttrBlockId.trim()) {
+    return nodeAttrBlockId.trim();
+  }
   const trimmed = selectedText.normalize("NFC").trim();
   if (trimmed) {
     const matched = blocks.find((b) => {
@@ -57,17 +140,15 @@ function findCurrentBlockId(blocks: DocumentBlock[], selectedText: string, ancho
   return candidate?.id ?? blocks[0]?.id;
 }
 
-export function DocumentEditor({
-  document,
-  tiptapContent,
-  readOnly,
-  onDocChange,
-  onSelectionChange,
-}: DocumentEditorProps) {
-  // Keep latest blocks and callbacks in refs so ProseMirror listeners never capture stale closures
+const DocumentEditorInner = forwardRef<DocumentEditorHandle, DocumentEditorProps>(function DocumentEditorInner(
+  { document, tiptapContent, readOnly, onDocChange, onDirtyChange, onSelectionChange },
+  ref,
+) {
   const blocksRef = useRef<DocumentBlock[]>(document.blocks);
   const onDocChangeRef = useRef(onDocChange);
+  const onDirtyChangeRef = useRef(onDirtyChange);
   const onSelectionChangeRef = useRef(onSelectionChange);
+  const isDirtyRef = useRef(false);
   const lastSyncedKeyRef = useRef<string>(`${document.documentId}:${document.revision}`);
 
   useEffect(() => {
@@ -79,6 +160,10 @@ export function DocumentEditor({
   }, [onDocChange]);
 
   useEffect(() => {
+    onDirtyChangeRef.current = onDirtyChange;
+  }, [onDirtyChange]);
+
+  useEffect(() => {
     onSelectionChangeRef.current = onSelectionChange;
   }, [onSelectionChange]);
 
@@ -88,6 +173,8 @@ export function DocumentEditor({
       StarterKit.configure({
         heading: { levels: [1, 2, 3] },
       }),
+      BlockIdAndFontSizeExtension,
+      LinkedMetricPlaceholderNode,
       TextAlign.configure({ types: ["heading", "paragraph"] }),
       Table.configure({ resizable: false }),
       TableRow,
@@ -103,20 +190,50 @@ export function DocumentEditor({
     ],
     content: tiptapContent,
     onUpdate({ editor: ed }) {
-      onDocChangeRef.current(ed.getJSON() as Record<string, unknown>);
+      // Notify parent once on clean -> dirty transition to avoid per-keystroke tree serialization (H24)
+      if (!isDirtyRef.current) {
+        isDirtyRef.current = true;
+        onDirtyChangeRef.current?.(true);
+      }
+      if (onDocChangeRef.current) {
+        onDocChangeRef.current(ed.getJSON() as Record<string, unknown>);
+      }
     },
     onSelectionUpdate({ editor: ed }) {
       const { from, to } = ed.state.selection;
       const selectedText = ed.state.doc.textBetween(from, to, " ").normalize("NFC");
-      const parentPos = ed.state.doc.resolve(from);
-      const topIndex = parentPos.index(0);
+      const resolvedFrom = ed.state.doc.resolve(from);
+      const topIndex = resolvedFrom.index(0);
+      const topNode = topIndex >= 0 && topIndex < ed.state.doc.childCount ? ed.state.doc.child(topIndex) : null;
+      const attrBlockId = typeof topNode?.attrs?.blockId === "string" ? topNode.attrs.blockId : null;
+
+      let startOffset: number | undefined;
+      let endOffset: number | undefined;
+      if (to > from && resolvedFrom.depth >= 1) {
+        const blockStartPos = resolvedFrom.start(1);
+        const blockEndPos = resolvedFrom.end(1);
+        if (to <= blockEndPos) {
+          startOffset = ed.state.doc.textBetween(blockStartPos, from, "\n").normalize("NFC").length;
+          endOffset = ed.state.doc.textBetween(blockStartPos, to, "\n").normalize("NFC").length;
+        }
+      }
+
       onSelectionChangeRef.current({
-        blockId: findCurrentBlockId(blocksRef.current, selectedText, topIndex),
+        blockId: findCurrentBlockId(blocksRef.current, selectedText, topIndex, attrBlockId),
         selectedText,
         graphemeCount: countGraphemes(selectedText),
+        ...(startOffset !== undefined && endOffset !== undefined ? { startOffset, endOffset } : {}),
       });
     },
   });
+
+  useImperativeHandle(
+    ref,
+    () => ({
+      getCurrentTiptapJson: () => (editor ? (editor.getJSON() as Record<string, unknown>) : null),
+    }),
+    [editor],
+  );
 
   useEffect(() => {
     if (!editor) return;
@@ -129,6 +246,7 @@ export function DocumentEditor({
     if (lastSyncedKeyRef.current !== nextKey) {
       editor.commands.setContent(tiptapContent, { emitUpdate: false });
       lastSyncedKeyRef.current = nextKey;
+      isDirtyRef.current = false;
     }
   }, [editor, document.revision, document.documentId, tiptapContent]);
 
@@ -141,24 +259,48 @@ export function DocumentEditor({
     .filter(Boolean)
     .join(" ");
 
+  const isParagraph = editor?.isActive("paragraph") ?? false;
+  const isH1 = editor?.isActive("heading", { level: 1 }) ?? false;
+  const isH2 = editor?.isActive("heading", { level: 2 }) ?? false;
+  const isH3 = editor?.isActive("heading", { level: 3 }) ?? false;
+  const isBold = editor?.isActive("bold") ?? false;
+  const isItalic = editor?.isActive("italic") ?? false;
+  const isUnderline = editor?.isActive("underline") ?? false;
+  const isAlignLeft = editor?.isActive({ textAlign: "left" }) ?? false;
+  const isAlignCenter = editor?.isActive({ textAlign: "center" }) ?? false;
+  const isAlignRight = editor?.isActive({ textAlign: "right" }) ?? false;
+  const isAlignJustify = editor?.isActive({ textAlign: "justify" }) ?? false;
+  const isBulletList = editor?.isActive("bulletList") ?? false;
+  const isOrderedList = editor?.isActive("orderedList") ?? false;
+
   return (
-    <div style={{ width: "100%", display: "flex", flexDirection: "column", alignItems: "center", gap: 10 }}>
+    <div className="editor-container">
       {editor && (
         <div
-          className="toolbar"
+          className="toolbar editor-formatting-toolbar"
           role="toolbar"
           aria-label="Document formatting toolbar"
-          style={{ width: "100%", justifyContent: "center", borderRadius: 8, border: "1px solid #cbd5e1" }}
         >
-          <button type="button" className="btn" disabled={readOnly || !editor.can().undo()} onClick={() => editor.chain().focus().undo().run()}>
+          <button
+            type="button"
+            className="btn"
+            disabled={readOnly || !editor.can().undo()}
+            onClick={() => editor.chain().focus().undo().run()}
+          >
             Undo
           </button>
-          <button type="button" className="btn" disabled={readOnly || !editor.can().redo()} onClick={() => editor.chain().focus().redo().run()}>
+          <button
+            type="button"
+            className="btn"
+            disabled={readOnly || !editor.can().redo()}
+            onClick={() => editor.chain().focus().redo().run()}
+          >
             Redo
           </button>
           <button
             type="button"
-            className={`btn ${editor.isActive("paragraph") ? "active" : ""}`}
+            className={`btn ${isParagraph ? "active" : ""}`}
+            aria-pressed={isParagraph}
             disabled={readOnly}
             onClick={() => editor.chain().focus().setParagraph().run()}
           >
@@ -166,7 +308,8 @@ export function DocumentEditor({
           </button>
           <button
             type="button"
-            className={`btn ${editor.isActive("heading", { level: 1 }) ? "active" : ""}`}
+            className={`btn ${isH1 ? "active" : ""}`}
+            aria-pressed={isH1}
             disabled={readOnly}
             onClick={() => editor.chain().focus().toggleHeading({ level: 1 }).run()}
           >
@@ -174,7 +317,8 @@ export function DocumentEditor({
           </button>
           <button
             type="button"
-            className={`btn ${editor.isActive("heading", { level: 2 }) ? "active" : ""}`}
+            className={`btn ${isH2 ? "active" : ""}`}
+            aria-pressed={isH2}
             disabled={readOnly}
             onClick={() => editor.chain().focus().toggleHeading({ level: 2 }).run()}
           >
@@ -182,7 +326,8 @@ export function DocumentEditor({
           </button>
           <button
             type="button"
-            className={`btn ${editor.isActive("heading", { level: 3 }) ? "active" : ""}`}
+            className={`btn ${isH3 ? "active" : ""}`}
+            aria-pressed={isH3}
             disabled={readOnly}
             onClick={() => editor.chain().focus().toggleHeading({ level: 3 }).run()}
           >
@@ -190,7 +335,8 @@ export function DocumentEditor({
           </button>
           <button
             type="button"
-            className={`btn ${editor.isActive("bold") ? "active" : ""}`}
+            className={`btn ${isBold ? "active" : ""}`}
+            aria-pressed={isBold}
             disabled={readOnly}
             onClick={() => editor.chain().focus().toggleBold().run()}
           >
@@ -198,7 +344,8 @@ export function DocumentEditor({
           </button>
           <button
             type="button"
-            className={`btn ${editor.isActive("italic") ? "active" : ""}`}
+            className={`btn ${isItalic ? "active" : ""}`}
+            aria-pressed={isItalic}
             disabled={readOnly}
             onClick={() => editor.chain().focus().toggleItalic().run()}
           >
@@ -206,7 +353,8 @@ export function DocumentEditor({
           </button>
           <button
             type="button"
-            className={`btn ${editor.isActive("underline") ? "active" : ""}`}
+            className={`btn ${isUnderline ? "active" : ""}`}
+            aria-pressed={isUnderline}
             disabled={readOnly}
             onClick={() => editor.chain().focus().toggleUnderline().run()}
           >
@@ -214,7 +362,8 @@ export function DocumentEditor({
           </button>
           <button
             type="button"
-            className={`btn ${editor.isActive({ textAlign: "left" }) ? "active" : ""}`}
+            className={`btn ${isAlignLeft ? "active" : ""}`}
+            aria-pressed={isAlignLeft}
             disabled={readOnly}
             onClick={() => editor.chain().focus().setTextAlign("left").run()}
           >
@@ -222,7 +371,8 @@ export function DocumentEditor({
           </button>
           <button
             type="button"
-            className={`btn ${editor.isActive({ textAlign: "center" }) ? "active" : ""}`}
+            className={`btn ${isAlignCenter ? "active" : ""}`}
+            aria-pressed={isAlignCenter}
             disabled={readOnly}
             onClick={() => editor.chain().focus().setTextAlign("center").run()}
           >
@@ -230,7 +380,8 @@ export function DocumentEditor({
           </button>
           <button
             type="button"
-            className={`btn ${editor.isActive({ textAlign: "right" }) ? "active" : ""}`}
+            className={`btn ${isAlignRight ? "active" : ""}`}
+            aria-pressed={isAlignRight}
             disabled={readOnly}
             onClick={() => editor.chain().focus().setTextAlign("right").run()}
           >
@@ -238,7 +389,8 @@ export function DocumentEditor({
           </button>
           <button
             type="button"
-            className={`btn ${editor.isActive({ textAlign: "justify" }) ? "active" : ""}`}
+            className={`btn ${isAlignJustify ? "active" : ""}`}
+            aria-pressed={isAlignJustify}
             disabled={readOnly}
             onClick={() => editor.chain().focus().setTextAlign("justify").run()}
           >
@@ -246,7 +398,8 @@ export function DocumentEditor({
           </button>
           <button
             type="button"
-            className={`btn ${editor.isActive("bulletList") ? "active" : ""}`}
+            className={`btn ${isBulletList ? "active" : ""}`}
+            aria-pressed={isBulletList}
             disabled={readOnly}
             onClick={() => editor.chain().focus().toggleBulletList().run()}
           >
@@ -254,7 +407,8 @@ export function DocumentEditor({
           </button>
           <button
             type="button"
-            className={`btn ${editor.isActive("orderedList") ? "active" : ""}`}
+            className={`btn ${isOrderedList ? "active" : ""}`}
+            aria-pressed={isOrderedList}
             disabled={readOnly}
             onClick={() => editor.chain().focus().toggleOrderedList().run()}
           >
@@ -301,10 +455,12 @@ export function DocumentEditor({
           <span>{document.layout.footerText}</span>
           <span>
             Rev {document.revision}
-            {document.layout.showPageNumbers ? " · Page 1" : ""}
+            {document.layout.showPageNumbers ? " · Scroll View (Paginated on PDF Export)" : ""}
           </span>
         </div>
       </div>
     </div>
   );
-}
+});
+
+export const DocumentEditor = memo(DocumentEditorInner);

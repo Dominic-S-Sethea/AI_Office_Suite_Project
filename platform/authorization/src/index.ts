@@ -1,7 +1,14 @@
 import type { ActorContext, WorkspaceRole } from "@ai-office-suite/shared-contracts";
 
-export type ResourceType = "document" | "ai_assistant" | "audit" | "export";
-export type PermissionAction = "read" | "create" | "write" | "restore" | "export" | "apply_ai";
+export type ResourceType = "document" | "ai_assistant" | "audit" | "export" | "metrics" | "speech";
+export type PermissionAction =
+  | "read"
+  | "create"
+  | "write"
+  | "restore"
+  | "export"
+  | "apply_ai"
+  | "transcribe";
 
 const ROLE_PERMISSIONS: Record<WorkspaceRole, ReadonlySet<`${ResourceType}:${PermissionAction}`>> = {
   owner: new Set([
@@ -14,6 +21,8 @@ const ROLE_PERMISSIONS: Record<WorkspaceRole, ReadonlySet<`${ResourceType}:${Per
     "ai_assistant:read",
     "ai_assistant:apply_ai",
     "audit:read",
+    "metrics:read",
+    "speech:transcribe",
   ]),
   administrator: new Set([
     "document:read",
@@ -25,6 +34,8 @@ const ROLE_PERMISSIONS: Record<WorkspaceRole, ReadonlySet<`${ResourceType}:${Per
     "ai_assistant:read",
     "ai_assistant:apply_ai",
     "audit:read",
+    "metrics:read",
+    "speech:transcribe",
   ]),
   editor: new Set([
     "document:read",
@@ -36,6 +47,7 @@ const ROLE_PERMISSIONS: Record<WorkspaceRole, ReadonlySet<`${ResourceType}:${Per
     "ai_assistant:read",
     "ai_assistant:apply_ai",
     "audit:read",
+    "speech:transcribe",
   ]),
   reviewer: new Set([
     "document:read",
@@ -47,7 +59,6 @@ const ROLE_PERMISSIONS: Record<WorkspaceRole, ReadonlySet<`${ResourceType}:${Per
   viewer: new Set([
     "document:read",
     "export:read",
-    "audit:read",
   ]),
 };
 

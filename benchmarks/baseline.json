@@ -1,12 +1,12 @@
 {
-  "schemaVersion": 1,
-  "recordedAt": "2026-11-25",
+  "schemaVersion": 2,
+  "recordedAt": "2026-11-26",
   "environment": "Ubuntu 24.04 x86_64, Node v22.23.5, PostgreSQL 16.16 (Docker), DuckDB v1.4.5, Polars 0.26.2",
   "budgets": {
-    "duckdb_50k_p95_ms": 250,
-    "polars_50k_p95_ms": 250,
-    "pipeline_10k_bigint_ms": 1500,
-    "spreadsheet_5k_recalc_ms": 1000
+    "duckdb_50k_p95_ms": 130,
+    "polars_50k_p95_ms": 120,
+    "pipeline_10k_bigint_ms": 750,
+    "spreadsheet_5k_recalc_ms": 250
   },
   "observedDeepSoak": {
     "pg16_100_concurrent_reads_5_tenants": {

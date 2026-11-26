@@ -87,7 +87,7 @@ describe("Phase D2 (G2) — PostgreSQL RLS, Hardened Auth/RBAC, Concurrency & Mi
   });
 
   it("enforces fail-closed PostgreSQL RLS as app_runtime, blocks cross-tenant queries/FKs, and forbids audit tampering", async () => {
-    // 1. Login as Alpha editor via HTTP (cookie + JWT)
+    // 1. Browser login via /api/auth/login sets HttpOnly cookie and does NOT leak raw JWT in JSON body (H2)
     const loginAlpha = await fetch(`${baseUrl}/api/auth/login`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -103,7 +103,23 @@ describe("Phase D2 (G2) — PostgreSQL RLS, Hardened Auth/RBAC, Concurrency & Mi
     const setCookie = loginAlpha.headers.get("set-cookie") ?? "";
     expect(setCookie).toContain("aios_session=");
     expect(setCookie).toContain("HttpOnly");
-    const { token: alphaToken } = (await loginAlpha.json()) as { token: string };
+    const loginAlphaBody = (await loginAlpha.json()) as { token?: string; actor: { role: string } };
+    expect(loginAlphaBody.token).toBeUndefined();
+    expect(loginAlphaBody.actor.role).toBe("editor");
+
+    // Programmatic Bearer token issued via /api/auth/token
+    const tokenAlphaRes = await fetch(`${baseUrl}/api/auth/token`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        email: "editor@alpha.test",
+        password: "StrongPass!2026",
+        tenantId: TENANT_ALPHA,
+        workspaceId: WS_ALPHA,
+      }),
+    });
+    expect(tokenAlphaRes.status).toBe(200);
+    const { token: alphaToken } = (await tokenAlphaRes.json()) as { token: string };
 
     // 2. Create a document in Alpha tenant
     const createRes = await fetch(`${baseUrl}/api/documents`, {
@@ -144,7 +160,7 @@ describe("Phase D2 (G2) — PostgreSQL RLS, Hardened Auth/RBAC, Concurrency & Mi
     ).rejects.toThrow();
 
     // 5. Cross-tenant HTTP access via Beta Owner -> blocked on Alpha doc
-    const loginBeta = await fetch(`${baseUrl}/api/auth/login`, {
+    const loginBeta = await fetch(`${baseUrl}/api/auth/token`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -170,7 +186,7 @@ describe("Phase D2 (G2) — PostgreSQL RLS, Hardened Auth/RBAC, Concurrency & Mi
     expect(spoofedHeaderRes.status).toBe(403);
 
     // 6. RBAC Viewer cannot create documents
-    const loginViewer = await fetch(`${baseUrl}/api/auth/login`, {
+    const loginViewer = await fetch(`${baseUrl}/api/auth/token`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({

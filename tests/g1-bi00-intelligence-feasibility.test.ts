@@ -1,7 +1,13 @@
-import { mkdirSync, writeFileSync } from "node:fs";
+import { writeFileSync } from "node:fs";
 import path from "node:path";
-import { describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it } from "vitest";
 import type { ActorContext, DataScopePolicy } from "@ai-office-suite/shared-contracts";
+import { createTestArtifactsDir } from "./helpers/artifactsDir.ts";
+
+const artifactsHandle = createTestArtifactsDir("aios-bi-");
+afterAll(() => {
+  artifactsHandle.cleanup();
+});
 import { AuthorizationError } from "@ai-office-suite/authorization";
 import { recalculateWorkbook } from "@ai-office-suite/calculation-engine";
 import { buildCrossModuleReconciledOutputs } from "@ai-office-suite/analytics-engine";
@@ -104,8 +110,7 @@ describe("FR-07 BI-00 & Integrated X-VIS — Intelligence Studio Feasibility (BI
 
     // Render ECharts chart PNG via headless Chromium/Edge into tests/artifacts/ for direct visual inspection
     if (detectChromiumBinary()) {
-      const artifactsDir = path.resolve(process.cwd(), "tests", "artifacts");
-      mkdirSync(artifactsDir, { recursive: true });
+      const artifactsDir = artifactsHandle.dir;
       const chartShot = await renderChartSpecPngViaEdge(
         fullEval.visualResults.vis_chart_budget_vs_actual?.chartSpec!,
         path.join(artifactsDir, "bi-dashboard-revenue-chart.png"),
@@ -293,7 +298,7 @@ describe("FR-07 BI-00 & Integrated X-VIS — Intelligence Studio Feasibility (BI
     const exportedPptx = await exportPresentationToPptxBuffer(linkedDeck);
     expect(exportedPptx.disclosure.includedScopeLabel).toContain("Sales + Services");
     writeFileSync(
-      path.resolve(process.cwd(), "tests", "artifacts", "scoped-sales-services-deck.pptx"),
+      path.join(artifactsHandle.dir, "scoped-sales-services-deck.pptx"),
       exportedPptx.buffer,
     );
 
