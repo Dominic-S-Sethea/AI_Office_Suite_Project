@@ -3,6 +3,11 @@ import type {
   FinancialPrecisionPolicy,
   RoundingMode,
 } from "@ai-office-suite/shared-contracts";
+import {
+  ExactDecimalError,
+  parseExactDecimalToMinorUnits,
+  roundExactQuotient,
+} from "@ai-office-suite/validation";
 
 export class AnalyticsError extends Error {
   readonly statusCode: number;
@@ -46,72 +51,14 @@ export function parseDecimalToMinorUnits(
   maxAbs: bigint = MAX_ABS_MINOR,
   roundingMode: RoundingMode = "HALF_UP",
 ): bigint {
-  let str: string;
-  if (typeof raw === "number") {
-    if (!Number.isFinite(raw)) {
-      throw new AnalyticsError(422, "INVALID_NUMERIC_VALUE", "Non-finite number cannot be parsed for financial arithmetic.");
+  try {
+    return parseExactDecimalToMinorUnits(raw, scale, maxAbs, roundingMode);
+  } catch (err) {
+    if (err instanceof ExactDecimalError) {
+      throw new AnalyticsError(422, err.code, err.message);
     }
-    str = raw.toString();
-  } else {
-    str = raw.trim();
+    throw err;
   }
-
-  if (!/^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$/.test(str)) {
-    throw new AnalyticsError(422, "INVALID_DECIMAL_FORMAT", `Invalid decimal string '${raw}'.`);
-  }
-
-  // Normalize scientific notation into fixed decimal digits first if present
-  let sign = 1n;
-  if (str.startsWith("-")) {
-    sign = -1n;
-    str = str.slice(1);
-  } else if (str.startsWith("+")) {
-    str = str.slice(1);
-  }
-
-  const [mantissa, expPart] = str.toLowerCase().split("e");
-  const expShift = expPart !== undefined ? Number.parseInt(expPart, 10) : 0;
-  if (!Number.isSafeInteger(expShift) || Math.abs(expShift) > 100) {
-    throw new AnalyticsError(422, "NUMERIC_OVERFLOW", `Exponent in '${raw}' exceeds safe financial bounds.`);
-  }
-  const [intRaw = "0", fracRaw = ""] = (mantissa ?? "0").split(".");
-  const digits = `${intRaw}${fracRaw}`.replace(/^0+(?=\d)/, "") || "0";
-  const decimalPlacesAfterShift = fracRaw.length - expShift;
-
-  let result: bigint;
-  const targetShift = scale - decimalPlacesAfterShift;
-  if (digits === "0") {
-    return 0n;
-  }
-  if (targetShift > 36) {
-    throw new AnalyticsError(
-      422,
-      "NUMERIC_OVERFLOW",
-      `Financial amount '${raw}' exceeds overflow guard of ±${maxAbs.toString()} minor units.`,
-    );
-  }
-  if (targetShift >= 0) {
-    result = BigInt(digits) * pow10BigInt(targetShift);
-  } else {
-    const dropDigits = -targetShift;
-    if (dropDigits > digits.length + 1) {
-      result = 0n;
-    } else {
-      const divisor = pow10BigInt(dropDigits);
-      const num = BigInt(digits);
-      result = roundQuotientExact(num, divisor, roundingMode);
-    }
-  }
-
-  const signed = sign * result;
-  if (signed > maxAbs || signed < -maxAbs) {
-    throw new AnalyticsError(
-      422,
-      "NUMERIC_OVERFLOW",
-      `Financial amount '${raw}' exceeds overflow guard of ±${maxAbs.toString()} minor units.`,
-    );
-  }
-  return signed;
 }
 
 export function addMinorUnits(a: bigint, b: bigint, maxAbs: bigint = MAX_ABS_MINOR): bigint {
@@ -135,32 +82,14 @@ export function roundQuotientExact(
   denominator: bigint,
   roundingMode: RoundingMode,
 ): bigint {
-  if (denominator === 0n) {
-    throw new AnalyticsError(422, "ZERO_DENOMINATOR", "Division by zero is undefined.");
-  }
-  const sign = (numerator < 0n) !== (denominator < 0n) ? -1n : 1n;
-  const absNum = numerator < 0n ? -numerator : numerator;
-  const absDen = denominator < 0n ? -denominator : denominator;
-
-  const quot = absNum / absDen;
-  const rem = absNum % absDen;
-  const twiceRem = rem * 2n;
-
-  let roundedAbs = quot;
-  if (twiceRem > absDen) {
-    roundedAbs = quot + 1n;
-  } else if (twiceRem === absDen) {
-    if (roundingMode === "HALF_UP") {
-      // Commercial financial half-up rounds ties away from zero (for both positive and negative amounts)
-      roundedAbs = quot + 1n;
-    } else {
-      // HALF_EVEN (Banker's rounding): tie goes to nearest even integer
-      if (quot % 2n !== 0n) {
-        roundedAbs = quot + 1n;
-      }
+  try {
+    return roundExactQuotient(numerator, denominator, roundingMode);
+  } catch (err) {
+    if (err instanceof ExactDecimalError) {
+      throw new AnalyticsError(422, err.code, err.message);
     }
+    throw err;
   }
-  return sign * roundedAbs;
 }
 
 export function formatScaledBigInt(value: bigint, scale: number): string {

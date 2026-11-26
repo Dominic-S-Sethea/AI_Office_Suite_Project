@@ -1,8 +1,14 @@
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, writeFileSync } from "node:fs";
 import path from "node:path";
-import { describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it } from "vitest";
 import { zipSync, unzipSync } from "fflate";
+import { createTestArtifactsDir } from "./helpers/artifactsDir.ts";
+
+const artifactsHandle = createTestArtifactsDir("aios-presentation-");
+afterAll(() => {
+  artifactsHandle.cleanup();
+});
 import type { ActorContext, ChartSpec, LinkedMetricReference } from "@ai-office-suite/shared-contracts";
 import { AuthorizationError } from "@ai-office-suite/authorization";
 import { countPdfPages, detectChromiumBinary } from "@ai-office-suite/file-conversion";
@@ -357,8 +363,7 @@ describe("FR-06 PS-00 — Presentation Studio Feasibility, PPTX/PDF Round-Trip &
     expect(Buffer.from(zipMap["ppt/slides/slide1.xml"]!).toString("utf8")).toContain("របាយការណ៍គ្រប់គ្រងប្រចាំខែ");
 
     // Persist artifacts under tests/artifacts/ for audit & visual inspection
-    const artifactsDir = path.resolve(process.cwd(), "tests", "artifacts");
-    mkdirSync(artifactsDir, { recursive: true });
+    const artifactsDir = artifactsHandle.dir;
     writeFileSync(path.join(artifactsDir, "management-review-deck.pptx"), exported.buffer);
 
     // PPT-T05: Re-import clean exported PPTX back into StudioPresentation preserving Khmer Unicode + original SHA-256

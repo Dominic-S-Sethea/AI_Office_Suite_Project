@@ -11,7 +11,7 @@ import type {
   SpeechRecognitionRequest,
   SpeechRecognitionResult,
 } from "@ai-office-suite/shared-contracts";
-import { SpeechProviderError } from "./index.ts";
+import { SpeechProviderError } from "./errors.ts";
 
 const execFileAsync = promisify(execFile);
 

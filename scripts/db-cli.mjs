@@ -9,8 +9,8 @@ import {
   restoreLogicalBackupSnapshot,
   verifyDatabaseRlsReadiness,
 } from "../platform/database/src/index.ts";
-import { initializeIntegrationSchema } from "../engines/integration/src/index.ts";
-import { hashPassword } from "../platform/identity/src/index.ts";
+import { initializeIntegrationSchema } from "../engines/integration/src/pgPersistence.ts";
+import { hashPassword } from "../platform/identity/src/authService.ts";
 
 const ALL_TENANT_RLS_TABLES = [
   "workspaces",

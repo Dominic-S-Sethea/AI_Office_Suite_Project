@@ -6,21 +6,11 @@ import type {
   SpeechRecognitionResult,
 } from "@ai-office-suite/shared-contracts";
 import { FasterWhisperLocalAdapter } from "./fasterWhisper.ts";
+import { SpeechProviderError } from "./errors.ts";
 
+export * from "./errors.ts";
 export * from "./benchmark.ts";
 export * from "./fasterWhisper.ts";
-
-export class SpeechProviderError extends Error {
-  readonly statusCode: number;
-  readonly code: string;
-
-  constructor(statusCode: number, code: string, message: string) {
-    super(message);
-    this.name = "SpeechProviderError";
-    this.statusCode = statusCode;
-    this.code = code;
-  }
-}
 
 export interface SyntheticVoiceFixture {
   fixtureId: string;

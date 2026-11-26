@@ -9,6 +9,7 @@ import type {
   PresentationSlide,
   StudioPresentation,
 } from "@ai-office-suite/shared-contracts";
+import { escapeHtml as esc } from "@ai-office-suite/validation";
 import {
   buildSanitizedSubprocessEnv,
   countPdfPages,
@@ -22,15 +23,6 @@ import {
 } from "@ai-office-suite/file-conversion";
 
 const execFileAsync = promisify(execFile);
-
-function esc(text: string): string {
-  return text
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&#39;");
-}
 
 function safeColor(raw: unknown, fallback: string): string {
   return sanitizeCssColor(raw) ?? fallback;

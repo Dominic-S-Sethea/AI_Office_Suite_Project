@@ -1,16 +1,16 @@
 {
   "extends": "../../tsconfig.base.json",
   "compilerOptions": {
-    "outDir": "./dist",
-    "rootDir": "../..",
-    "noEmit": false,
-    "sourceMap": true
+    "noEmit": true
   },
   "include": [
     "src/**/*.ts",
     "../../packages/*/src/**/*.ts",
     "../../platform/*/src/**/*.ts",
-    "../../engines/*/src/**/*.ts",
+    "../../engines/data-processing/src/**/*.ts",
+    "../../engines/document/src/**/*.ts",
+    "../../engines/file-conversion/src/**/*.ts",
+    "../../engines/speech/src/**/*.ts",
     "../../modules/*/src/**/*.ts"
   ]
 }

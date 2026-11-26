@@ -1,6 +1,6 @@
-import { mkdirSync, writeFileSync } from "node:fs";
+import { writeFileSync } from "node:fs";
 import path from "node:path";
-import { describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it } from "vitest";
 import { zipSync, unzipSync } from "fflate";
 import {
   detectChromiumBinary,
@@ -16,6 +16,12 @@ import {
   buildFormalBilingualLetterFixture,
   buildLandscapeOperationsFixture,
 } from "./fixtures/g1-pagination-fixtures.ts";
+import { createTestArtifactsDir } from "./helpers/artifactsDir.ts";
+
+const artifactsHandle = createTestArtifactsDir("aios-docx-pdf-");
+afterAll(() => {
+  artifactsHandle.cleanup();
+});
 
 describe("D1.01, D1.03 & G1 — DOCX Round-Trip, Security Hardening, Pagination & HarfBuzz Visual Renders", () => {
   it("exports bilingual EN/KM fixture to valid OOXML DOCX with Complex Script Khmer fonts and re-imports without Khmer Unicode loss", async () => {
@@ -23,8 +29,7 @@ describe("D1.01, D1.03 & G1 — DOCX Round-Trip, Security Hardening, Pagination 
     const docxBuffer = await exportToDocxBuffer(doc);
     expect(docxBuffer.byteLength).toBeGreaterThan(3000);
 
-    const artifactsDir = path.resolve(process.cwd(), "tests", "artifacts");
-    mkdirSync(artifactsDir, { recursive: true });
+    const artifactsDir = artifactsHandle.dir;
     writeFileSync(path.join(artifactsDir, "bilingual-management-report.docx"), docxBuffer);
 
     const entries = unzipSync(docxBuffer);
@@ -122,8 +127,7 @@ describe("D1.01, D1.03 & G1 — DOCX Round-Trip, Security Hardening, Pagination 
       return;
     }
 
-    const artifactsDir = path.resolve(process.cwd(), "tests", "artifacts");
-    mkdirSync(artifactsDir, { recursive: true });
+    const artifactsDir = artifactsHandle.dir;
 
     // Multi-page management report (explicit page break -> >= 2 pages)
     const reportDoc = buildBilingualManagementReportFixture();

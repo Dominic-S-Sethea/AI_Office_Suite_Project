@@ -16,7 +16,6 @@ import { normalizeDocumentText } from "@ai-office-suite/document-engine";
 import { scanForPromptInjection } from "@ai-office-suite/validation";
 
 export const EMU_PER_INCH = 914400;
-export const PX_PER_INCH = 96;
 
 export class PresentationEngineError extends Error {
   readonly statusCode: number;
@@ -36,14 +35,6 @@ export function inchesToEmu(inches: number): number {
 
 export function emuToInches(emu: number): number {
   return Math.round((emu / EMU_PER_INCH) * 10000) / 10000;
-}
-
-export function inchesToPx(inches: number): number {
-  return Math.round(inches * PX_PER_INCH);
-}
-
-export function pxToInches(px: number): number {
-  return Math.round((px / PX_PER_INCH) * 10000) / 10000;
 }
 
 export function validateSlideGeometry(bounds: SlideGeometry, theme: PresentationTheme): void {

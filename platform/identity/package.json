@@ -4,7 +4,8 @@
   "private": true,
   "type": "module",
   "exports": {
-    ".": "./src/index.ts"
+    ".": "./src/index.ts",
+    "./express": "./src/express.ts"
   },
   "dependencies": {
     "@ai-office-suite/authorization": "*",
@@ -12,5 +13,13 @@
     "@ai-office-suite/shared-contracts": "*",
     "bcryptjs": "^3.0.3",
     "jsonwebtoken": "^9.0.3"
+  },
+  "peerDependencies": {
+    "express": "^4.21.2"
+  },
+  "peerDependenciesMeta": {
+    "express": {
+      "optional": true
+    }
   }
 }

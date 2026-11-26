@@ -12,7 +12,12 @@ import type {
   ReconciliationReport,
 } from "@ai-office-suite/shared-contracts";
 import { assertCanPerform, assertTenantWorkspaceAccess } from "@ai-office-suite/authorization";
-import { escapeSafeCsvCell, inspectAndExtractOoxmlZip, scanForPromptInjection } from "@ai-office-suite/validation";
+import {
+  escapeSafeCsvCell,
+  inspectAndExtractOoxmlZip,
+  parseExactDecimalToMinorUnits,
+  scanForPromptInjection,
+} from "@ai-office-suite/validation";
 import ExcelJS from "exceljs";
 
 const EPHEMERAL_DEV_PII_KEY = randomBytes(32).toString("hex");
@@ -323,37 +328,21 @@ export function normalizeKhmerDigitsText(raw: string, stripCurrencySymbols = fal
 
 export function parseAmountToMinorUnitsBigInt(raw: unknown, scale: number): bigint | null {
   if (raw === null || raw === undefined || raw === "") return null;
-  let str = typeof raw === "number" ? (Number.isFinite(raw) ? raw.toString() : "") : String(raw).trim();
-  if (!str) return null;
-  str = str.replace(/,/g, "");
-  // Expand scientific notation cleanly if present
-  if (/^[+-]?\d+(?:\.\d+)?[eE][+-]?\d+$/.test(str)) {
-    const num = Number(str);
-    if (!Number.isFinite(num)) return null;
-    str = num.toFixed(Math.max(0, Math.min(8, scale + 2)));
-  }
-  const match = str.match(/^([+-])?(\d+)(?:\.(\d+))?$/);
-  if (!match) return null;
-  const neg = match[1] === "-";
-  const intPart = match[2]!;
-  const fracPart = match[3] ?? "";
-
-  if (scale === 0) {
-    let units = BigInt(intPart);
-    if (fracPart.length > 0 && Number(fracPart[0]) >= 5) {
-      units += 1n;
+  if (typeof raw === "number") {
+    if (!Number.isFinite(raw)) return null;
+    try {
+      return parseExactDecimalToMinorUnits(raw, scale);
+    } catch {
+      return null;
     }
-    return neg ? -units : units;
   }
-
-  const paddedFrac = fracPart.padEnd(scale + 1, "0");
-  const keptFrac = paddedFrac.slice(0, scale);
-  const roundDigit = Number(paddedFrac[scale] ?? "0");
-  let units = BigInt(intPart) * 10n ** BigInt(scale) + BigInt(keptFrac);
-  if (roundDigit >= 5) {
-    units += 1n;
+  const cleaned = String(raw).trim().replace(/,/g, "");
+  if (!cleaned) return null;
+  try {
+    return parseExactDecimalToMinorUnits(cleaned, scale);
+  } catch {
+    return null;
   }
-  return neg ? -units : units;
 }
 
 function minorUnitsToNumber(minor: bigint, scale: number): number {

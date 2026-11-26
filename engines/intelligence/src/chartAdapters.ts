@@ -6,7 +6,7 @@ import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import * as echarts from "echarts";
 import type { ChartSpec } from "@ai-office-suite/shared-contracts";
-import { validateChartSpecSafety } from "@ai-office-suite/validation";
+import { escapeHtml, validateChartSpecSafety } from "@ai-office-suite/validation";
 import {
   buildSanitizedSubprocessEnv,
   detectChromiumBinary,
@@ -28,15 +28,6 @@ export class ChartAdapterError extends Error {
     this.statusCode = statusCode;
     this.code = code;
   }
-}
-
-function escapeHtml(text: string): string {
-  return text
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&#39;");
 }
 
 export function compileChartSpecToEChartsOption(

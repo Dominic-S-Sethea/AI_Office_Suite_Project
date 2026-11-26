@@ -11,6 +11,7 @@ apps/web/dist/
 *.wav
 *.mp3
 coverage/
-tests/artifacts/*.pdf
-tests/artifacts/*.docx
-!.gitkeep
+__pycache__/
+*.pyc
+tests/artifacts/*
+!tests/artifacts/.gitkeep
