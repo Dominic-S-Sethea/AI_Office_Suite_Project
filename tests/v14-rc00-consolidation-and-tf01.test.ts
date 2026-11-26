@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
@@ -651,6 +651,55 @@ describe("V1.4 TF-01 — RC-T01..RC-T08 Consolidation, RC-P1-01..05 Gates & Miss
     // Every single one of the 51 parents has at least one linked test in Section 2
     const coveredParents = new Set(testRows.map((r) => r.parentId));
     expect(coveredParents.size).toBe(51);
+
+    // Stage 1-3 Integrity Guard: EVERY backticked repo file path referenced in RTM & TECHNICAL_FEASIBILITY_PLAN MUST exist on disk!
+    const tfPlanPath = path.resolve(process.cwd(), "documentation/TECHNICAL_FEASIBILITY_PLAN.md");
+    const tfPlanContent = readFileSync(tfPlanPath, "utf8");
+    const regPath = path.resolve(process.cwd(), "documentation/REQUIREMENTS_REGISTER.md");
+    const regContent = readFileSync(regPath, "utf8");
+
+    const filePathRegex =
+      /`((?:tests|scripts|documentation|apps|engines|modules|platform|packages|\.github)\/[A-Za-z0-9._\-\/]+\.(?:ts|tsx|js|mjs|cjs|json|md|sql|yml|yaml|sh))`/g;
+    for (const [docName, docText] of [
+      ["REQUIREMENTS_TRACEABILITY_MATRIX.md", content],
+      ["TECHNICAL_FEASIBILITY_PLAN.md", tfPlanContent],
+    ] as const) {
+      const missingPaths: string[] = [];
+      for (const m of docText.matchAll(filePathRegex)) {
+        const relPath = m[1]!;
+        if (!existsSync(path.resolve(process.cwd(), relPath))) {
+          missingPaths.push(`${docName} -> ${relPath}`);
+        }
+      }
+      expect(missingPaths).toEqual([]);
+    }
+
+    // Verify TECHNICAL_FEASIBILITY_PLAN.md aligns TF-01..TF-12 1:1 with V1.4 §22 canonical topics
+    const canonicalTfTopics: Array<[string, string]> = [
+      ["TF-01", "Repository and technical feasibility baseline"],
+      ["TF-02", "Document editing, pagination and conversion"],
+      ["TF-03", "Spreadsheet editor, formula engine and interoperability"],
+      ["TF-04", "Data preparation and analytical precision"],
+      ["TF-05", "Presentation authoring and export"],
+      ["TF-06", "Business intelligence and visualization"],
+      ["TF-07", "Shared platform, identity, storage and jobs"],
+      ["TF-08", "AI model adapters and agent execution"],
+      ["TF-09", "Voice EN/KM, STT/TTS and local/cloud evaluation"],
+      ["TF-10", "Integrated cross-module feasibility"],
+      ["TF-11", "NFR and operational economics"],
+      ["TF-12", "Technical decision consolidation"],
+    ];
+    for (const [tfId, topic] of canonicalTfTopics) {
+      expect(tfPlanContent).toContain(`| **${tfId}** | ${topic} |`);
+    }
+
+    // Verify all 7 canonical V1.4 §23.2 APPROVAL gates & all 8 Change Records CR-001..CR-008 are present
+    for (let i = 1; i <= 7; i++) {
+      expect(tfPlanContent).toContain(`| **APPROVAL-0${i}** |`);
+    }
+    for (let i = 1; i <= 8; i++) {
+      expect(regContent).toContain(`| CR-00${i} |`);
+    }
   });
 
   it("RC-T08 (FR-12/FR-13): release evidence gate blocks release on missing fixture, stale approval, or mock-only evidence for real gate", () => {
