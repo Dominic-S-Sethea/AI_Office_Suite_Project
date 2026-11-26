@@ -11,6 +11,10 @@ import { SpeechProviderError } from "./errors.ts";
 export * from "./errors.ts";
 export * from "./benchmark.ts";
 export * from "./fasterWhisper.ts";
+export * from "./criticalFields.ts";
+export * from "./terminology.ts";
+export * from "./voiceSession.ts";
+export * from "./voiceGovernance.ts";
 
 export interface SyntheticVoiceFixture {
   fixtureId: string;

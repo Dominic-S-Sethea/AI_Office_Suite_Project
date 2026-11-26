@@ -4,3 +4,4 @@ export * from "./spreadsheetsAndData.ts";
 export * from "./analytics.ts";
 export * from "./presentationAndBi.ts";
 export * from "./integration.ts";
+export * from "./governance.ts";

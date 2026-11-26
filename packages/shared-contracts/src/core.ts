@@ -1,6 +1,9 @@
 export type WorkspaceRole =
   | "owner"
   | "administrator"
+  | "workspace_manager"
+  | "billing_admin"
+  | "auditor"
   | "editor"
   | "reviewer"
   | "viewer";
@@ -10,6 +13,12 @@ export interface ActorContext {
   workspaceId: string;
   userId: string;
   role: WorkspaceRole;
+  /** Optional explicit workspace content grant for restricted workspaces (PA-00 / PLT-02). */
+  workspaceContentGrant?: boolean;
+  /** Optional ISO timestamp of latest MFA step-up verification for privileged actions. */
+  mfaVerifiedAt?: string;
+  /** Optional allowed department scopes for row/knowledge ACL filtering. */
+  departmentScopes?: string[] | "ALL";
 }
 
 

@@ -199,3 +199,5 @@ export class InMemoryStorageAdapter implements DocumentStorageAdapter {
     return docs.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
   }
 }
+
+export * from "./objectStore.ts";
