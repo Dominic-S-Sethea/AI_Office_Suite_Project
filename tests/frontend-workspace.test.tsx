@@ -672,6 +672,43 @@ describe("Wave 1 Frontend & Tiptap Codec Verification (C8 & C9)", () => {
             { status: 200 },
           );
         }
+        if (url.includes("/versions")) {
+          return new Response(
+            JSON.stringify({
+              versions: [
+                {
+                  versionId: "ver_1",
+                  documentId: sampleBilingualDoc.documentId,
+                  revision: 1,
+                  source: "seed",
+                  summary: "Seeded bilingual fixture",
+                  actorId: "user_editor",
+                  createdAt: "2026-11-26T02:16:43Z",
+                },
+              ],
+            }),
+            { status: 200 },
+          );
+        }
+        if (url.includes("/audit")) {
+          return new Response(
+            JSON.stringify({
+              events: [
+                {
+                  auditId: "aud_1",
+                  action: "document.seed_bilingual",
+                  outcome: "success",
+                  summary: "Seeded fixture",
+                  actorId: "user_editor",
+                  actorRole: "editor",
+                  source: "manual",
+                  createdAt: "2026-11-26T02:16:43Z",
+                },
+              ],
+            }),
+            { status: 200 },
+          );
+        }
         return new Response(JSON.stringify({}), { status: 200 });
       }),
     );
@@ -708,13 +745,20 @@ describe("Wave 1 Frontend & Tiptap Codec Verification (C8 & C9)", () => {
     expect(dataHeader.getAttribute("aria-expanded")).toBe("true");
     expect(screen.getByRole("menu", { name: "Data & Analytics sub-headers" })).toBeTruthy();
 
-    // Escape closes the open vertical accordion
+    // Escape closes the open vertical accordion when no modal is open
     fireEvent.keyDown(window, { key: "Escape" });
     expect(dataHeader.getAttribute("aria-expanded")).toBe("false");
     expect(screen.queryByRole("menu", { name: "Data & Analytics sub-headers" })).toBeNull();
 
-    // 3. Open Data & Analytics -> Stage & Profile sub-header -> keeps section open & runs live profile endpoint inside Center Workspace
+    // 3. Exclusive sub-header active states: Certified Metrics does not mark DuckDB 1M Spill active
     fireEvent.click(dataHeader);
+    const certBtn = screen.getByRole("menuitem", { name: /Certified Metrics/ });
+    const duckBtn = screen.getByRole("menuitem", { name: /DuckDB 1M Spill/ });
+    fireEvent.click(certBtn);
+    expect(certBtn.className).toContain("is-active");
+    expect(duckBtn.className).not.toContain("is-active");
+
+    // Open Stage & Profile -> keeps section open & runs live profile endpoint inside Center Workspace
     fireEvent.click(screen.getByRole("menuitem", { name: /Stage & Profile/ }));
     expect(dataHeader.getAttribute("aria-expanded")).toBe("true");
     await waitFor(() => {
@@ -725,7 +769,22 @@ describe("Wave 1 Frontend & Tiptap Codec Verification (C8 & C9)", () => {
       expect(screen.getByText(/ds_workspace_preview/)).toBeTruthy();
     });
 
-    // 4. Center Workspace contains the integrated AI & Voice Assistant Dock (starts compact, expands on click)
+    // 4. Versions & Audit -> Audit Trail opens cleanly, Escape closes drawer first without sticking or collapsing sidebar
+    const versionsHeader = screen.getByRole("menuitem", { name: /Versions & Audit/ });
+    fireEvent.click(versionsHeader);
+    const auditBtn = screen.getByRole("menuitem", { name: /Audit Trail/ });
+    fireEvent.click(auditBtn);
+    await waitFor(() => {
+      expect(screen.getByRole("dialog", { name: "Version & Audit History" })).toBeTruthy();
+    });
+    fireEvent.keyDown(window, { key: "Escape" });
+    await waitFor(() => {
+      expect(screen.queryByRole("dialog", { name: "Version & Audit History" })).toBeNull();
+    });
+    // Left accordion stays open after Escape dismissed only the modal
+    expect(versionsHeader.getAttribute("aria-expanded")).toBe("true");
+
+    // 5. Center Workspace contains the integrated AI & Voice Assistant Dock (starts compact, expands on click)
     const workspaceMain = screen.getByRole("main", { name: "Center Workspace" });
     await waitFor(() => {
       expect(workspaceMain.querySelector('[aria-label="AI and Voice Assistant"]')).toBeTruthy();

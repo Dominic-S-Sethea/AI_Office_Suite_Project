@@ -28,7 +28,7 @@ import { AiVoicePanel } from "./components/AiVoicePanel.tsx";
 import { ErrorBoundary } from "./components/ErrorBoundary.tsx";
 import { LeftNavRail, type FixedHeaderId, type NavFixedHeaderGroup } from "./components/LeftNavRail.tsx";
 import { NewDocumentModal } from "./components/NewDocumentModal.tsx";
-import type { RevisionDiffPayload } from "./components/VersionAuditDrawer.tsx";
+import type { HistorySectionTab, RevisionDiffPayload } from "./components/VersionAuditDrawer.tsx";
 import { WorkspaceSubPanel, type WorkspaceUtilityPanelId } from "./components/WorkspaceSubPanel.tsx";
 import {
   arrayBufferToBase64,
@@ -66,6 +66,17 @@ export function App() {
   const [openFixedHeader, setOpenFixedHeader] = useState<FixedHeaderId | null>(null);
   const [docsDrawerOpen, setDocsDrawerOpen] = useState(true);
   const [activeSubPanel, setActiveSubPanel] = useState<WorkspaceUtilityPanelId>(null);
+  const scrollStageRef = useRef<HTMLDivElement | null>(null);
+
+  const toggleSubPanel = useCallback((panel: Exclude<WorkspaceUtilityPanelId, null>) => {
+    setActiveSubPanel((prev) => {
+      const next = prev === panel ? null : panel;
+      if (next && scrollStageRef.current && typeof scrollStageRef.current.scrollTo === "function") {
+        scrollStageRef.current.scrollTo({ top: 0, behavior: "smooth" });
+      }
+      return next;
+    });
+  }, []);
 
   // jwt-pg sign-in form state
   const [loginEmail, setLoginEmail] = useState("");
@@ -106,6 +117,7 @@ export function App() {
 
   // Version & audit drawer
   const [historyOpen, setHistoryOpen] = useState(false);
+  const [historySection, setHistorySection] = useState<HistorySectionTab>("all");
   const [versions, setVersions] = useState<DocumentVersion[]>([]);
   const [auditEvents, setAuditEvents] = useState<AuditEvent[]>([]);
 
@@ -683,7 +695,7 @@ export function App() {
     }
   }
 
-  async function openHistory() {
+  async function openHistory(section: HistorySectionTab = "all") {
     if (!activeDoc) return;
     historyAbortRef.current?.abort();
     const controller = new AbortController();
@@ -691,6 +703,7 @@ export function App() {
     const seq = ++historySeqRef.current;
 
     setErrorBanner(null);
+    setHistorySection(section);
     setHistoryOpen(true);
     setIsLoadingHistory(true);
     try {
@@ -941,11 +954,11 @@ export function App() {
         {
           id: "page_size",
           label: `Page Size (${effectiveActiveDoc?.layout.size ?? "A4"})`,
-          active: activeSubPanel === "page_layout",
+          active: activeSubPanel === "page_size",
           disabled: !activeDoc,
           onSelect: () => {
             setActiveStudio("documents");
-            setActiveSubPanel((prev) => (prev === "page_layout" ? null : "page_layout"));
+            toggleSubPanel("page_size");
           },
         },
         {
@@ -964,18 +977,18 @@ export function App() {
         {
           id: "khmer_fonts",
           label: "Khmer Fonts & Headers",
-          active: activeSubPanel === "page_layout",
+          active: activeSubPanel === "page_fonts",
           disabled: !activeDoc,
           onSelect: () => {
             setActiveStudio("documents");
-            setActiveSubPanel("page_layout");
+            toggleSubPanel("page_fonts");
           },
         },
         {
           id: "linked_metrics",
           label: "Linked Metrics",
-          active: activeSubPanel === "certified_metrics",
-          onSelect: () => setActiveSubPanel((prev) => (prev === "certified_metrics" ? null : "certified_metrics")),
+          active: activeSubPanel === "linked_metrics",
+          onSelect: () => toggleSubPanel("linked_metrics"),
         },
       ],
     },
@@ -989,21 +1002,21 @@ export function App() {
           label: "Stage & Profile",
           badge: "API",
           active: activeSubPanel === "data_prep",
-          onSelect: () => setActiveSubPanel((prev) => (prev === "data_prep" ? null : "data_prep")),
+          onSelect: () => toggleSubPanel("data_prep"),
         },
         {
           id: "certified_metrics",
           label: "Certified Metrics",
           badge: "FIN-POL-V1",
           active: activeSubPanel === "certified_metrics",
-          onSelect: () => setActiveSubPanel((prev) => (prev === "certified_metrics" ? null : "certified_metrics")),
+          onSelect: () => toggleSubPanel("certified_metrics"),
         },
         {
           id: "duckdb_spill",
           label: "DuckDB 1M Spill",
           badge: "TF-04",
-          active: activeSubPanel === "certified_metrics",
-          onSelect: () => setActiveSubPanel("certified_metrics"),
+          active: activeSubPanel === "duckdb_spill",
+          onSelect: () => toggleSubPanel("duckdb_spill"),
         },
       ],
     },
@@ -1015,21 +1028,21 @@ export function App() {
         {
           id: "linked_objects",
           label: "Linked Objects",
-          active: activeSubPanel === "workflows",
-          onSelect: () => setActiveSubPanel((prev) => (prev === "workflows" ? null : "workflows")),
+          active: activeSubPanel === "workflow_links",
+          onSelect: () => toggleSubPanel("workflow_links"),
         },
         {
           id: "reporting_packages",
           label: "Reporting Packages",
           badge: "XI-00",
-          active: activeSubPanel === "workflows",
-          onSelect: () => setActiveSubPanel("workflows"),
+          active: activeSubPanel === "workflow_packages",
+          onSelect: () => toggleSubPanel("workflow_packages"),
         },
         {
           id: "outbox_status",
           label: "Publication Outbox",
-          active: activeSubPanel === "workflows",
-          onSelect: () => setActiveSubPanel("workflows"),
+          active: activeSubPanel === "workflow_outbox",
+          onSelect: () => toggleSubPanel("workflow_outbox"),
         },
       ],
     },
@@ -1042,26 +1055,28 @@ export function App() {
           id: "version_history",
           label: "Version History",
           disabled: !activeDoc,
-          active: historyOpen,
-          onSelect: () => void openHistory(),
+          active: historyOpen && (historySection === "versions" || historySection === "all"),
+          onSelect: () => void openHistory("versions"),
         },
         {
           id: "revision_diff",
           label: "Revision Diff",
           disabled: !activeDoc,
-          onSelect: () => void openHistory(),
+          active: historyOpen && historySection === "diff",
+          onSelect: () => void openHistory("diff"),
         },
         {
           id: "audit_trail",
           label: "Audit Trail",
           disabled: !activeDoc,
-          onSelect: () => void openHistory(),
+          active: historyOpen && historySection === "audit",
+          onSelect: () => void openHistory("audit"),
         },
         {
           id: "backup_restore",
           label: "Backup & Restore",
-          active: activeSubPanel === "admin_policies",
-          onSelect: () => setActiveSubPanel("admin_policies"),
+          active: activeSubPanel === "backup_restore",
+          onSelect: () => toggleSubPanel("backup_restore"),
         },
       ],
     },
@@ -1074,27 +1089,27 @@ export function App() {
           id: "role_rbac",
           label: `Role & RBAC (${effectiveRole})`,
           active: activeSubPanel === "admin_rbac",
-          onSelect: () => setActiveSubPanel((prev) => (prev === "admin_rbac" ? null : "admin_rbac")),
+          onSelect: () => toggleSubPanel("admin_rbac"),
         },
         {
           id: "ai_voice_policy",
           label: "AI & Voice Policy",
           badge: "423",
           active: activeSubPanel === "admin_policies",
-          onSelect: () => setActiveSubPanel((prev) => (prev === "admin_policies" ? null : "admin_policies")),
+          onSelect: () => toggleSubPanel("admin_policies"),
         },
         {
           id: "quotas_jobs",
           label: "Quotas & Jobs",
           badge: "PA-00",
-          active: activeSubPanel === "admin_policies",
-          onSelect: () => setActiveSubPanel("admin_policies"),
+          active: activeSubPanel === "admin_quotas",
+          onSelect: () => toggleSubPanel("admin_quotas"),
         },
         {
           id: "session_health",
           label: "Session & Health",
           active: activeSubPanel === "admin_health",
-          onSelect: () => setActiveSubPanel((prev) => (prev === "admin_health" ? null : "admin_health")),
+          onSelect: () => toggleSubPanel("admin_health"),
         },
       ],
     },
@@ -1143,7 +1158,10 @@ export function App() {
             type="button"
             className="badge topbar-role-pill"
             title="Open Role & RBAC controls in Governance"
-            onClick={() => setActiveSubPanel((prev) => (prev === "admin_rbac" ? null : "admin_rbac"))}
+            onClick={() => {
+              setOpenFixedHeader("admin");
+              toggleSubPanel("admin_rbac");
+            }}
           >
             Role: {effectiveRole}
           </button>
@@ -1385,7 +1403,7 @@ export function App() {
 
           {/* Zone 3: Center Workspace (Studio Canvas + Contextual Sub-Panels + Integrated AI & Voice Dock) */}
           <main className="center-workspace" aria-label="Center Workspace">
-            <div className="workspace-scroll-stage">
+            <div ref={scrollStageRef} className="workspace-scroll-stage">
               <WorkspaceSubPanel
                 panelId={activeSubPanel}
                 onClose={() => setActiveSubPanel(null)}
@@ -1537,8 +1555,22 @@ export function App() {
       {historyOpen && (
         <Suspense
           fallback={
-            <div className="drawer-backdrop" role="dialog" aria-modal="true" aria-label="Loading history drawer">
+            <div
+              className="drawer-backdrop"
+              role="dialog"
+              aria-modal="true"
+              aria-label="Loading history drawer"
+              onClick={(e) => {
+                if (e.target === e.currentTarget) handleCloseHistory();
+              }}
+            >
               <div className="drawer-panel">
+                <div className="panel-header-row">
+                  <strong className="modal-title">Version &amp; Audit History</strong>
+                  <button type="button" className="btn" onClick={handleCloseHistory}>
+                    Close
+                  </button>
+                </div>
                 <div className="preview-card" role="status">
                   Loading version &amp; audit drawer...
                 </div>
@@ -1550,6 +1582,7 @@ export function App() {
             versions={versions}
             auditEvents={auditEvents}
             currentRevision={activeDoc?.revision}
+            initialSection={historySection}
             readOnly={readOnly}
             isLoading={isLoadingHistory}
             restoringRevision={restoringRevision}

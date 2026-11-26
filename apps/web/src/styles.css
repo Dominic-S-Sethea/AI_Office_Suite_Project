@@ -923,6 +923,7 @@ textarea {
   z-index: 25;
   overflow-y: auto;
   overflow-x: hidden;
+  scrollbar-gutter: stable;
 }
 
 .left-rail-heading {
@@ -983,10 +984,10 @@ textarea {
 }
 
 .fixed-header-btn:active {
-  transform: scale(0.98);
+  transform: scale(0.985);
 }
 
-.fixed-header-btn.has-active {
+.fixed-header-btn.has-active:not(.is-open) {
   color: #f8fafc;
   background: rgba(37, 99, 235, 0.16);
   border-color: rgba(59, 130, 246, 0.32);
@@ -996,7 +997,7 @@ textarea {
   background: linear-gradient(135deg, #2563eb 0%, #1d4ed8 100%);
   color: #ffffff;
   border-color: rgba(147, 197, 253, 0.35);
-  box-shadow: 0 6px 18px rgba(29, 78, 216, 0.34);
+  box-shadow: 0 4px 14px rgba(29, 78, 216, 0.3);
 }
 
 .fixed-header-btn:focus-visible,
@@ -1142,6 +1143,23 @@ textarea {
     opacity 220ms ease 40ms;
 }
 
+/* Staggered cascade lives ONLY on the wrapper row so button hover/leave is always 0ms-delay & snappy */
+.vertical-subheader-row {
+  opacity: 0;
+  transform: translateY(-7px);
+  transition:
+    opacity 150ms ease,
+    transform 170ms ease;
+}
+
+.vertical-dropdown-wrap.is-open .vertical-subheader-row {
+  opacity: 1;
+  transform: translateY(0);
+  transition:
+    opacity 240ms cubic-bezier(0.22, 1, 0.36, 1) calc(40ms + var(--item-index, 0) * 30ms),
+    transform 270ms cubic-bezier(0.22, 1, 0.36, 1) calc(40ms + var(--item-index, 0) * 30ms);
+}
+
 .vertical-subheader-btn {
   width: 100%;
   display: flex;
@@ -1156,38 +1174,22 @@ textarea {
   font-weight: 500;
   text-align: left;
   cursor: pointer;
-  opacity: 0;
-  transform: translateY(-8px) scale(0.98);
   transition:
-    opacity 150ms ease,
-    transform 170ms ease,
     background 140ms ease,
     color 140ms ease,
-    border-color 140ms ease;
+    border-color 140ms ease,
+    transform 130ms cubic-bezier(0.22, 1, 0.36, 1);
 }
 
-.vertical-dropdown-wrap.is-open .vertical-subheader-btn {
-  opacity: 1;
-  transform: translateY(0) scale(1);
-  transition:
-    opacity 240ms cubic-bezier(0.22, 1, 0.36, 1) calc(45ms + var(--item-index, 0) * 32ms),
-    transform 280ms cubic-bezier(0.22, 1, 0.36, 1) calc(45ms + var(--item-index, 0) * 32ms),
-    background 140ms ease,
-    color 140ms ease,
-    border-color 140ms ease;
-}
-
-.vertical-dropdown-wrap.is-open .vertical-subheader-btn:hover:not(:disabled) {
+.vertical-subheader-btn:hover:not(:disabled) {
   background: rgba(59, 130, 246, 0.16);
   color: #ffffff;
   border-color: rgba(96, 165, 250, 0.25);
   transform: translateX(3px);
-  transition-delay: 0ms;
 }
 
-.vertical-dropdown-wrap.is-open .vertical-subheader-btn:active:not(:disabled) {
+.vertical-subheader-btn:active:not(:disabled) {
   transform: translateX(2px) scale(0.985);
-  transition-delay: 0ms;
 }
 
 .vertical-subheader-btn.is-active {
@@ -1198,12 +1200,8 @@ textarea {
 }
 
 .vertical-subheader-btn:disabled {
-  opacity: 0.4;
-  cursor: not-allowed;
-}
-
-.vertical-dropdown-wrap.is-open .vertical-subheader-btn:disabled {
   opacity: 0.42;
+  cursor: not-allowed;
 }
 
 .vertical-subheader-dot {
@@ -1342,6 +1340,14 @@ textarea {
   padding: 18px;
 }
 
+.drawer-tab-bar {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+  padding-bottom: 10px;
+  border-bottom: 1px solid #e2e8f0;
+}
+
 /* Integrated AI & Voice Assistant Dock inside the Center Workspace */
 .ai-workspace-dock {
   background: var(--surface);
@@ -1350,6 +1356,8 @@ textarea {
   display: flex;
   flex-direction: column;
   gap: 8px;
+  max-height: 48vh;
+  overflow-y: auto;
   box-shadow: 0 -4px 18px rgba(15, 23, 42, 0.06);
 }
 
@@ -1408,6 +1416,7 @@ textarea {
   .fixed-header-chevron,
   .vertical-dropdown-wrap,
   .vertical-subheaders-list::before,
+  .vertical-subheader-row,
   .vertical-subheader-btn,
   .vertical-subheader-dot,
   .workspace-subpanel {

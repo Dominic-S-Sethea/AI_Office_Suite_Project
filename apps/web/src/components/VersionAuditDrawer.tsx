@@ -27,10 +27,13 @@ export interface RevisionDiffPayload {
   }>;
 }
 
+export type HistorySectionTab = "all" | "versions" | "diff" | "audit";
+
 interface VersionAuditDrawerProps {
   versions: DocumentVersion[];
   auditEvents: AuditEvent[];
   currentRevision?: number;
+  initialSection?: HistorySectionTab;
   readOnly: boolean;
   isLoading?: boolean;
   restoringRevision?: number | null;
@@ -43,6 +46,7 @@ function VersionAuditDrawerInner({
   versions,
   auditEvents,
   currentRevision,
+  initialSection = "all",
   readOnly,
   isLoading = false,
   restoringRevision = null,
@@ -50,11 +54,16 @@ function VersionAuditDrawerInner({
   onCompareRevision,
   onClose,
 }: VersionAuditDrawerProps) {
+  const [activeTab, setActiveTab] = useState<HistorySectionTab>(initialSection);
   const [diffResult, setDiffResult] = useState<RevisionDiffPayload | null>(null);
   const [diffLoadingRev, setDiffLoadingRev] = useState<number | null>(null);
   const drawerRef = useRef<HTMLDivElement | null>(null);
   const closeBtnRef = useRef<HTMLButtonElement | null>(null);
   const compareSeqRef = useRef(0);
+
+  useEffect(() => {
+    setActiveTab(initialSection);
+  }, [initialSection]);
 
   useEffect(() => {
     const previouslyFocused = document.activeElement instanceof HTMLElement ? document.activeElement : null;
@@ -71,7 +80,9 @@ function VersionAuditDrawerInner({
     window.addEventListener("keydown", onKeyDown);
     return () => {
       window.removeEventListener("keydown", onKeyDown);
-      previouslyFocused?.focus();
+      if (previouslyFocused && document.contains(previouslyFocused) && previouslyFocused.tabIndex >= 0) {
+        previouslyFocused.focus();
+      }
     };
   }, [onClose]);
 
@@ -90,6 +101,9 @@ function VersionAuditDrawerInner({
       }
     }
   }
+
+  const showVersions = activeTab === "all" || activeTab === "versions" || activeTab === "diff";
+  const showAudit = activeTab === "all" || activeTab === "audit";
 
   return (
     <div
@@ -110,6 +124,36 @@ function VersionAuditDrawerInner({
             Close
           </button>
         </div>
+
+        <div className="drawer-tab-bar" role="tablist" aria-label="History view filter">
+          {(
+            [
+              ["all", "All"],
+              ["versions", "Versions"],
+              ["diff", "Revision Diff"],
+              ["audit", "Audit Trail"],
+            ] as const
+          ).map(([tabId, label]) => (
+            <button
+              key={tabId}
+              type="button"
+              role="tab"
+              aria-selected={activeTab === tabId}
+              className={`btn btn-compact ${activeTab === tabId ? "active" : ""}`}
+              onClick={() => setActiveTab(tabId)}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+
+        {activeTab === "diff" && !diffResult && !isLoading && (
+          <div className="preview-card muted-text">
+            {versions.length < 2
+              ? "Save a second revision to compare changes between revisions."
+              : "Click Diff on any prior revision below to inspect block-level English/Khmer changes."}
+          </div>
+        )}
 
         {diffResult && (
           <section className="diff-card" aria-label="Revision Diff Summary">
@@ -159,7 +203,8 @@ function VersionAuditDrawerInner({
           </div>
         ) : (
           <>
-            <section>
+            {showVersions && (
+              <section>
               <h3 className="drawer-section-heading">Immutable Versions ({versions.length})</h3>
               {versions.length === 0 ? (
                 <div className="preview-card muted-text">
@@ -211,39 +256,42 @@ function VersionAuditDrawerInner({
                   })}
                 </div>
               )}
-            </section>
+              </section>
+            )}
 
-            <section>
-              <h3 className="drawer-section-heading">Append-Only Audit Log ({auditEvents.length})</h3>
-              {auditEvents.length === 0 ? (
-                <div className="preview-card muted-text">
-                  No audit events recorded for this document yet.
-                </div>
-              ) : (
-                <div className="stack-sm">
-                  {auditEvents.map((ev) => {
-                    const badgeClass =
-                      ev.outcome === "success"
-                        ? "badge badge-ok"
-                        : ev.outcome === "denied"
-                          ? "badge badge-danger"
-                          : "badge badge-warn";
-                    return (
-                      <div key={ev.auditId} className="preview-card">
-                        <div className="panel-header-row">
-                          <strong>{ev.action}</strong>
-                          <span className={badgeClass}>{ev.outcome}</span>
+            {showAudit && (
+              <section>
+                <h3 className="drawer-section-heading">Append-Only Audit Log ({auditEvents.length})</h3>
+                {auditEvents.length === 0 ? (
+                  <div className="preview-card muted-text">
+                    No audit events recorded for this document yet.
+                  </div>
+                ) : (
+                  <div className="stack-sm">
+                    {auditEvents.map((ev) => {
+                      const badgeClass =
+                        ev.outcome === "success"
+                          ? "badge badge-ok"
+                          : ev.outcome === "denied"
+                            ? "badge badge-danger"
+                            : "badge badge-warn";
+                      return (
+                        <div key={ev.auditId} className="preview-card">
+                          <div className="panel-header-row">
+                            <strong>{ev.action}</strong>
+                            <span className={badgeClass}>{ev.outcome}</span>
+                          </div>
+                          <div>{ev.summary}</div>
+                          <div className="meta-caption">
+                            {ev.actorId} ({ev.actorRole}) · {ev.source} · {new Date(ev.createdAt).toLocaleTimeString()}
+                          </div>
                         </div>
-                        <div>{ev.summary}</div>
-                        <div className="meta-caption">
-                          {ev.actorId} ({ev.actorRole}) · {ev.source} · {new Date(ev.createdAt).toLocaleTimeString()}
-                        </div>
-                      </div>
-                    );
-                  })}
-                </div>
-              )}
-            </section>
+                      );
+                    })}
+                  </div>
+                )}
+              </section>
+            )}
           </>
         )}
       </div>

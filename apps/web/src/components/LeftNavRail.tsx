@@ -91,6 +91,10 @@ function LeftNavRailInner({ groups, openHeaderId, onToggleHeader }: LeftNavRailP
 
     function handleKeyDown(e: KeyboardEvent) {
       if (e.key === "Escape") {
+        // Let active modal dialogs / drawers handle Escape first so focus restoration isn't corrupted
+        if (e.defaultPrevented || document.querySelector('[aria-modal="true"]')) {
+          return;
+        }
         e.preventDefault();
         onToggleHeader(null);
       }
@@ -158,21 +162,26 @@ function LeftNavRailInner({ groups, openHeaderId, onToggleHeader }: LeftNavRailP
                 <div className="vertical-dropdown-inner">
                   <div className="vertical-subheaders-list">
                     {group.subHeaders.map((sub, idx) => (
-                      <button
+                      <div
                         key={sub.id}
-                        type="button"
-                        role="menuitem"
-                        tabIndex={isOpen ? 0 : -1}
-                        disabled={sub.disabled}
-                        title={sub.title}
+                        className="vertical-subheader-row"
                         style={{ "--item-index": idx } as CSSProperties}
-                        className={`vertical-subheader-btn ${sub.active ? "is-active" : ""}`}
-                        onClick={() => sub.onSelect()}
+                        role="none"
                       >
-                        <span className="vertical-subheader-dot" aria-hidden="true" />
-                        <span className="vertical-subheader-label">{sub.label}</span>
-                        {sub.badge && <span className="subheader-badge">{sub.badge}</span>}
-                      </button>
+                        <button
+                          type="button"
+                          role="menuitem"
+                          tabIndex={isOpen ? 0 : -1}
+                          disabled={sub.disabled}
+                          title={sub.title}
+                          className={`vertical-subheader-btn ${sub.active ? "is-active" : ""}`}
+                          onClick={() => sub.onSelect()}
+                        >
+                          <span className="vertical-subheader-dot" aria-hidden="true" />
+                          <span className="vertical-subheader-label">{sub.label}</span>
+                          {sub.badge && <span className="subheader-badge">{sub.badge}</span>}
+                        </button>
+                      </div>
                     ))}
                   </div>
                 </div>
