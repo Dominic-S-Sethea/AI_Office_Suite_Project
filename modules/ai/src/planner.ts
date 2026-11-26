@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import type {
   ActorContext,
   DocumentOperationProposal,
@@ -18,7 +18,55 @@ import {
   khmerNumeralsToArabic,
   normalizeDocumentText,
   previewDocumentOperation,
+  snapRangeToGraphemeBoundaries,
 } from "@ai-office-suite/document-engine";
+
+const EPHEMERAL_PROPOSAL_HMAC_KEY = randomBytes(32).toString("hex");
+
+function resolveProposalHmacKey(): string {
+  const configured = process.env.PROPOSAL_SIGNING_KEY?.trim() || process.env.JWT_SECRET?.trim();
+  if (configured && configured.length >= 32) {
+    return configured;
+  }
+  return EPHEMERAL_PROPOSAL_HMAC_KEY;
+}
+
+function canonicalProposalSignPayload(actor: ActorContext, proposal: DocumentOperationProposal): string {
+  return JSON.stringify({
+    tenantId: actor.tenantId,
+    workspaceId: actor.workspaceId,
+    userId: actor.userId,
+    operationId: proposal.operationId,
+    documentId: proposal.documentId,
+    expectedRevision: proposal.expectedRevision,
+    selection: proposal.selection ?? null,
+    action: proposal.action,
+    params: proposal.params,
+    requestedBy: proposal.requestedBy,
+    requiresApproval: proposal.requiresApproval,
+    source: proposal.source,
+    inputLanguage: proposal.inputLanguage,
+    outputLanguage: proposal.outputLanguage,
+    createdAt: proposal.createdAt,
+  });
+}
+
+export function signDocumentProposal(actor: ActorContext, proposal: DocumentOperationProposal): string {
+  return createHmac("sha256", resolveProposalHmacKey())
+    .update(canonicalProposalSignPayload(actor, proposal))
+    .digest("hex");
+}
+
+export function verifyDocumentProposalSignature(actor: ActorContext, proposal: DocumentOperationProposal): boolean {
+  const provided = proposal.proposalSignature;
+  if (!provided || !/^[0-9a-f]{64}$/i.test(provided)) {
+    return false;
+  }
+  const expected = signDocumentProposal(actor, proposal);
+  const a = Buffer.from(provided, "hex");
+  const b = Buffer.from(expected, "hex");
+  return a.length === b.length && timingSafeEqual(a, b);
+}
 
 export class AiPlanningError extends Error {
   readonly statusCode: number;
@@ -87,14 +135,16 @@ function parseBilingualCommand(
     };
   }
 
-  // 2. Insert table (EN / KM with Arabic or Khmer numerals)
+  // 2. Insert table (EN / KM with Arabic or Khmer numerals, strictly clamped 1..20 x 1..10 — M10)
   const tableMatch = normalized.match(/(\d+)\s*[x×*]\s*(\d+)/i);
   if (
     (/\btable\b/i.test(lower) || normalized.includes("តារាង")) &&
     (/\b(insert|add|create)\b/i.test(lower) || /(បញ្ចូល|បន្ថែម|បង្កើត)/.test(normalized))
   ) {
-    const rows = tableMatch ? Number(tableMatch[1]) : 3;
-    const cols = tableMatch ? Number(tableMatch[2]) : 3;
+    const rawRows = tableMatch ? Number(tableMatch[1]) : 3;
+    const rawCols = tableMatch ? Number(tableMatch[2]) : 3;
+    const rows = Math.max(1, Math.min(20, Number.isFinite(rawRows) ? Math.trunc(rawRows) : 3));
+    const cols = Math.max(1, Math.min(10, Number.isFinite(rawCols) ? Math.trunc(rawCols) : 3));
     return {
       action: "insert_table",
       params: { rows, cols },
@@ -257,11 +307,19 @@ export function planDocumentOperation(params: {
   const { actor, document, priorRevisionDoc, input, audit } = params;
   assertCanPerform(actor, "document", "write");
 
+  if (
+    typeof input.selection?.startOffset === "number" &&
+    typeof input.selection?.endOffset === "number" &&
+    input.selection.startOffset > input.selection.endOffset
+  ) {
+    throw new AiPlanningError(400, "INVALID_SELECTION_RANGE", "selection.startOffset must be <= selection.endOffset.");
+  }
+
   const targetBlock = input.selection?.blockId
     ? document.blocks.find((b) => b.id === input.selection?.blockId)
     : document.blocks.find((b) => b.type === "paragraph" || b.type === "heading");
 
-  const blockPlainText = targetBlock ? getBlockPlainText(targetBlock) : "";
+  const blockPlainText = targetBlock ? normalizeDocumentText(getBlockPlainText(targetBlock)) : "";
   const selectedText = input.selection?.selectedText ?? blockPlainText;
 
   // Untrusted-content & prompt-injection defense (D4.05 / AI-05)
@@ -290,22 +348,22 @@ export function planDocumentOperation(params: {
 
   const parsed = parseBilingualCommand(input.command, selectedText, input.outputLanguage);
 
+  const snappedRange =
+    typeof input.selection?.startOffset === "number" && typeof input.selection?.endOffset === "number"
+      ? snapRangeToGraphemeBoundaries(blockPlainText, input.selection.startOffset, input.selection.endOffset)
+      : { start: 0, end: blockPlainText.length };
+
   const resolvedSelection: DocumentSelectionRef | undefined =
     parsed.action === "undo_last"
       ? undefined
       : {
           blockId: targetBlock?.id ?? document.blocks[0]?.id ?? "",
-          startOffset: input.selection?.startOffset ?? 0,
-          endOffset: input.selection?.endOffset ?? blockPlainText.length,
+          startOffset: snappedRange.start,
+          endOffset: snappedRange.end,
           selectedText,
           selectionHash:
             input.selection?.selectionHash ??
-            hashTextSelection(
-              typeof input.selection?.startOffset === "number" &&
-                typeof input.selection?.endOffset === "number"
-                ? blockPlainText.slice(input.selection.startOffset, input.selection.endOffset)
-                : blockPlainText,
-            ),
+            hashTextSelection(blockPlainText.slice(snappedRange.start, snappedRange.end)),
         };
 
   const { preview } = previewDocumentOperation(
@@ -337,6 +395,8 @@ export function planDocumentOperation(params: {
     previewDiff: preview,
     createdAt: new Date().toISOString(),
   };
+  // Sign server-issued proposal with HMAC-SHA256 bound to actor + revision + params (H16)
+  proposal.proposalSignature = signDocumentProposal(actor, proposal);
 
   audit.append({
     auditId: `aud_${randomUUID()}`,

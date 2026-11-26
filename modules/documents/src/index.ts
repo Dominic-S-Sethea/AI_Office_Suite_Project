@@ -23,6 +23,106 @@ import {
   type PdfExportResult,
 } from "@ai-office-suite/file-conversion";
 
+export function buildBilingualSampleDocument(actor: ActorContext, documentId?: string): StudioDocument {
+  const doc = createEmptyDocument({
+    ...(documentId ? { documentId } : {}),
+    tenantId: actor.tenantId,
+    workspaceId: actor.workspaceId,
+    title: "របាយការណ៍ប្រចាំខែ · Monthly Management Report 2026",
+    language: "bilingual",
+    createdBy: actor.userId,
+  });
+  doc.blocks = [
+    {
+      id: "blk_title_km",
+      type: "heading",
+      level: 1,
+      alignment: "left",
+      runs: [
+        {
+          text: "របាយការណ៍គ្រប់គ្រងប្រចាំខែវិច្ឆិកា ឆ្នាំ២០២៦",
+          marks: { bold: true, fontFamily: "Kantumruy Pro" },
+        },
+      ],
+    },
+    {
+      id: "blk_subtitle_en",
+      type: "heading",
+      level: 2,
+      alignment: "left",
+      runs: [
+        {
+          text: "Monthly Management Report — November 2026",
+          marks: { bold: true, fontFamily: "Inter" },
+        },
+      ],
+    },
+    {
+      id: "blk_exec_summary",
+      type: "paragraph",
+      alignment: "left",
+      runs: [
+        {
+          text: "The administration and finance departments completed operational reconciliation for November 2026 across all Phnom Penh and regional branches.",
+        },
+      ],
+    },
+    {
+      id: "blk_khmer_para",
+      type: "paragraph",
+      alignment: "left",
+      runs: [
+        {
+          text: "នាយកដ្ឋានរដ្ឋបាល និងហិរញ្ញវត្ថុបានបញ្ចប់ការត្រួតពិនិត្យផ្ទៀងផ្ទាត់ទិន្នន័យចំណូល និងចំណាយប្រចាំខែវិច្ឆិកា ឆ្នាំ២០២៦ ដោយជោគជ័យ ជាមួយនឹងតម្លាភាព និងសុក្រឹតភាពខ្ពស់។",
+          marks: { fontFamily: "Noto Sans Khmer" },
+        },
+      ],
+    },
+    {
+      id: "blk_metric_placeholder",
+      type: "linked_metric_placeholder",
+      metric: {
+        datasetId: "ds_demo_finance_2026_11",
+        datasetVersion: "v1.0",
+        metricId: "metric_net_operating_profit",
+        metricVersion: "v1.0",
+        reportingPeriod: "2026-11",
+        filterContext: { region: "All Cambodia", currency: "USD" },
+        unit: "USD",
+        currency: "USD",
+        approvalStatus: "certified",
+        freshnessTimestamp: "2026-11-26T00:00:00.000Z",
+        mode: "published_snapshot",
+        displayLabel: "Net Operating Profit (Synthetic D7 Placeholder)",
+        cachedFormattedValue: "$38,500.00",
+      },
+    },
+    {
+      id: "blk_table_summary",
+      type: "table",
+      hasHeaderRow: true,
+      rows: [
+        [
+          { runs: [{ text: "Department / នាយកដ្ឋាន", marks: { bold: true } }] },
+          { runs: [{ text: "Budget (USD)", marks: { bold: true } }] },
+          { runs: [{ text: "Actual (USD)", marks: { bold: true } }] },
+        ],
+        [
+          { runs: [{ text: "Administration / រដ្ឋបាល" }] },
+          { runs: [{ text: "$15,000.00" }] },
+          { runs: [{ text: "$14,250.00" }] },
+        ],
+        [
+          { runs: [{ text: "Operations / ប្រតិបត្តិការ" }] },
+          { runs: [{ text: "$42,000.00" }] },
+          { runs: [{ text: "$40,800.00" }] },
+        ],
+      ],
+    },
+  ];
+  return doc;
+}
+
 export class DocumentService {
   private readonly storage: DocumentStorageAdapter;
   private readonly audit: AuditStore;
@@ -89,97 +189,11 @@ export class DocumentService {
   }
 
   async seedBilingualSample(actor: ActorContext): Promise<StudioDocument> {
+    const sample = buildBilingualSampleDocument(actor);
     return this.createDocument(actor, {
-      title: "របាយការណ៍ប្រចាំខែ · Monthly Management Report 2026",
-      language: "bilingual",
-      blocks: [
-        {
-          id: "blk_title_km",
-          type: "heading",
-          level: 1,
-          alignment: "left",
-          runs: [
-            {
-              text: "របាយការណ៍គ្រប់គ្រងប្រចាំខែវិច្ឆិកា ឆ្នាំ២០២៦",
-              marks: { bold: true, fontFamily: "Kantumruy Pro" },
-            },
-          ],
-        },
-        {
-          id: "blk_subtitle_en",
-          type: "heading",
-          level: 2,
-          alignment: "left",
-          runs: [
-            {
-              text: "Monthly Management Report — November 2026",
-              marks: { bold: true, fontFamily: "Inter" },
-            },
-          ],
-        },
-        {
-          id: "blk_exec_summary",
-          type: "paragraph",
-          alignment: "left",
-          runs: [
-            {
-              text: "The administration and finance departments completed operational reconciliation for November 2026 across all Phnom Penh and regional branches.",
-            },
-          ],
-        },
-        {
-          id: "blk_khmer_para",
-          type: "paragraph",
-          alignment: "left",
-          runs: [
-            {
-              text: "នាយកដ្ឋានរដ្ឋបាល និងហិរញ្ញវត្ថុបានបញ្ចប់ការត្រួតពិនិត្យផ្ទៀងផ្ទាត់ទិន្នន័យចំណូល និងចំណាយប្រចាំខែវិច្ឆិកា ឆ្នាំ២០២៦ ដោយជោគជ័យ ជាមួយនឹងតម្លាភាព និងសុក្រឹតភាពខ្ពស់។",
-              marks: { fontFamily: "Noto Sans Khmer" },
-            },
-          ],
-        },
-        {
-          id: "blk_metric_placeholder",
-          type: "linked_metric_placeholder",
-          metric: {
-            datasetId: "ds_demo_finance_2026_11",
-            datasetVersion: "v1.0",
-            metricId: "metric_net_operating_profit",
-            metricVersion: "v1.0",
-            reportingPeriod: "2026-11",
-            filterContext: { region: "All Cambodia", currency: "USD" },
-            unit: "USD",
-            currency: "USD",
-            approvalStatus: "certified",
-            freshnessTimestamp: "2026-11-26T00:00:00.000Z",
-            mode: "published_snapshot",
-            displayLabel: "Net Operating Profit (Synthetic D7 Placeholder)",
-            cachedFormattedValue: "$38,500.00",
-          },
-        },
-        {
-          id: "blk_table_summary",
-          type: "table",
-          hasHeaderRow: true,
-          rows: [
-            [
-              { runs: [{ text: "Department / នាយកដ្ឋាន", marks: { bold: true } }] },
-              { runs: [{ text: "Budget (USD)", marks: { bold: true } }] },
-              { runs: [{ text: "Actual (USD)", marks: { bold: true } }] },
-            ],
-            [
-              { runs: [{ text: "Administration / រដ្ឋបាល" }] },
-              { runs: [{ text: "$15,000.00" }] },
-              { runs: [{ text: "$14,250.00" }] },
-            ],
-            [
-              { runs: [{ text: "Operations / ប្រតិបត្តិការ" }] },
-              { runs: [{ text: "$42,000.00" }] },
-              { runs: [{ text: "$40,800.00" }] },
-            ],
-          ],
-        },
-      ],
+      title: sample.title,
+      language: sample.language,
+      blocks: sample.blocks,
     });
   }
 
@@ -234,6 +248,7 @@ export class DocumentService {
       source?: "manual" | "typed_ai" | "voice_command";
       operationId?: string;
       undoneRevision?: number;
+      restoredFromRevision?: number;
     },
   ): Promise<StudioDocument> {
     assertCanPerform(actor, "document", "write");
@@ -266,6 +281,7 @@ export class DocumentService {
       source: input.source ?? "manual",
       actorId: actor.userId,
       ...(typeof input.undoneRevision === "number" ? { undoneRevision: input.undoneRevision } : {}),
+      ...(typeof input.restoredFromRevision === "number" ? { restoredFromRevision: input.restoredFromRevision } : {}),
       createdAt: now,
     };
 

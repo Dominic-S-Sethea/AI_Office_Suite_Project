@@ -744,8 +744,11 @@ export class PostgreSqlDocumentRepository {
           );
         }
 
-        const curSnapRes = await tx.query<{ snapshot_json: StudioDocument | string }>(
-          `SELECT snapshot_json
+        const curSnapRes = await tx.query<{
+          snapshot_json: StudioDocument | string;
+          restored_from_revision: number | null;
+        }>(
+          `SELECT snapshot_json, restored_from_revision
            FROM document_versions
            WHERE document_id = $1::uuid AND revision = $2`,
           [documentId, row.current_revision],
@@ -756,19 +759,27 @@ export class PostgreSqlDocumentRepository {
         }
         const currentDoc = parseSnapshot(curSnapRow.snapshot_json);
         let priorSnapshot: StudioDocument | null = null;
+        let undoTargetRevision: number | null = null;
         if (loadPriorForUndo && currentDoc.revision > 1) {
-          // Walk back past any prior undo target to avoid consecutive undo flip-flop (H18)
-          const historyRes = await tx.query<{ revision: number; restored_from_revision: number | null; snapshot_json: StudioDocument | string }>(
-            `SELECT revision, restored_from_revision, snapshot_json
-             FROM document_versions
-             WHERE document_id = $1::uuid AND revision < $2
-             ORDER BY revision DESC
-             LIMIT 20`,
-            [documentId, currentDoc.revision],
-          );
-          const prevRow = historyRes.rows[0];
-          if (prevRow?.snapshot_json) {
-            priorSnapshot = parseSnapshot(prevRow.snapshot_json);
+          // Walk back past prior restored_from_revision to eliminate consecutive undo flip-flop (H18)
+          const targetUpper =
+            curSnapRow.restored_from_revision !== null
+              ? curSnapRow.restored_from_revision - 1
+              : currentDoc.revision - 1;
+          if (targetUpper >= 1) {
+            const prevRes = await tx.query<{ revision: number; snapshot_json: StudioDocument | string }>(
+              `SELECT revision, snapshot_json
+               FROM document_versions
+               WHERE document_id = $1::uuid AND revision <= $2
+               ORDER BY revision DESC
+               LIMIT 1`,
+              [documentId, targetUpper],
+            );
+            const prevRow = prevRes.rows[0];
+            if (prevRow?.snapshot_json) {
+              priorSnapshot = parseSnapshot(prevRow.snapshot_json);
+              undoTargetRevision = prevRow.revision;
+            }
           }
         }
 
@@ -798,14 +809,16 @@ export class PostgreSqlDocumentRepository {
 
         await tx.query(
           `INSERT INTO document_versions (
-             tenant_id, document_id, revision, storage_object_key, content_sha256, source, summary, snapshot_json, created_by
-           ) VALUES ($1::uuid, $2::uuid, $3, $4, $5, $6, $7, $8::jsonb, $9::uuid)`,
+             tenant_id, document_id, revision, storage_object_key, content_sha256,
+             restored_from_revision, source, summary, snapshot_json, created_by
+           ) VALUES ($1::uuid, $2::uuid, $3, $4, $5, $6, $7, $8, $9::jsonb, $10::uuid)`,
           [
             actor.tenantId,
             documentId,
             nextRevision,
             `${actor.tenantId}/${actor.workspaceId}/documents/${documentId}/rev-${nextRevision}.json`,
             contentSha,
+            undoTargetRevision,
             source,
             summary,
             JSON.stringify(updatedDoc),

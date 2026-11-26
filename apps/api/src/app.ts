@@ -21,6 +21,7 @@ import {
   DatabaseConflictError,
   PostgreSqlDocumentRepository,
   verifyDatabaseRlsReadiness,
+  type DatabaseReadinessReport,
   type PgDatabaseAdapter,
 } from "@ai-office-suite/database";
 import {
@@ -43,6 +44,7 @@ import {
   createEmptyDocument,
   normalizeDocumentText,
   previewDocumentOperation,
+  resolveUndoTargetRevision,
 } from "@ai-office-suite/document-engine";
 import {
   DataPreparationPipeline,
@@ -58,8 +60,13 @@ import {
   PdfExportError,
 } from "@ai-office-suite/file-conversion";
 import { getSpeechAdapter, SpeechProviderError } from "@ai-office-suite/speech-engine";
-import { DocumentService } from "@ai-office-suite/documents-module";
-import { AiDocumentExecutor, AiPlanningError, planDocumentOperation } from "@ai-office-suite/ai-module";
+import { buildBilingualSampleDocument, DocumentService } from "@ai-office-suite/documents-module";
+import {
+  AiDocumentExecutor,
+  AiPlanningError,
+  planDocumentOperation,
+  verifyDocumentProposalSignature,
+} from "@ai-office-suite/ai-module";
 import { createSlidingWindowRateLimiter } from "./rateLimit.ts";
 import { createApiObservability } from "./observability.ts";
 
@@ -73,11 +80,43 @@ export interface CreateApiAppOptions {
   isShuttingDown?: () => boolean;
   enableStructuredLogs?: boolean;
   logSink?: (line: string) => void;
+  readyCacheTtlMs?: number;
+  maxConcurrentPdfExports?: number;
+  maxConcurrentDataPrep?: number;
   rateLimit?: {
     enabled?: boolean;
     windowMs?: number;
     loginMaxPerWindow?: number;
+    loginIpMaxPerWindow?: number;
     apiMaxPerWindow?: number;
+  };
+}
+
+const MAX_PG_INT32 = 2_147_483_647;
+
+function parseStrictRevisionParam(raw: string): number | null {
+  if (!/^\d{1,10}$/.test(raw)) return null;
+  const n = Number(raw);
+  if (!Number.isSafeInteger(n) || n < 1 || n > MAX_PG_INT32) return null;
+  return n;
+}
+
+function createConcurrencyGate(maxConcurrent: number) {
+  let active = 0;
+  const limit = Math.max(1, Math.trunc(maxConcurrent));
+  return {
+    tryAcquire(): (() => void) | null {
+      if (active >= limit) return null;
+      active++;
+      let released = false;
+      return () => {
+        if (!released) {
+          released = true;
+          active = Math.max(0, active - 1);
+        }
+      };
+    },
+    getActive: () => active,
   };
 }
 
@@ -121,10 +160,51 @@ export function createApiApp(options: CreateApiAppOptions = {}): Express {
     .map((s) => s.trim())
     .filter(Boolean);
 
+  const observability = createApiObservability({
+    enableStructuredLogs: options.enableStructuredLogs,
+    sink: options.logSink,
+  });
+
+  const logRateLimitExceeded = (req: Request, key: string): void => {
+    observability.logEvent("warn", "security.rate_limit_exceeded", {
+      requestId: (req as Request & { requestId?: string }).requestId,
+      method: req.method,
+      path: req.path,
+      bucket: key.split(":")[0],
+    });
+  };
+
   const rateLimitEnabled = options.rateLimit?.enabled ?? process.env.NODE_ENV !== "test";
+  const windowMs = options.rateLimit?.windowMs ?? 60_000;
+  const loginMax = options.rateLimit?.loginMaxPerWindow ?? 15;
+  const apiMax = options.rateLimit?.apiMaxPerWindow ?? 300;
+
+  // Pre-parse IP flood shield (H14 — executes BEFORE express.json body parsing)
+  const preParseIpLimiter = createSlidingWindowRateLimiter({
+    windowMs,
+    maxRequests: Math.max(apiMax * 5, 1_000),
+    keyGenerator: (req) => {
+      const ip = req.ip || req.socket?.remoteAddress || "unknown";
+      return `preip:${String(ip).trim().slice(0, 128)}`;
+    },
+    onLimitExceeded: logRateLimitExceeded,
+  });
+
+  // Per-IP aggregate login limiter prevents cross-account credential stuffing (H15)
+  const loginIpLimiter = createSlidingWindowRateLimiter({
+    windowMs,
+    maxRequests: options.rateLimit?.loginIpMaxPerWindow ?? Math.max(loginMax * 4, 20),
+    keyGenerator: (req) => {
+      const ip = req.ip || req.socket?.remoteAddress || "unknown";
+      return `login_ip:${String(ip).trim().slice(0, 128)}`;
+    },
+    onLimitExceeded: logRateLimitExceeded,
+  });
+
+  // Per-(IP, email) login limiter isolates brute-force attempts on a single account
   const loginLimiter = createSlidingWindowRateLimiter({
-    windowMs: options.rateLimit?.windowMs ?? 60_000,
-    maxRequests: options.rateLimit?.loginMaxPerWindow ?? 15,
+    windowMs,
+    maxRequests: loginMax,
     keyGenerator: (req) => {
       const ip = req.ip || req.socket?.remoteAddress || "unknown";
       const email =
@@ -133,10 +213,12 @@ export function createApiApp(options: CreateApiAppOptions = {}): Express {
           : "";
       return `login:${ip}:${email}`;
     },
+    onLimitExceeded: logRateLimitExceeded,
   });
+
   const apiLimiter = createSlidingWindowRateLimiter({
-    windowMs: options.rateLimit?.windowMs ?? 60_000,
-    maxRequests: options.rateLimit?.apiMaxPerWindow ?? 300,
+    windowMs,
+    maxRequests: apiMax,
     keyGenerator: (req) => {
       const authReq = req as AuthenticatedRequest;
       if (authReq.actor) {
@@ -145,19 +227,25 @@ export function createApiApp(options: CreateApiAppOptions = {}): Express {
       const ip = req.ip || req.socket?.remoteAddress || "unknown";
       return `ip:${String(ip).trim().slice(0, 128)}`;
     },
-    onLimitExceeded: (req, key) => {
-      observability.logEvent("warn", "security.rate_limit_exceeded", {
-        requestId: (req as Request & { requestId?: string }).requestId,
-        method: req.method,
-        path: req.path,
-        bucket: key.split(":")[0],
-      });
+    onLimitExceeded: logRateLimitExceeded,
+  });
+
+  // Dedicated readiness probe rate limiter & 2s TTL cache prevents unauthenticated DB-probe floods (H15)
+  const readyLimiter = createSlidingWindowRateLimiter({
+    windowMs: 10_000,
+    maxRequests: 60,
+    keyGenerator: (req) => {
+      const ip = req.ip || req.socket?.remoteAddress || "unknown";
+      return `ready:${String(ip).trim().slice(0, 128)}`;
     },
+    onLimitExceeded: logRateLimitExceeded,
   });
-  const observability = createApiObservability({
-    enableStructuredLogs: options.enableStructuredLogs,
-    sink: options.logSink,
-  });
+  const readyCacheTtlMs = Math.max(0, options.readyCacheTtlMs ?? 2_000);
+  let readyCache: { expiresAt: number; report: DatabaseReadinessReport } | null = null;
+
+  // Bounded concurrency gates for CPU/Chromium-heavy endpoints (H17)
+  const pdfExportGate = createConcurrencyGate(options.maxConcurrentPdfExports ?? 2);
+  const dataPrepGate = createConcurrencyGate(options.maxConcurrentDataPrep ?? 2);
 
   const app = express();
   app.disable("x-powered-by");
@@ -184,7 +272,27 @@ export function createApiApp(options: CreateApiAppOptions = {}): Express {
       credentials: useJwtPg,
     }),
   );
-  app.use(express.json({ limit: "25mb" }));
+
+  // Outer IP flood shield + login IP shield run BEFORE JSON body allocation (H14, H15)
+  if (rateLimitEnabled) {
+    app.use("/api", preParseIpLimiter.middleware);
+    app.use("/api/auth/login", loginIpLimiter.middleware);
+    app.use("/api/auth/token", loginIpLimiter.middleware);
+    app.use("/api/ready", readyLimiter.middleware);
+  }
+
+  // Route-specific JSON body size limits (H14 — no blanket 25mb parser on auth/read endpoints)
+  const authJsonParser = express.json({ limit: "16kb" });
+  const largeUploadJsonParser = express.json({ limit: "16mb" });
+  const dataPrepJsonParser = express.json({ limit: "6mb" });
+  const defaultJsonParser = express.json({ limit: "2mb" });
+
+  app.use("/api/auth", authJsonParser);
+  app.use("/api/documents/import/docx", largeUploadJsonParser);
+  app.use("/api/speech/transcribe", largeUploadJsonParser);
+  app.use("/api/data-prep", dataPrepJsonParser);
+  app.use(defaultJsonParser);
+
   app.use((req, res, next) => {
     res.setHeader("X-Auth-Mode", useJwtPg ? "jwt-postgresql-rls" : "provisional-local-prototype");
     if (
@@ -228,9 +336,18 @@ export function createApiApp(options: CreateApiAppOptions = {}): Express {
       return;
     }
     try {
-      const report = await verifyDatabaseRlsReadiness(options.db, {
-        requireNonSuperuserConnection: Boolean(options.requireNonSuperuserDb),
-      });
+      const now = Date.now();
+      let report: DatabaseReadinessReport;
+      if (readyCache && readyCache.expiresAt > now && readyCache.report.ready) {
+        report = readyCache.report;
+      } else {
+        report = await verifyDatabaseRlsReadiness(options.db, {
+          requireNonSuperuserConnection: Boolean(options.requireNonSuperuserDb),
+        });
+        if (readyCacheTtlMs > 0 && report.ready) {
+          readyCache = { expiresAt: now + readyCacheTtlMs, report };
+        }
+      }
       res.status(report.ready ? 200 : 503).json({
         status: report.ready ? "ready" : "degraded",
         authMode,
@@ -238,6 +355,7 @@ export function createApiApp(options: CreateApiAppOptions = {}): Express {
         checks: report.checks,
       });
     } catch (err) {
+      readyCache = null;
       observability.logEvent("error", "readiness.probe_failed", {
         requestId,
         error: err instanceof Error ? err.message : "UnknownError",
@@ -261,7 +379,7 @@ export function createApiApp(options: CreateApiAppOptions = {}): Express {
       app.use("/api/auth/token", loginLimiter.middleware);
     }
 
-    app.get("/api/metrics", jwtMiddleware, (req, res, next) => {
+    app.get("/api/metrics", jwtMiddleware, ...(rateLimitEnabled ? [apiLimiter.middleware] : []), (req, res, next) => {
       try {
         const authReq = req as AuthenticatedRequest;
         assertCanPerform(authReq.actor!, "metrics", "read");
@@ -272,6 +390,7 @@ export function createApiApp(options: CreateApiAppOptions = {}): Express {
           rateLimits: {
             enabled: rateLimitEnabled,
             login: loginLimiter.getStats(),
+            loginIp: loginIpLimiter.getStats(),
             api: apiLimiter.getStats(),
           },
           ...(db.getPoolStats ? { dbPool: db.getPoolStats() } : {}),
@@ -443,7 +562,8 @@ export function createApiApp(options: CreateApiAppOptions = {}): Express {
           createdBy: actor.userId,
         });
         if (parsed.data.layout) doc.layout = parsed.data.layout;
-        if (parsed.data.blocks) doc.blocks = parsed.data.blocks;
+        // Consistent blocks: [] handling across PG and local modes (M8)
+        if (parsed.data.blocks && parsed.data.blocks.length > 0) doc.blocks = parsed.data.blocks;
         const created = await pgRepo.createDocument(actor, doc);
         res.status(201).json({ document: created });
         return;
@@ -460,11 +580,8 @@ export function createApiApp(options: CreateApiAppOptions = {}): Express {
       const actor = getActor(req);
       if (pgRepo) {
         assertCanPerform(actor, "document", "create");
-        const sample = await documents.seedBilingualSample(actor);
-        const pgDoc: StudioDocument = {
-          ...sample,
-          documentId: randomUUID(),
-        };
+        // Build sample purely in-memory with zero ghost writes to local storage/audit (H13)
+        const pgDoc = buildBilingualSampleDocument(actor, randomUUID());
         const created = await pgRepo.createDocument(actor, pgDoc, {
           source: "manual",
           action: "document.created",
@@ -514,7 +631,7 @@ export function createApiApp(options: CreateApiAppOptions = {}): Express {
           }),
           {
             source: "manual",
-            action: "document.update",
+            action: "document.updated",
             summary: parsed.data.summary ?? undefined,
           },
         );
@@ -543,23 +660,30 @@ export function createApiApp(options: CreateApiAppOptions = {}): Express {
   app.get("/api/documents/:id/versions/:fromRev/diff/:toRev", async (req, res, next) => {
     try {
       const actor = getActor(req);
-      const fromRev = Number(req.params.fromRev);
-      const toRev = Number(req.params.toRev);
-      if (!Number.isInteger(fromRev) || fromRev < 1 || !Number.isInteger(toRev) || toRev < 1) {
-        res.status(400).json({ error: "Invalid revision numbers", code: "VALIDATION_ERROR" });
+      const fromRev = parseStrictRevisionParam(req.params.fromRev);
+      const toRev = parseStrictRevisionParam(req.params.toRev);
+      if (fromRev === null || toRev === null) {
+        res.status(400).json({ error: "Invalid revision numbers (must be integers 1..2147483647)", code: "VALIDATION_ERROR" });
         return;
       }
-      const fromVer = pgRepo
-        ? await pgRepo.getVersion(actor, req.params.id, fromRev)
-        : await documents.getVersion(actor, req.params.id, fromRev);
-      const toVer = pgRepo
-        ? await pgRepo.getVersion(actor, req.params.id, toRev)
-        : await documents.getVersion(actor, req.params.id, toRev);
-      if (!fromVer || !toVer) {
+      let fromSnapshot: StudioDocument | null = null;
+      let toSnapshot: StudioDocument | null = null;
+      if (pgRepo) {
+        // Atomic single-transaction fetch for both revisions (M9)
+        const pair = await pgRepo.getVersionsForDiff(actor, req.params.id, fromRev, toRev);
+        fromSnapshot = pair.fromDoc;
+        toSnapshot = pair.toDoc;
+      } else {
+        const fromVer = await documents.getVersion(actor, req.params.id, fromRev);
+        const toVer = await documents.getVersion(actor, req.params.id, toRev);
+        fromSnapshot = fromVer?.snapshot ?? null;
+        toSnapshot = toVer?.snapshot ?? null;
+      }
+      if (!fromSnapshot || !toSnapshot) {
         res.status(404).json({ error: "Requested document revision not found", code: "VERSION_NOT_FOUND" });
         return;
       }
-      const diff = computeDocumentRevisionDiff(fromVer.snapshot, toVer.snapshot);
+      const diff = computeDocumentRevisionDiff(fromSnapshot, toSnapshot);
       res.json({ diff });
     } catch (err) {
       next(err);
@@ -569,9 +693,9 @@ export function createApiApp(options: CreateApiAppOptions = {}): Express {
   app.post("/api/documents/:id/versions/:revision/restore", async (req, res, next) => {
     try {
       const actor = getActor(req);
-      const rev = Number(req.params.revision);
-      if (!Number.isInteger(rev) || rev < 1) {
-        res.status(400).json({ error: "Invalid revision number", code: "VALIDATION_ERROR" });
+      const rev = parseStrictRevisionParam(req.params.revision);
+      if (rev === null) {
+        res.status(400).json({ error: "Invalid revision number (must be integer 1..2147483647)", code: "VALIDATION_ERROR" });
         return;
       }
       const restored = pgRepo
@@ -594,19 +718,76 @@ export function createApiApp(options: CreateApiAppOptions = {}): Express {
       const doc = pgRepo
         ? await pgRepo.getDocument(actor, req.params.id)
         : await documents.getDocument(actor, req.params.id);
-      const prior =
-        doc.revision > 1
-          ? pgRepo
-            ? await pgRepo.getVersion(actor, doc.documentId, doc.revision - 1)
-            : await documents.getVersion(actor, doc.documentId, doc.revision - 1)
-          : null;
-      const proposal = planDocumentOperation({
-        actor,
-        document: doc,
-        priorRevisionDoc: prior?.snapshot ?? null,
-        input: parsed.data,
-        audit,
-      });
+      let priorSnapshot: StudioDocument | null = null;
+      if (doc.revision > 1) {
+        const versions = pgRepo
+          ? await pgRepo.listVersions(actor, doc.documentId)
+          : await documents.listVersions(actor, doc.documentId);
+        const undoTarget = resolveUndoTargetRevision(versions);
+        if (undoTarget !== null) {
+          priorSnapshot = versions.find((v) => v.revision === undoTarget)?.snapshot ?? null;
+        }
+      }
+
+      // Capture planner audit events so jwt-pg mode persists EVERY plan & prompt-injection denial to PostgreSQL (H13)
+      const capturedEvents: Array<Parameters<AuditStore["append"]>[0]> = [];
+      const planAuditSink: AuditStore = pgRepo
+        ? {
+            append: (ev) => capturedEvents.push(ev),
+            listAll: () => [],
+            listForDocument: () => [],
+          }
+        : audit;
+
+      let proposal;
+      try {
+        proposal = planDocumentOperation({
+          actor,
+          document: doc,
+          priorRevisionDoc: priorSnapshot,
+          input: parsed.data,
+          audit: planAuditSink,
+        });
+      } catch (planErr) {
+        if (pgRepo && capturedEvents.length > 0) {
+          for (const ev of capturedEvents) {
+            await pgRepo.recordAudit(actor, {
+              tenantId: ev.tenantId,
+              workspaceId: ev.workspaceId,
+              documentId: ev.documentId,
+              actorId: ev.actorId,
+              actorRole: ev.actorRole,
+              source: ev.source,
+              action: ev.action,
+              outcome: ev.outcome,
+              revisionBefore: ev.revisionBefore,
+              revisionAfter: ev.revisionAfter,
+              summary: ev.summary,
+              metadata: ev.metadata,
+            });
+          }
+        }
+        throw planErr;
+      }
+
+      if (pgRepo && capturedEvents.length > 0) {
+        for (const ev of capturedEvents) {
+          await pgRepo.recordAudit(actor, {
+            tenantId: ev.tenantId,
+            workspaceId: ev.workspaceId,
+            documentId: ev.documentId,
+            actorId: ev.actorId,
+            actorRole: ev.actorRole,
+            source: ev.source,
+            action: ev.action,
+            outcome: ev.outcome,
+            revisionBefore: ev.revisionBefore,
+            revisionAfter: ev.revisionAfter,
+            summary: ev.summary,
+            metadata: ev.operationId ? { operationId: ev.operationId, ...(ev.metadata ?? {}) } : ev.metadata,
+          });
+        }
+      }
       res.json({ proposal });
     } catch (err) {
       next(err);
@@ -629,10 +810,42 @@ export function createApiApp(options: CreateApiAppOptions = {}): Express {
         assertCanPerform(actor, "ai_assistant", "apply_ai");
         assertCanPerform(actor, "document", "write");
         if (!parsed.data.approved) {
+          await pgRepo.recordAudit(actor, {
+            tenantId: actor.tenantId,
+            workspaceId: actor.workspaceId,
+            documentId: req.params.id,
+            actorId: actor.userId,
+            actorRole: actor.role,
+            source: parsed.data.proposal.source,
+            action: "ai.operation_unapproved",
+            outcome: "denied",
+            summary: `Rejected unapproved operation ${parsed.data.proposal.action}.`,
+            metadata: { operationId: parsed.data.proposal.operationId },
+          });
           throw new AiPlanningError(
             400,
             "APPROVAL_REQUIRED",
             "Explicit user approval is required before applying an AI or voice operation.",
+          );
+        }
+        // Verify HMAC signature issued by server planner (H16)
+        if (!verifyDocumentProposalSignature(actor, parsed.data.proposal)) {
+          await pgRepo.recordAudit(actor, {
+            tenantId: actor.tenantId,
+            workspaceId: actor.workspaceId,
+            documentId: req.params.id,
+            actorId: actor.userId,
+            actorRole: actor.role,
+            source: parsed.data.proposal.source,
+            action: "ai.operation_tampered_signature",
+            outcome: "denied",
+            summary: `Rejected AI proposal '${parsed.data.proposal.operationId}' with missing or invalid server HMAC signature.`,
+            metadata: { operationId: parsed.data.proposal.operationId },
+          });
+          throw new AiPlanningError(
+            400,
+            "INVALID_PROPOSAL_SIGNATURE",
+            "Proposal signature verification denied: missing, tampered, or cross-tenant signature. Re-plan through /ai/plan before applying.",
           );
         }
         const result = await pgRepo.applyAiOperationIdempotent({
@@ -690,7 +903,7 @@ export function createApiApp(options: CreateApiAppOptions = {}): Express {
         summary: `Speech transcription via '${parsed.data.provider}' (${parsed.data.language}, isMock=${String(result.isMock)})`,
       };
       if (pgRepo) {
-        await pgRepo.recordAudit(actor, auditEvent);
+        await pgRepo.recordAudit(actor, { ...auditEvent, targetType: "speech" });
       } else {
         audit.append({
           ...auditEvent,
@@ -715,13 +928,34 @@ export function createApiApp(options: CreateApiAppOptions = {}): Express {
       const buffer = Buffer.from(parsed.data.contentBase64, "base64");
       if (pgRepo) {
         assertCanPerform(actor, "document", "create");
-        const { document, diagnostics } = await importFromDocxBuffer({
-          buffer,
-          filename: parsed.data.filename,
-          tenantId: actor.tenantId,
-          workspaceId: actor.workspaceId,
-          actorId: actor.userId,
-        });
+        let importedResult: Awaited<ReturnType<typeof importFromDocxBuffer>>;
+        try {
+          importedResult = await importFromDocxBuffer({
+            buffer,
+            filename: parsed.data.filename,
+            tenantId: actor.tenantId,
+            workspaceId: actor.workspaceId,
+            actorId: actor.userId,
+          });
+        } catch (importErr) {
+          // Persist rejected DOCX import attempts to PostgreSQL audit_logs (H13)
+          if (importErr instanceof DocxImportError) {
+            await pgRepo.recordAudit(actor, {
+              tenantId: actor.tenantId,
+              workspaceId: actor.workspaceId,
+              actorId: actor.userId,
+              actorRole: actor.role,
+              source: "import",
+              action: "document.import_docx_rejected",
+              outcome: "denied",
+              targetType: "import",
+              summary: `Rejected DOCX upload '${parsed.data.filename}' (${importErr.code}): ${importErr.message}`,
+              metadata: { code: importErr.code, filename: parsed.data.filename },
+            });
+          }
+          throw importErr;
+        }
+        const { document, diagnostics } = importedResult;
         const pgDoc: StudioDocument = { ...document, documentId: randomUUID() };
         const created = await pgRepo.createDocument(actor, pgDoc, {
           source: "import",
@@ -780,6 +1014,16 @@ export function createApiApp(options: CreateApiAppOptions = {}): Express {
   });
 
   app.post("/api/documents/:id/export/pdf", async (req, res, next) => {
+    const release = pdfExportGate.tryAcquire();
+    if (!release) {
+      res.setHeader("Retry-After", "2");
+      res.status(503).json({
+        error: "PDF export workers are currently at capacity. Please retry shortly.",
+        code: "SERVICE_BUSY",
+        retryAfterSeconds: 2,
+      });
+      return;
+    }
     try {
       const actor = getActor(req);
       if (pgRepo) {
@@ -813,6 +1057,8 @@ export function createApiApp(options: CreateApiAppOptions = {}): Express {
       res.send(result.pdfBuffer);
     } catch (err) {
       next(err);
+    } finally {
+      release();
     }
   });
 
@@ -829,6 +1075,16 @@ export function createApiApp(options: CreateApiAppOptions = {}): Express {
   });
 
   app.post("/api/data-prep/stage-and-profile", async (req, res, next) => {
+    const release = dataPrepGate.tryAcquire();
+    if (!release) {
+      res.setHeader("Retry-After", "2");
+      res.status(503).json({
+        error: "Data preparation workers are currently at capacity. Please retry shortly.",
+        code: "SERVICE_BUSY",
+        retryAfterSeconds: 2,
+      });
+      return;
+    }
     try {
       const actor = getActor(req);
       assertCanPerform(actor, "document", "write");
@@ -842,6 +1098,9 @@ export function createApiApp(options: CreateApiAppOptions = {}): Express {
         delimiter: parsed.data.delimiter ?? "auto",
         maxRows: 50_000,
       });
+      // Yield to event loop between heavy CSV staging and profiling/recipe execution (H17)
+      await new Promise<void>((resolve) => setImmediate(resolve));
+
       const profile = profileDataset(staged.source.sourceId, staged.rows, {
         scope: parsed.data.profileScope,
         sampleSize: parsed.data.sampleSize,
@@ -856,6 +1115,7 @@ export function createApiApp(options: CreateApiAppOptions = {}): Express {
       } | null = null;
 
       if (parsed.data.steps && parsed.data.steps.length > 0) {
+        await new Promise<void>((resolve) => setImmediate(resolve));
         const expectedColumns =
           parsed.data.expectedColumns && parsed.data.expectedColumns.length > 0
             ? parsed.data.expectedColumns
@@ -893,6 +1153,7 @@ export function createApiApp(options: CreateApiAppOptions = {}): Express {
           source: "import",
           action: "data_prep.stage_and_profile",
           outcome: "success",
+          targetType: "data_prep",
           summary: `Staged '${parsed.data.filename}' (${staged.source.acceptedRows} accepted, ${staged.source.rejectedRows} rejected).`,
         });
       } else {
@@ -919,6 +1180,8 @@ export function createApiApp(options: CreateApiAppOptions = {}): Express {
       });
     } catch (err) {
       next(err);
+    } finally {
+      release();
     }
   });
 

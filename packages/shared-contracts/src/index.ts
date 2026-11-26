@@ -207,6 +207,7 @@ export interface DocumentOperationProposal {
   explanation: string;
   previewDiff: DocumentOperationPreview;
   createdAt: string;
+  proposalSignature?: string;
 }
 
 export type SpeechProviderId =
