@@ -1268,7 +1268,7 @@ export function App() {
             onChange={(e) => void handleDocxFileSelected(e)}
           />
 
-          {/* Zone 2: Left Fixed-Header Rail with Horizontal Dropdown Sub-Headers */}
+          {/* Zone 2: Left Fixed-Header Rail with Animated Vertical Downward Sub-Header Dropdowns */}
           <LeftNavRail
             groups={navGroups}
             openHeaderId={openFixedHeader}

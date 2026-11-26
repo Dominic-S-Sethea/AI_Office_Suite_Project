@@ -655,7 +655,7 @@ describe("Wave 1 Frontend & Tiptap Codec Verification (C8 & C9)", () => {
     });
   });
 
-  it("3-Zone UI/UX Rework: preserves Top Master Studio Headers, opens Left Fixed-Header horizontal Sub-Header flyouts with Escape dismissal, runs Data Prep subpanel, and renders Center Workspace AI Dock", async () => {
+  it("3-Zone UI/UX Rework: preserves Top Master Studio Headers, opens Left Fixed-Header animated vertical Sub-Header accordions with Escape dismissal, runs Data Prep subpanel, and renders Center Workspace AI Dock", async () => {
     vi.stubGlobal(
       "fetch",
       vi.fn(async (input: RequestInfo | URL) => {
@@ -688,21 +688,35 @@ describe("Wave 1 Frontend & Tiptap Codec Verification (C8 & C9)", () => {
     expect(screen.getByRole("button", { name: "Presentations" })).toBeTruthy();
     expect(screen.getByRole("button", { name: "Intelligence BI" })).toBeTruthy();
 
-    // 2. Clicking a Left Fixed-Header opens its horizontal Sub-Header flyout; Escape closes it
+    // 2. Clicking a Left Fixed-Header opens its vertical downward accordion; switching collapses previous; Escape closes it
     const filesHeader = screen.getByRole("menuitem", { name: /Files & Docs/ });
-    expect(filesHeader.getAttribute("aria-expanded")).toBe("false");
-    fireEvent.click(filesHeader);
-    expect(filesHeader.getAttribute("aria-expanded")).toBe("true");
-    expect(screen.getByRole("menu", { name: "Files & Docs sub-headers" })).toBeTruthy();
-    expect(screen.getByRole("menuitem", { name: "+ New Blank" })).toBeTruthy();
-
-    fireEvent.keyDown(window, { key: "Escape" });
+    const dataHeader = screen.getByRole("menuitem", { name: /Data & Analytics/ });
     expect(filesHeader.getAttribute("aria-expanded")).toBe("false");
     expect(screen.queryByRole("menu", { name: "Files & Docs sub-headers" })).toBeNull();
 
-    // 3. Open Data & Analytics -> Stage & Profile sub-header -> run live profile endpoint inside Center Workspace
-    fireEvent.click(screen.getByRole("menuitem", { name: /Data & Analytics/ }));
+    fireEvent.click(filesHeader);
+    expect(filesHeader.getAttribute("aria-expanded")).toBe("true");
+    const filesMenu = screen.getByRole("menu", { name: "Files & Docs sub-headers" });
+    expect(filesMenu.className).toContain("vertical-dropdown-wrap");
+    expect(filesMenu.className).toContain("is-open");
+    expect(screen.getByRole("menuitem", { name: "+ New Blank" })).toBeTruthy();
+
+    // Clicking another Fixed-Header collapses Files & Docs smoothly and opens Data & Analytics vertically
+    fireEvent.click(dataHeader);
+    expect(filesHeader.getAttribute("aria-expanded")).toBe("false");
+    expect(screen.queryByRole("menu", { name: "Files & Docs sub-headers" })).toBeNull();
+    expect(dataHeader.getAttribute("aria-expanded")).toBe("true");
+    expect(screen.getByRole("menu", { name: "Data & Analytics sub-headers" })).toBeTruthy();
+
+    // Escape closes the open vertical accordion
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(dataHeader.getAttribute("aria-expanded")).toBe("false");
+    expect(screen.queryByRole("menu", { name: "Data & Analytics sub-headers" })).toBeNull();
+
+    // 3. Open Data & Analytics -> Stage & Profile sub-header -> keeps section open & runs live profile endpoint inside Center Workspace
+    fireEvent.click(dataHeader);
     fireEvent.click(screen.getByRole("menuitem", { name: /Stage & Profile/ }));
+    expect(dataHeader.getAttribute("aria-expanded")).toBe("true");
     await waitFor(() => {
       expect(screen.getByRole("button", { name: "Run Stage & Profile" })).toBeTruthy();
     });
