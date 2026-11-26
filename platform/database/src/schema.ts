@@ -263,11 +263,11 @@ export async function initializePostgreSqlSchema(
       );
     `);
     if (!options.force) {
-      const existing = await tx.query<{ version: string }>(
-        "SELECT version FROM schema_migrations WHERE version = $1",
+      const existing = await tx.query<{ version: string; core_present: boolean }>(
+        "SELECT version, (to_regclass('public.organizations') IS NOT NULL) AS core_present FROM schema_migrations WHERE version = $1",
         [CORE_SCHEMA_VERSION],
       );
-      if (existing.rows.length > 0) {
+      if (existing.rows.length > 0 && existing.rows[0]?.core_present) {
         return { applied: false, version: CORE_SCHEMA_VERSION };
       }
     }

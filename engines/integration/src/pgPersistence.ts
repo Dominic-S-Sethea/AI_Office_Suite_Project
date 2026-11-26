@@ -251,11 +251,11 @@ export async function initializeIntegrationSchema(
       );
     `);
     if (!options.force) {
-      const existing = await tx.query<{ version: string }>(
-        "SELECT version FROM schema_migrations WHERE version = $1",
+      const existing = await tx.query<{ version: string; xi_present: boolean }>(
+        "SELECT version, (to_regclass('public.xi_artifacts') IS NOT NULL) AS xi_present FROM schema_migrations WHERE version = $1",
         [XI_SCHEMA_VERSION],
       );
-      if (existing.rows.length > 0) {
+      if (existing.rows.length > 0 && existing.rows[0]?.xi_present) {
         return { applied: false, version: XI_SCHEMA_VERSION };
       }
     }

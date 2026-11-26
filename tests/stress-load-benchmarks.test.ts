@@ -53,7 +53,7 @@ describe("Phase 6 — Stress, Concurrency & Soak Benchmarks", () => {
         await db.exec(`
           DROP TABLE IF EXISTS
             ai_applied_operations, migration_batches, audit_logs, idempotency_keys,
-            document_versions, documents, memberships, workspaces, users, organizations
+            document_versions, documents, memberships, workspaces, users, organizations, schema_migrations
           CASCADE;
         `);
       }

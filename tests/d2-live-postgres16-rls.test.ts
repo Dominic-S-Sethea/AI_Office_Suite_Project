@@ -94,7 +94,8 @@ describeLivePg("Phase 1 — Real PostgreSQL 16 Verification (RLS, Pooled Isolati
         memberships,
         workspaces,
         users,
-        organizations
+        organizations,
+        schema_migrations
       CASCADE;
     `);
     await initializePostgreSqlSchema(db);
