@@ -10,6 +10,24 @@ export default defineConfig({
       "@ai-office-suite/document-engine/tiptap-codec": path.resolve(__dirname, "../../engines/document/src/tiptapCodec.ts"),
     },
   },
+  build: {
+    rollupOptions: {
+      output: {
+        manualChunks(id) {
+          if (id.includes("node_modules/react") || id.includes("node_modules/react-dom") || id.includes("node_modules/scheduler")) {
+            return "react-vendor";
+          }
+          if (id.includes("node_modules/prosemirror-") || id.includes("node_modules/@tiptap/pm")) {
+            return "prosemirror-vendor";
+          }
+          if (id.includes("node_modules/@tiptap/")) {
+            return "tiptap-vendor";
+          }
+          return undefined;
+        },
+      },
+    },
+  },
   server: {
     port: 5174,
     host: "127.0.0.1",

@@ -1,4 +1,14 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type ChangeEvent, type FormEvent } from "react";
+import {
+  lazy,
+  Suspense,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ChangeEvent,
+  type FormEvent,
+} from "react";
 import type {
   ActorContext,
   AuditEvent,
@@ -9,29 +19,28 @@ import type {
 } from "@ai-office-suite/shared-contracts";
 import { PLANNED_FUTURE_STUDIOS } from "@ai-office-suite/shared-contracts";
 import { fromTiptapJson, toTiptapJson, type TiptapNode } from "@ai-office-suite/document-engine/tiptap-codec";
-import { DocumentEditor, type EditorSelectionState } from "./components/DocumentEditor.tsx";
+import {
+  DocumentEditor,
+  type DocumentEditorHandle,
+  type EditorSelectionState,
+} from "./components/DocumentEditor.tsx";
 import { AiVoicePanel } from "./components/AiVoicePanel.tsx";
-import { VersionAuditDrawer, type RevisionDiffPayload } from "./components/VersionAuditDrawer.tsx";
+import { ErrorBoundary } from "./components/ErrorBoundary.tsx";
+import { NewDocumentModal } from "./components/NewDocumentModal.tsx";
+import type { RevisionDiffPayload } from "./components/VersionAuditDrawer.tsx";
+import {
+  arrayBufferToBase64,
+  formatApiErrorMessage,
+  MAX_DOCX_UPLOAD_BYTES,
+  safeReadJson,
+} from "./lib/apiClient.ts";
+
+const LazyVersionAuditDrawer = lazy(() => import("./components/VersionAuditDrawer.tsx"));
 
 type AuthMode = "provisional-local" | "jwt-pg";
+type BootState = "loading" | "ready" | "unreachable";
 
-async function safeReadJson(res: Response): Promise<Record<string, unknown>> {
-  try {
-    return (await res.json()) as Record<string, unknown>;
-  } catch {
-    return { error: `Request failed with HTTP ${res.status}` };
-  }
-}
-
-function arrayBufferToBase64(buffer: ArrayBuffer): string {
-  const bytes = new Uint8Array(buffer);
-  const chunkSize = 0x8000;
-  let binary = "";
-  for (let i = 0; i < bytes.length; i += chunkSize) {
-    binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
-  }
-  return btoa(binary);
-}
+const PAGE_SIZE = 50;
 
 const DEFAULT_PAGE_LAYOUT: PageLayoutConfig = {
   size: "A4",
@@ -44,7 +53,8 @@ const DEFAULT_PAGE_LAYOUT: PageLayoutConfig = {
 
 export function App() {
   const [authMode, setAuthMode] = useState<AuthMode>("provisional-local");
-  const [authInitialized, setAuthInitialized] = useState(false);
+  const [bootState, setBootState] = useState<BootState>("loading");
+  const [bootAttempt, setBootAttempt] = useState(0);
   const [sessionActor, setSessionActor] = useState<ActorContext | null>(null);
   const [prototypeRole, setPrototypeRole] = useState<WorkspaceRole>("editor");
 
@@ -55,16 +65,18 @@ export function App() {
   const [loginWorkspaceId, setLoginWorkspaceId] = useState("");
   const [isAuthenticating, setIsAuthenticating] = useState(false);
 
-  // Documents & filters
+  // Documents, filters & pagination (M15)
   const [docs, setDocs] = useState<StudioDocument[]>([]);
   const [totalDocs, setTotalDocs] = useState(0);
+  const [docOffset, setDocOffset] = useState(0);
   const [searchQuery, setSearchQuery] = useState("");
   const [languageFilter, setLanguageFilter] = useState<"" | "en" | "km" | "bilingual">("");
   const [activeDoc, setActiveDoc] = useState<StudioDocument | null>(null);
   const activeDocIdRef = useRef<string | null>(null);
 
-  // Draft edits (content + metadata/layout)
-  const [draftBlocks, setDraftBlocks] = useState<StudioDocument["blocks"] | null>(null);
+  // Imperative editor handle avoids per-keystroke fromTiptapJson serialization (H24)
+  const editorRef = useRef<DocumentEditorHandle | null>(null);
+  const [editorDirty, setEditorDirty] = useState(false);
   const [draftTitle, setDraftTitle] = useState<string | null>(null);
   const [draftLanguage, setDraftLanguage] = useState<StudioDocument["language"] | null>(null);
   const [draftLayout, setDraftLayout] = useState<PageLayoutConfig | null>(null);
@@ -76,16 +88,26 @@ export function App() {
   const [newDocLanguage, setNewDocLanguage] = useState<"en" | "km" | "bilingual">("bilingual");
   const [newDocSize, setNewDocSize] = useState<"A4" | "Letter">("A4");
   const [newDocOrientation, setNewDocOrientation] = useState<"portrait" | "landscape">("portrait");
+  const [newDocError, setNewDocError] = useState<string | null>(null);
   const [isCreatingDoc, setIsCreatingDoc] = useState(false);
 
   // DOCX import state
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const [isImportingDocx, setIsImportingDocx] = useState(false);
 
+  // Responsive panels & drawers (H27)
+  const [sidebarOpen, setSidebarOpen] = useState(true);
   const [panelOpen, setPanelOpen] = useState(true);
   const [historyOpen, setHistoryOpen] = useState(false);
   const [versions, setVersions] = useState<DocumentVersion[]>([]);
   const [auditEvents, setAuditEvents] = useState<AuditEvent[]>([]);
+
+  // Request abort / sequence guards (H23)
+  const listAbortRef = useRef<AbortController | null>(null);
+  const listSeqRef = useRef(0);
+  const historyAbortRef = useRef<AbortController | null>(null);
+  const historySeqRef = useRef(0);
+  const diffAbortRef = useRef<AbortController | null>(null);
 
   const [isLoadingDocs, setIsLoadingDocs] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
@@ -101,19 +123,45 @@ export function App() {
   const effectiveRole: WorkspaceRole = authMode === "jwt-pg" ? (sessionActor?.role ?? "viewer") : prototypeRole;
   const readOnly = effectiveRole === "viewer" || effectiveRole === "reviewer";
   const canExport = effectiveRole !== "viewer";
-  const isAuthenticated = authMode === "provisional-local" || sessionActor !== null;
+  const isAuthenticated = bootState === "ready" && (authMode === "provisional-local" || sessionActor !== null);
   const hasUnsavedChanges =
-    draftBlocks !== null || draftTitle !== null || draftLanguage !== null || draftLayout !== null;
+    editorDirty || draftTitle !== null || draftLanguage !== null || draftLayout !== null;
+
   const hasUnsavedChangesRef = useRef(hasUnsavedChanges);
   useEffect(() => {
     hasUnsavedChangesRef.current = hasUnsavedChanges;
   }, [hasUnsavedChanges]);
 
+  // Warn browser unload when unsaved changes exist (H25)
+  useEffect(() => {
+    if (!hasUnsavedChanges) return;
+    const onBeforeUnload = (e: BeforeUnloadEvent) => {
+      e.preventDefault();
+      e.returnValue = "";
+    };
+    window.addEventListener("beforeunload", onBeforeUnload);
+    return () => window.removeEventListener("beforeunload", onBeforeUnload);
+  }, [hasUnsavedChanges]);
+
+  // Abort any in-flight fetches on unmount (H23)
+  useEffect(() => {
+    return () => {
+      listAbortRef.current?.abort();
+      historyAbortRef.current?.abort();
+      diffAbortRef.current?.abort();
+    };
+  }, []);
+
   const clearDrafts = useCallback(() => {
-    setDraftBlocks(null);
+    setEditorDirty(false);
     setDraftTitle(null);
     setDraftLanguage(null);
     setDraftLayout(null);
+  }, []);
+
+  const confirmDiscardUnsavedChanges = useCallback((actionDescription: string): boolean => {
+    if (!hasUnsavedChangesRef.current) return true;
+    return window.confirm(`You have unsaved changes on the current document. Discard them and ${actionDescription}?`);
   }, []);
 
   // In jwt-pg mode, rely exclusively on HttpOnly `aios_session` cookie (never send spoofable prototype headers)
@@ -133,19 +181,26 @@ export function App() {
     activeDocIdRef.current = activeDoc?.documentId ?? null;
   }, [activeDoc]);
 
-  // Detect backend auth mode & restore existing cookie session if running under jwt-pg
+  // Detect backend auth mode & restore existing cookie session if running under jwt-pg (M14 offline retry)
   useEffect(() => {
+    const controller = new AbortController();
     let cancelled = false;
     async function initAuth() {
+      setBootState("loading");
+      setErrorBanner(null);
+      setStatusMessage("Connecting to workspace API...");
       try {
-        const healthRes = await fetch("/api/health", { credentials: "include" });
+        const healthRes = await fetch("/api/health", { credentials: "include", signal: controller.signal });
+        if (!healthRes.ok) {
+          throw new Error(`API health check failed (HTTP ${healthRes.status})`);
+        }
         const health = await safeReadJson(healthRes);
         const detectedMode: AuthMode = health.authMode === "jwt-pg" ? "jwt-pg" : "provisional-local";
         if (cancelled) return;
         setAuthMode(detectedMode);
 
         if (detectedMode === "jwt-pg") {
-          const meRes = await fetch("/api/auth/me", { credentials: "include" });
+          const meRes = await fetch("/api/auth/me", { credentials: "include", signal: controller.signal });
           if (meRes.ok) {
             const meData = await safeReadJson(meRes);
             if (!cancelled && meData.actor) {
@@ -159,26 +214,27 @@ export function App() {
         } else {
           setStatusMessage("Ready (D1 Local Prototype — Loopback Only)");
         }
-      } catch {
-        if (!cancelled) {
-          setErrorBanner("Unable to reach API server. Verify the backend is running.");
-          setStatusMessage("API unreachable");
-        }
-      } finally {
-        if (!cancelled) setAuthInitialized(true);
+        if (!cancelled) setBootState("ready");
+      } catch (err) {
+        if (cancelled || (err instanceof DOMException && err.name === "AbortError")) return;
+        setErrorBanner("Unable to reach API server. Verify the backend is running and click Retry Connection.");
+        setStatusMessage("API unreachable");
+        setBootState("unreachable");
       }
     }
     void initAuth();
     return () => {
       cancelled = true;
+      controller.abort();
     };
-  }, []);
+  }, [bootAttempt]);
 
   const handleUnauthorized = useCallback(() => {
     if (authMode === "jwt-pg") {
       setSessionActor(null);
       setDocs([]);
       setTotalDocs(0);
+      setDocOffset(0);
       setActiveDoc(null);
       clearDrafts();
       setErrorBanner("Session expired or revoked. Please sign in again.");
@@ -186,61 +242,77 @@ export function App() {
     }
   }, [authMode, clearDrafts]);
 
-  const loadDocuments = useCallback(async (opts?: { forceSyncActive?: boolean }) => {
-    if (!authInitialized || !isAuthenticated) return;
-    setIsLoadingDocs(true);
-    try {
-      const qs = new URLSearchParams();
-      if (searchQuery.trim()) qs.set("q", searchQuery.trim());
-      if (languageFilter) qs.set("language", languageFilter);
-      qs.set("limit", "50");
-      const queryStr = qs.toString();
-      const res = await fetch(`/api/documents${queryStr ? `?${queryStr}` : ""}`, {
-        credentials: "include",
-        headers: apiHeaders,
-      });
-      if (res.status === 401) {
-        handleUnauthorized();
-        return;
-      }
-      const data = await safeReadJson(res);
-      if (!res.ok) {
-        setErrorBanner(String(data.error ?? "Failed to load workspace documents."));
-        return;
-      }
-      const list = (data.documents ?? []) as StudioDocument[];
-      setDocs(list);
-      setTotalDocs(typeof data.total === "number" ? data.total : list.length);
-      setErrorBanner(null);
+  const loadDocuments = useCallback(
+    async (opts?: { forceSyncActive?: boolean }) => {
+      if (bootState !== "ready" || !isAuthenticated) return;
+      listAbortRef.current?.abort();
+      const controller = new AbortController();
+      listAbortRef.current = controller;
+      const seq = ++listSeqRef.current;
 
-      const currentId = activeDocIdRef.current;
-      if (!currentId && list[0]) {
-        setActiveDoc(list[0]);
-      } else if (currentId) {
-        const refreshed = list.find((d) => d.documentId === currentId);
-        if (refreshed) {
-          if (opts?.forceSyncActive || !hasUnsavedChangesRef.current) {
-            setActiveDoc(refreshed);
-          } else {
-            setActiveDoc((prev) => {
-              if (prev && refreshed.revision !== prev.revision) {
-                setConflictMessage(
-                  `Server revision advanced to rev ${refreshed.revision} while you have unsaved edits on rev ${prev.revision}.`,
-                );
-              }
-              return prev;
-            });
+      setIsLoadingDocs(true);
+      try {
+        const qs = new URLSearchParams();
+        if (searchQuery.trim()) qs.set("q", searchQuery.trim());
+        if (languageFilter) qs.set("language", languageFilter);
+        qs.set("limit", String(PAGE_SIZE));
+        qs.set("offset", String(docOffset));
+        const res = await fetch(`/api/documents?${qs.toString()}`, {
+          credentials: "include",
+          headers: apiHeaders,
+          signal: controller.signal,
+        });
+        if (seq !== listSeqRef.current) return;
+        if (res.status === 401) {
+          handleUnauthorized();
+          return;
+        }
+        const data = await safeReadJson(res);
+        if (seq !== listSeqRef.current) return;
+        if (!res.ok) {
+          setErrorBanner(formatApiErrorMessage(res, data, "Failed to load workspace documents."));
+          return;
+        }
+        const list = (data.documents ?? []) as StudioDocument[];
+        setDocs(list);
+        setTotalDocs(typeof data.total === "number" ? data.total : list.length);
+        setErrorBanner(null);
+
+        const currentId = activeDocIdRef.current;
+        if (!currentId && list[0]) {
+          setActiveDoc(list[0]);
+        } else if (currentId) {
+          const refreshed = list.find((d) => d.documentId === currentId);
+          if (refreshed) {
+            if (opts?.forceSyncActive || !hasUnsavedChangesRef.current) {
+              setActiveDoc(refreshed);
+            } else {
+              setActiveDoc((prev) => {
+                if (prev && refreshed.revision !== prev.revision) {
+                  setConflictMessage(
+                    `Server revision advanced to rev ${refreshed.revision} while you have unsaved edits on rev ${prev.revision}.`,
+                  );
+                }
+                return prev;
+              });
+            }
+          } else if (!searchQuery.trim() && !languageFilter && docOffset === 0 && !hasUnsavedChangesRef.current) {
+            setActiveDoc(list[0] ?? null);
           }
-        } else if (!searchQuery.trim() && !languageFilter && !hasUnsavedChangesRef.current) {
-          setActiveDoc(list[0] ?? null);
+        }
+      } catch (err) {
+        if (err instanceof DOMException && err.name === "AbortError") return;
+        if (seq === listSeqRef.current) {
+          setErrorBanner("Network error while loading workspace documents.");
+        }
+      } finally {
+        if (seq === listSeqRef.current) {
+          setIsLoadingDocs(false);
         }
       }
-    } catch {
-      setErrorBanner("Network error while loading workspace documents.");
-    } finally {
-      setIsLoadingDocs(false);
-    }
-  }, [apiHeaders, authInitialized, isAuthenticated, handleUnauthorized, searchQuery, languageFilter]);
+    },
+    [apiHeaders, bootState, isAuthenticated, handleUnauthorized, searchQuery, languageFilter, docOffset],
+  );
 
   useEffect(() => {
     const timer = window.setTimeout(() => {
@@ -268,11 +340,12 @@ export function App() {
       });
       const data = await safeReadJson(res);
       if (!res.ok) {
-        setErrorBanner(String(data.error ?? "Sign in failed. Verify credentials and tenant/workspace IDs."));
+        setErrorBanner(formatApiErrorMessage(res, data, "Sign in failed. Verify credentials and tenant/workspace IDs."));
         return;
       }
       setSessionActor(data.actor as ActorContext);
       setLoginPassword("");
+      setDocOffset(0);
       setStatusMessage("Signed in via HttpOnly session cookie (PostgreSQL RLS).");
     } catch {
       setErrorBanner("Network error during sign in.");
@@ -282,19 +355,39 @@ export function App() {
   }
 
   async function handleLogout(revokeAll = false) {
+    if (!confirmDiscardUnsavedChanges(revokeAll ? "revoke all active sessions" : "sign out")) return;
+    setErrorBanner(null);
     try {
-      await fetch(revokeAll ? "/api/auth/revoke-sessions" : "/api/auth/logout", {
+      const res = await fetch(revokeAll ? "/api/auth/revoke-sessions" : "/api/auth/logout", {
         method: "POST",
         credentials: "include",
       });
-    } finally {
+      if (!res.ok && res.status !== 401) {
+        const data = await safeReadJson(res);
+        // Truthful error feedback when server-side revocation fails (M14)
+        setErrorBanner(
+          formatApiErrorMessage(
+            res,
+            data,
+            revokeAll ? "Server failed to revoke all sessions. Please retry." : "Sign out request failed.",
+          ),
+        );
+        return;
+      }
       setSessionActor(null);
       setDocs([]);
       setTotalDocs(0);
+      setDocOffset(0);
       setActiveDoc(null);
       clearDrafts();
       setConflictMessage(null);
       setStatusMessage(revokeAll ? "All sessions revoked." : "Signed out.");
+    } catch {
+      setErrorBanner(
+        revokeAll
+          ? "Network error while revoking sessions — existing sessions may still be active."
+          : "Network error during sign out. Please retry.",
+      );
     }
   }
 
@@ -312,7 +405,7 @@ export function App() {
       }
       const data = await safeReadJson(res);
       if (!res.ok) {
-        setErrorBanner(String(data.error ?? "Failed to reload latest document."));
+        setErrorBanner(formatApiErrorMessage(res, data, "Failed to reload latest document."));
         return;
       }
       const latest = data.document as StudioDocument;
@@ -329,6 +422,8 @@ export function App() {
   async function handleCreateBlankDocument(e: FormEvent) {
     e.preventDefault();
     if (readOnly || isCreatingDoc || !newDocTitle.trim()) return;
+    if (!confirmDiscardUnsavedChanges("create a new document")) return;
+    setNewDocError(null);
     setErrorBanner(null);
     setIsCreatingDoc(true);
     try {
@@ -353,7 +448,7 @@ export function App() {
       }
       const data = await safeReadJson(res);
       if (!res.ok) {
-        setErrorBanner(String(data.error ?? "Failed to create document."));
+        setNewDocError(formatApiErrorMessage(res, data, "Failed to create document."));
         return;
       }
       const created = data.document as StudioDocument;
@@ -362,10 +457,12 @@ export function App() {
       setConflictMessage(null);
       setNewDocModalOpen(false);
       setNewDocTitle("");
+      setNewDocError(null);
+      setDocOffset(0);
       await loadDocuments();
       setStatusMessage(`Created '${created.title}' (${created.layout.size} ${created.layout.orientation}).`);
     } catch {
-      setErrorBanner("Network error creating new document.");
+      setNewDocError("Network error creating new document.");
     } finally {
       setIsCreatingDoc(false);
     }
@@ -375,12 +472,13 @@ export function App() {
     const file = e.target.files?.[0];
     e.target.value = "";
     if (!file || readOnly || isImportingDocx) return;
+    if (!confirmDiscardUnsavedChanges("import a DOCX file")) return;
     if (!file.name.toLowerCase().endsWith(".docx")) {
       setErrorBanner("Only .docx files are supported for Document Studio import (.docm macros are blocked).");
       return;
     }
-    if (file.size > 15 * 1024 * 1024) {
-      setErrorBanner("DOCX file exceeds 15 MB safety limit.");
+    if (file.size > MAX_DOCX_UPLOAD_BYTES) {
+      setErrorBanner("DOCX file exceeds 10 MB safety limit.");
       return;
     }
     setErrorBanner(null);
@@ -401,7 +499,7 @@ export function App() {
       }
       const data = await safeReadJson(res);
       if (!res.ok) {
-        setErrorBanner(String(data.error ?? "DOCX import failed."));
+        setErrorBanner(formatApiErrorMessage(res, data, "DOCX import failed."));
         setStatusMessage("DOCX import rejected.");
         return;
       }
@@ -409,6 +507,7 @@ export function App() {
       const diagnostics = data.diagnostics as { originalSha256?: string; warnings?: string[] } | undefined;
       setActiveDoc(created);
       clearDrafts();
+      setDocOffset(0);
       await loadDocuments();
       const shaPrefix = diagnostics?.originalSha256?.slice(0, 10) ?? "verified";
       const warnCount = diagnostics?.warnings?.length ?? 0;
@@ -424,6 +523,7 @@ export function App() {
 
   async function handleSeedBilingual() {
     if (readOnly || isSeeding) return;
+    if (!confirmDiscardUnsavedChanges("load a new bilingual sample document")) return;
     setErrorBanner(null);
     setConflictMessage(null);
     setIsSeeding(true);
@@ -442,10 +542,11 @@ export function App() {
         const created = data.document as StudioDocument;
         setActiveDoc(created);
         clearDrafts();
+        setDocOffset(0);
         await loadDocuments();
         setStatusMessage("Loaded bilingual English/Khmer management report fixture.");
       } else {
-        const msg = String(data.error ?? "Failed to create fixture");
+        const msg = formatApiErrorMessage(res, data, "Failed to create fixture");
         setErrorBanner(msg);
         setStatusMessage(msg);
       }
@@ -461,6 +562,12 @@ export function App() {
     setErrorBanner(null);
     setIsSaving(true);
     try {
+      // Serialize Tiptap JSON into canonical DocumentBlock[] strictly on Save (H24)
+      const currentJson = editorDirty ? editorRef.current?.getCurrentTiptapJson() : null;
+      const blocksToSave = currentJson
+        ? fromTiptapJson(currentJson as unknown as TiptapNode, activeDoc.blocks)
+        : activeDoc.blocks;
+
       const res = await fetch(`/api/documents/${encodeURIComponent(activeDoc.documentId)}`, {
         method: "PUT",
         credentials: "include",
@@ -470,7 +577,7 @@ export function App() {
           title: (draftTitle ?? activeDoc.title).trim().normalize("NFC"),
           language: draftLanguage ?? activeDoc.language,
           layout: draftLayout ?? activeDoc.layout,
-          blocks: draftBlocks ?? activeDoc.blocks,
+          blocks: blocksToSave,
           summary: "Manual editor save",
         }),
       });
@@ -496,7 +603,7 @@ export function App() {
         await loadDocuments();
         setStatusMessage(`Saved revision ${saved.revision}.`);
       } else {
-        const msg = String(data.error ?? "Save failed");
+        const msg = formatApiErrorMessage(res, data, "Save failed");
         setErrorBanner(msg);
         setStatusMessage(msg);
       }
@@ -508,13 +615,13 @@ export function App() {
   }, [
     activeDoc,
     hasUnsavedChanges,
+    editorDirty,
     readOnly,
     isSaving,
     apiHeaders,
     draftTitle,
     draftLanguage,
     draftLayout,
-    draftBlocks,
     handleUnauthorized,
     clearDrafts,
     loadDocuments,
@@ -548,7 +655,7 @@ export function App() {
       }
       if (!res.ok) {
         const data = await safeReadJson(res);
-        const msg = String(data.error ?? `${kind.toUpperCase()} export failed`);
+        const msg = formatApiErrorMessage(res, data, `${kind.toUpperCase()} export failed`);
         setErrorBanner(msg);
         setStatusMessage(msg);
         return;
@@ -559,7 +666,8 @@ export function App() {
       a.href = url;
       a.download = `${activeDoc.documentId}-rev${activeDoc.revision}.${kind}`;
       a.click();
-      URL.revokeObjectURL(url);
+      // Defer object URL revocation so Safari & slow download managers finish streaming cleanly (M14)
+      window.setTimeout(() => URL.revokeObjectURL(url), 60_000);
       setStatusMessage(`Exported ${kind.toUpperCase()} snapshot (rev ${activeDoc.revision}).`);
     } catch {
       setErrorBanner(`Network error during ${kind.toUpperCase()} export.`);
@@ -570,6 +678,11 @@ export function App() {
 
   async function openHistory() {
     if (!activeDoc) return;
+    historyAbortRef.current?.abort();
+    const controller = new AbortController();
+    historyAbortRef.current = controller;
+    const seq = ++historySeqRef.current;
+
     setErrorBanner(null);
     setHistoryOpen(true);
     setIsLoadingHistory(true);
@@ -578,108 +691,147 @@ export function App() {
         fetch(`/api/documents/${encodeURIComponent(activeDoc.documentId)}/versions`, {
           credentials: "include",
           headers: apiHeaders,
+          signal: controller.signal,
         }),
         fetch(`/api/documents/${encodeURIComponent(activeDoc.documentId)}/audit`, {
           credentials: "include",
           headers: apiHeaders,
+          signal: controller.signal,
         }),
       ]);
+      if (seq !== historySeqRef.current) return;
       if (vRes.status === 401 || aRes.status === 401) {
         setHistoryOpen(false);
         handleUnauthorized();
         return;
       }
       if (!vRes.ok || !aRes.ok) {
-        const errData = await safeReadJson(!vRes.ok ? vRes : aRes);
-        setErrorBanner(String(errData.error ?? "Failed to load version & audit history."));
+        const badRes = !vRes.ok ? vRes : aRes;
+        const errData = await safeReadJson(badRes);
+        setErrorBanner(formatApiErrorMessage(badRes, errData, "Failed to load version & audit history."));
         setHistoryOpen(false);
         return;
       }
       const vData = await safeReadJson(vRes);
       const aData = await safeReadJson(aRes);
+      if (seq !== historySeqRef.current) return;
       setVersions((vData.versions ?? []) as DocumentVersion[]);
       setAuditEvents((aData.events ?? []) as AuditEvent[]);
-    } catch {
-      setErrorBanner("Network error loading version & audit history.");
-      setHistoryOpen(false);
+    } catch (err) {
+      if (err instanceof DOMException && err.name === "AbortError") return;
+      if (seq === historySeqRef.current) {
+        setErrorBanner("Network error loading version & audit history.");
+        setHistoryOpen(false);
+      }
     } finally {
-      setIsLoadingHistory(false);
+      if (seq === historySeqRef.current) {
+        setIsLoadingHistory(false);
+      }
     }
   }
 
-  async function handleCompareRevision(fromRev: number, toRev: number): Promise<RevisionDiffPayload | null> {
-    if (!activeDoc) return null;
-    try {
-      const res = await fetch(
-        `/api/documents/${encodeURIComponent(activeDoc.documentId)}/versions/${fromRev}/diff/${toRev}`,
-        { credentials: "include", headers: apiHeaders },
-      );
-      if (res.status === 401) {
-        setHistoryOpen(false);
-        handleUnauthorized();
+  const handleCompareRevision = useCallback(
+    async (fromRev: number, toRev: number): Promise<RevisionDiffPayload | null> => {
+      if (!activeDoc) return null;
+      diffAbortRef.current?.abort();
+      const controller = new AbortController();
+      diffAbortRef.current = controller;
+      try {
+        const res = await fetch(
+          `/api/documents/${encodeURIComponent(activeDoc.documentId)}/versions/${fromRev}/diff/${toRev}`,
+          { credentials: "include", headers: apiHeaders, signal: controller.signal },
+        );
+        if (res.status === 401) {
+          setHistoryOpen(false);
+          handleUnauthorized();
+          return null;
+        }
+        const data = await safeReadJson(res);
+        if (!res.ok) {
+          setErrorBanner(formatApiErrorMessage(res, data, "Failed to compute revision diff."));
+          return null;
+        }
+        return (data.diff ?? null) as RevisionDiffPayload | null;
+      } catch (err) {
+        if (err instanceof DOMException && err.name === "AbortError") return null;
+        setErrorBanner("Network error loading revision diff.");
         return null;
       }
-      const data = await safeReadJson(res);
-      if (!res.ok) {
-        setErrorBanner(String(data.error ?? "Failed to compute revision diff."));
-        return null;
-      }
-      return (data.diff ?? null) as RevisionDiffPayload | null;
-    } catch {
-      setErrorBanner("Network error loading revision diff.");
-      return null;
-    }
-  }
+    },
+    [activeDoc, apiHeaders, handleUnauthorized],
+  );
 
-  async function handleRestore(revision: number) {
-    if (!activeDoc || readOnly || restoringRevision !== null) return;
-    setErrorBanner(null);
-    setRestoringRevision(revision);
-    try {
-      const res = await fetch(
-        `/api/documents/${encodeURIComponent(activeDoc.documentId)}/versions/${revision}/restore`,
-        {
-          method: "POST",
-          credentials: "include",
-          headers: apiHeaders,
-        },
-      );
-      if (res.status === 401) {
-        setHistoryOpen(false);
-        handleUnauthorized();
-        return;
+  const handleRestore = useCallback(
+    async (revision: number) => {
+      if (!activeDoc || readOnly || restoringRevision !== null) return;
+      if (!confirmDiscardUnsavedChanges(`restore revision ${revision}`)) return;
+      setErrorBanner(null);
+      setRestoringRevision(revision);
+      try {
+        const res = await fetch(
+          `/api/documents/${encodeURIComponent(activeDoc.documentId)}/versions/${revision}/restore`,
+          {
+            method: "POST",
+            credentials: "include",
+            headers: apiHeaders,
+          },
+        );
+        if (res.status === 401) {
+          setHistoryOpen(false);
+          handleUnauthorized();
+          return;
+        }
+        const data = await safeReadJson(res);
+        if (res.ok) {
+          const restored = data.document as StudioDocument;
+          setActiveDoc(restored);
+          clearDrafts();
+          setConflictMessage(null);
+          setHistoryOpen(false);
+          await loadDocuments();
+          setStatusMessage(`Restored revision ${revision} as new revision ${restored.revision}.`);
+        } else {
+          const msg = formatApiErrorMessage(res, data, "Restore failed");
+          setErrorBanner(msg);
+          setStatusMessage(msg);
+        }
+      } catch {
+        setErrorBanner("Network error restoring document revision.");
+      } finally {
+        setRestoringRevision(null);
       }
-      const data = await safeReadJson(res);
-      if (res.ok) {
-        const restored = data.document as StudioDocument;
-        setActiveDoc(restored);
-        clearDrafts();
-        setConflictMessage(null);
-        setHistoryOpen(false);
-        await loadDocuments();
-        setStatusMessage(`Restored revision ${revision} as new revision ${restored.revision}.`);
-      } else {
-        const msg = String(data.error ?? "Restore failed");
-        setErrorBanner(msg);
-        setStatusMessage(msg);
-      }
-    } catch {
-      setErrorBanner("Network error restoring document revision.");
-    } finally {
-      setRestoringRevision(null);
-    }
-  }
+    },
+    [activeDoc, readOnly, restoringRevision, confirmDiscardUnsavedChanges, apiHeaders, handleUnauthorized, clearDrafts, loadDocuments],
+  );
 
   function handleSelectDocument(nextDoc: StudioDocument) {
     if (activeDoc?.documentId === nextDoc.documentId) return;
-    if (hasUnsavedChanges) {
-      const confirmed = window.confirm("You have unsaved changes on the current document. Discard and switch?");
-      if (!confirmed) return;
-    }
+    if (!confirmDiscardUnsavedChanges("switch documents")) return;
     setActiveDoc(nextDoc);
     clearDrafts();
     setConflictMessage(null);
   }
+
+  function handlePrototypeRoleChange(nextRole: WorkspaceRole) {
+    if (!confirmDiscardUnsavedChanges(`switch role to ${nextRole}`)) return;
+    setPrototypeRole(nextRole);
+  }
+
+  const handleAiDocumentUpdated = useCallback(async () => {
+    clearDrafts();
+    await loadDocuments({ forceSyncActive: true });
+  }, [clearDrafts, loadDocuments]);
+
+  const handleCloseHistory = useCallback(() => {
+    historyAbortRef.current?.abort();
+    diffAbortRef.current?.abort();
+    setHistoryOpen(false);
+  }, []);
+
+  const handleCloseNewDocModal = useCallback(() => {
+    setNewDocModalOpen(false);
+    setNewDocError(null);
+  }, []);
 
   const effectiveActiveDoc = useMemo((): StudioDocument | null => {
     if (!activeDoc) return null;
@@ -697,18 +849,23 @@ export function App() {
       : { type: "doc", content: [] };
   }, [activeDoc]);
 
+  const pageStart = totalDocs === 0 ? 0 : docOffset + 1;
+  const pageEnd = Math.min(docOffset + docs.length, totalDocs);
+  const hasPrevPage = docOffset > 0;
+  const hasNextPage = docOffset + PAGE_SIZE < totalDocs;
+
   return (
     <div className="app-shell">
       <header className="topbar">
         <div className="brand">
-          <span>AI Office Suite</span>
+          <h1 className="brand-title">AI Office Suite</h1>
           <span className="badge">
             {authMode === "jwt-pg" ? "Document Studio · JWT + PG RLS" : "Document Studio · D1 Prototype"}
           </span>
         </div>
 
         <nav className="studio-tabs" aria-label="Workspace Studios">
-          <button type="button" className="studio-tab active">
+          <button type="button" className="studio-tab active" aria-current="page">
             Document Studio
           </button>
           {PLANNED_FUTURE_STUDIOS.map((studio) => (
@@ -724,7 +881,17 @@ export function App() {
           ))}
         </nav>
 
-        <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12 }}>
+        <div className="topbar-controls">
+          {bootState === "ready" && isAuthenticated && (
+            <button
+              type="button"
+              className="btn mobile-drawer-toggle"
+              aria-expanded={sidebarOpen}
+              onClick={() => setSidebarOpen((v) => !v)}
+            >
+              {sidebarOpen ? "Hide Docs" : "Documents"}
+            </button>
+          )}
           {authMode === "jwt-pg" ? (
             sessionActor ? (
               <>
@@ -747,12 +914,12 @@ export function App() {
               <span className="badge badge-warn">Not Signed In</span>
             )
           ) : (
-            <label>
+            <label className="role-selector-label">
               Role:&nbsp;
               <select
                 className="btn"
                 value={prototypeRole}
-                onChange={(e) => setPrototypeRole(e.target.value as WorkspaceRole)}
+                onChange={(e) => handlePrototypeRoleChange(e.target.value as WorkspaceRole)}
               >
                 <option value="editor">Editor</option>
                 <option value="owner">Owner</option>
@@ -761,7 +928,12 @@ export function App() {
               </select>
             </label>
           )}
-          <button type="button" className="btn" onClick={() => setPanelOpen((v) => !v)}>
+          <button
+            type="button"
+            className="btn"
+            aria-expanded={panelOpen}
+            onClick={() => setPanelOpen((v) => !v)}
+          >
             {panelOpen ? "Hide AI Panel" : "Show AI Panel"}
           </button>
         </div>
@@ -781,7 +953,7 @@ export function App() {
           <span>
             <strong>Revision Conflict (409):</strong> {conflictMessage}
           </span>
-          <div style={{ display: "flex", gap: 6 }}>
+          <div className="row-actions-tight">
             <button type="button" className="btn primary" onClick={() => void reloadActiveDocument()}>
               Reload Latest Revision
             </button>
@@ -792,18 +964,36 @@ export function App() {
         </div>
       )}
 
-      {!authInitialized ? (
+      {bootState === "loading" ? (
         <main className="canvas-area">
-          <div className="preview-card" style={{ maxWidth: 420, marginTop: 60 }} role="status">
+          <div className="preview-card boot-status-card" role="status">
             <strong>Initializing AI Office Suite Workspace...</strong>
             <span>Checking API auth mode and active session.</span>
+          </div>
+        </main>
+      ) : bootState === "unreachable" ? (
+        <main className="canvas-area">
+          <div className="preview-card boot-status-card" role="alert">
+            <strong>Workspace API Unreachable</strong>
+            <span className="muted-text">
+              Could not verify API health or authentication mode. Ensure the backend service is running, then retry.
+            </span>
+            <div className="row-actions">
+              <button
+                type="button"
+                className="btn primary"
+                onClick={() => setBootAttempt((n) => n + 1)}
+              >
+                Retry Connection
+              </button>
+            </div>
           </div>
         </main>
       ) : authMode === "jwt-pg" && !sessionActor ? (
         <main className="canvas-area">
           <form className="auth-card" onSubmit={(e) => void handleLogin(e)}>
-            <h2 style={{ margin: "0 0 6px 0", fontSize: 18 }}>Sign In (PostgreSQL RLS Session)</h2>
-            <p style={{ margin: "0 0 12px 0", fontSize: 12, color: "#475569" }}>
+            <h2 className="auth-card-title">Sign In (PostgreSQL RLS Session)</h2>
+            <p className="auth-card-subtitle">
               Authenticates via HttpOnly <code>aios_session</code> cookie with CSRF protection and tenant isolation.
             </p>
             <label>
@@ -857,12 +1047,15 @@ export function App() {
         </main>
       ) : (
         <>
-          <div className="toolbar">
+          <div className="toolbar" role="toolbar" aria-label="Workspace Actions">
             <button
               type="button"
               className="btn primary"
               disabled={readOnly}
-              onClick={() => setNewDocModalOpen(true)}
+              onClick={() => {
+                setNewDocError(null);
+                setNewDocModalOpen(true);
+              }}
             >
               + New Document
             </button>
@@ -886,7 +1079,8 @@ export function App() {
               ref={fileInputRef}
               type="file"
               accept=".docx"
-              style={{ display: "none" }}
+              aria-label="Import DOCX file"
+              className="visually-hidden"
               onChange={(e) => void handleDocxFileSelected(e)}
             />
             <button
@@ -921,69 +1115,105 @@ export function App() {
             </button>
           </div>
 
-          <div className={`workspace-body ${panelOpen ? "" : "panel-collapsed"}`}>
-            <aside className="sidebar" aria-label="Workspace Documents">
-              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-                <strong style={{ fontSize: 12 }}>Documents ({totalDocs})</strong>
-                <button
-                  type="button"
-                  className="btn"
-                  style={{ padding: "2px 6px", fontSize: 11 }}
-                  disabled={isLoadingDocs}
-                  onClick={() => void loadDocuments()}
-                >
-                  {isLoadingDocs ? "..." : "Refresh"}
-                </button>
-              </div>
-              <div className="sidebar-filters">
-                <input
-                  type="search"
-                  className="input-field"
-                  style={{ padding: "5px 8px", fontSize: 12 }}
-                  placeholder="Search title..."
-                  aria-label="Search documents by title"
-                  value={searchQuery}
-                  onChange={(e) => setSearchQuery(e.target.value)}
-                />
-                <select
-                  className="input-field"
-                  style={{ padding: "4px 8px", fontSize: 12 }}
-                  aria-label="Filter documents by language"
-                  value={languageFilter}
-                  onChange={(e) => setLanguageFilter(e.target.value as "" | "en" | "km" | "bilingual")}
-                >
-                  <option value="">All Languages</option>
-                  <option value="bilingual">Bilingual (EN/KM)</option>
-                  <option value="en">English</option>
-                  <option value="km">ខ្មែរ (Khmer)</option>
-                </select>
-              </div>
-              {isLoadingDocs && docs.length === 0 && (
-                <div style={{ fontSize: 12, color: "#64748b" }} role="status">
-                  Loading documents...
+          <div
+            className={`workspace-body ${panelOpen ? "" : "panel-collapsed"} ${sidebarOpen ? "" : "sidebar-collapsed"}`}
+          >
+            {sidebarOpen && (
+              <aside className="sidebar" aria-label="Workspace Documents">
+                <div className="panel-header-row">
+                  <strong className="sidebar-title">Documents ({totalDocs})</strong>
+                  <button
+                    type="button"
+                    className="btn btn-compact"
+                    disabled={isLoadingDocs}
+                    onClick={() => void loadDocuments()}
+                  >
+                    {isLoadingDocs ? "..." : "Refresh"}
+                  </button>
                 </div>
-              )}
-              {!isLoadingDocs && docs.length === 0 && (
-                <div style={{ fontSize: 12, color: "#64748b" }}>
-                  {searchQuery || languageFilter
-                    ? "No matching documents found."
-                    : 'No documents yet. Click "+ New Document" or "+ Bilingual EN/KM Sample".'}
+                <div className="sidebar-filters">
+                  <input
+                    type="search"
+                    className="input-field input-compact"
+                    placeholder="Search title..."
+                    aria-label="Search documents by title"
+                    value={searchQuery}
+                    onChange={(e) => {
+                      setSearchQuery(e.target.value);
+                      setDocOffset(0);
+                    }}
+                  />
+                  <select
+                    className="input-field input-compact"
+                    aria-label="Filter documents by language"
+                    value={languageFilter}
+                    onChange={(e) => {
+                      setLanguageFilter(e.target.value as "" | "en" | "km" | "bilingual");
+                      setDocOffset(0);
+                    }}
+                  >
+                    <option value="">All Languages</option>
+                    <option value="bilingual">Bilingual (EN/KM)</option>
+                    <option value="en">English</option>
+                    <option value="km">ខ្មែរ (Khmer)</option>
+                  </select>
                 </div>
-              )}
-              {docs.map((d) => (
-                <button
-                  key={d.documentId}
-                  type="button"
-                  className={`doc-item ${activeDoc?.documentId === d.documentId ? "selected" : ""}`}
-                  onClick={() => handleSelectDocument(d)}
-                >
-                  <div style={{ fontWeight: 600 }}>{d.title}</div>
-                  <div style={{ fontSize: 11, color: "#64748b" }}>
-                    Rev {d.revision} · {d.language} · {d.layout.size}
+                {isLoadingDocs && docs.length === 0 && (
+                  <div className="muted-text" role="status">
+                    Loading documents...
                   </div>
-                </button>
-              ))}
-            </aside>
+                )}
+                {!isLoadingDocs && docs.length === 0 && (
+                  <div className="muted-text">
+                    {searchQuery || languageFilter
+                      ? "No matching documents found."
+                      : 'No documents yet. Click "+ New Document" or "+ Bilingual EN/KM Sample".'}
+                  </div>
+                )}
+                {docs.map((d) => {
+                  const isSelected = activeDoc?.documentId === d.documentId;
+                  return (
+                    <button
+                      key={d.documentId}
+                      type="button"
+                      aria-current={isSelected ? "true" : undefined}
+                      className={`doc-item ${isSelected ? "selected" : ""}`}
+                      onClick={() => handleSelectDocument(d)}
+                    >
+                      <div className="strong-text">{d.title}</div>
+                      <div className="meta-caption">
+                        Rev {d.revision} · {d.language} · {d.layout.size}
+                      </div>
+                    </button>
+                  );
+                })}
+                {totalDocs > PAGE_SIZE && (
+                  <div className="pagination-bar" role="navigation" aria-label="Document pagination">
+                    <span className="meta-caption">
+                      {pageStart}–{pageEnd} of {totalDocs}
+                    </span>
+                    <div className="row-actions-tight">
+                      <button
+                        type="button"
+                        className="btn btn-compact"
+                        disabled={!hasPrevPage || isLoadingDocs}
+                        onClick={() => setDocOffset((prev) => Math.max(0, prev - PAGE_SIZE))}
+                      >
+                        Prev
+                      </button>
+                      <button
+                        type="button"
+                        className="btn btn-compact"
+                        disabled={!hasNextPage || isLoadingDocs}
+                        onClick={() => setDocOffset((prev) => prev + PAGE_SIZE)}
+                      >
+                        Next
+                      </button>
+                    </div>
+                  </div>
+                )}
+              </aside>
+            )}
 
             <main className="canvas-area">
               {effectiveActiveDoc && activeDoc ? (
@@ -1039,16 +1269,19 @@ export function App() {
                       <option value="landscape">Landscape</option>
                     </select>
                   </div>
-                  <DocumentEditor
-                    document={effectiveActiveDoc}
-                    tiptapContent={tiptapContent}
-                    readOnly={readOnly}
-                    onDocChange={(json) => setDraftBlocks(fromTiptapJson(json as unknown as TiptapNode, activeDoc.blocks))}
-                    onSelectionChange={setSelection}
-                  />
+                  <ErrorBoundary scopeLabel="Document Editor">
+                    <DocumentEditor
+                      ref={editorRef}
+                      document={effectiveActiveDoc}
+                      tiptapContent={tiptapContent}
+                      readOnly={readOnly}
+                      onDirtyChange={setEditorDirty}
+                      onSelectionChange={setSelection}
+                    />
+                  </ErrorBoundary>
                 </>
               ) : (
-                <div className="preview-card" style={{ maxWidth: 460, marginTop: 60 }}>
+                <div className="preview-card welcome-card">
                   <strong>Welcome to AI Office Suite</strong>
                   <span>
                     Create a new document, import a <code>.docx</code> file, or load the bilingual English &amp; Khmer
@@ -1067,11 +1300,10 @@ export function App() {
                 selectionBlockId={selection.blockId}
                 selectedText={selection.selectedText}
                 selectionGraphemeCount={selection.graphemeCount}
-                onDocumentUpdated={async () => {
-                  clearDrafts();
-                  await loadDocuments({ forceSyncActive: true });
-                }}
-                onRevisionConflict={(msg) => setConflictMessage(msg)}
+                selectionStartOffset={selection.startOffset}
+                selectionEndOffset={selection.endOffset}
+                onDocumentUpdated={handleAiDocumentUpdated}
+                onRevisionConflict={setConflictMessage}
                 onUnauthorized={handleUnauthorized}
                 apiHeaders={apiHeaders}
               />
@@ -1081,96 +1313,55 @@ export function App() {
       )}
 
       <footer className="statusbar">
-        <span>{statusMessage}</span>
+        <span role="status" aria-live="polite">
+          {statusMessage}
+        </span>
         <span>
           English / ខ្មែរ · {authMode === "jwt-pg" ? "PostgreSQL RLS Storage" : "Local Prototype Storage"}
         </span>
       </footer>
 
       {newDocModalOpen && (
-        <div
-          className="modal-backdrop"
-          role="dialog"
-          aria-modal="true"
-          aria-label="Create New Document"
-          onClick={(e) => {
-            if (e.target === e.currentTarget) setNewDocModalOpen(false);
-          }}
-        >
-          <form className="modal-card" onSubmit={(e) => void handleCreateBlankDocument(e)}>
-            <h3 style={{ margin: 0 }}>Create New Document</h3>
-            <label>
-              Title
-              <input
-                type="text"
-                required
-                maxLength={200}
-                className="input-field"
-                value={newDocTitle}
-                onChange={(e) => setNewDocTitle(e.target.value)}
-                placeholder="e.g. របាយការណ៍ហិរញ្ញវត្ថុ Q4 / Q4 Finance Brief"
-              />
-            </label>
-            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 8 }}>
-              <label>
-                Language
-                <select
-                  className="input-field"
-                  value={newDocLanguage}
-                  onChange={(e) => setNewDocLanguage(e.target.value as "en" | "km" | "bilingual")}
-                >
-                  <option value="bilingual">Bilingual</option>
-                  <option value="en">English</option>
-                  <option value="km">ខ្មែរ</option>
-                </select>
-              </label>
-              <label>
-                Page Size
-                <select
-                  className="input-field"
-                  value={newDocSize}
-                  onChange={(e) => setNewDocSize(e.target.value as "A4" | "Letter")}
-                >
-                  <option value="A4">A4</option>
-                  <option value="Letter">Letter</option>
-                </select>
-              </label>
-              <label>
-                Orientation
-                <select
-                  className="input-field"
-                  value={newDocOrientation}
-                  onChange={(e) => setNewDocOrientation(e.target.value as "portrait" | "landscape")}
-                >
-                  <option value="portrait">Portrait</option>
-                  <option value="landscape">Landscape</option>
-                </select>
-              </label>
-            </div>
-            <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginTop: 6 }}>
-              <button type="button" className="btn" onClick={() => setNewDocModalOpen(false)}>
-                Cancel
-              </button>
-              <button type="submit" className="btn primary" disabled={isCreatingDoc || !newDocTitle.trim()}>
-                {isCreatingDoc ? "Creating..." : "Create Document"}
-              </button>
-            </div>
-          </form>
-        </div>
+        <NewDocumentModal
+          title={newDocTitle}
+          language={newDocLanguage}
+          size={newDocSize}
+          orientation={newDocOrientation}
+          isCreating={isCreatingDoc}
+          errorMessage={newDocError}
+          onTitleChange={setNewDocTitle}
+          onLanguageChange={setNewDocLanguage}
+          onSizeChange={setNewDocSize}
+          onOrientationChange={setNewDocOrientation}
+          onSubmit={handleCreateBlankDocument}
+          onClose={handleCloseNewDocModal}
+        />
       )}
 
       {historyOpen && (
-        <VersionAuditDrawer
-          versions={versions}
-          auditEvents={auditEvents}
-          currentRevision={activeDoc?.revision}
-          readOnly={readOnly}
-          isLoading={isLoadingHistory}
-          restoringRevision={restoringRevision}
-          onRestore={handleRestore}
-          onCompareRevision={handleCompareRevision}
-          onClose={() => setHistoryOpen(false)}
-        />
+        <Suspense
+          fallback={
+            <div className="drawer-backdrop" role="dialog" aria-modal="true" aria-label="Loading history drawer">
+              <div className="drawer-panel">
+                <div className="preview-card" role="status">
+                  Loading version &amp; audit drawer...
+                </div>
+              </div>
+            </div>
+          }
+        >
+          <LazyVersionAuditDrawer
+            versions={versions}
+            auditEvents={auditEvents}
+            currentRevision={activeDoc?.revision}
+            readOnly={readOnly}
+            isLoading={isLoadingHistory}
+            restoringRevision={restoringRevision}
+            onRestore={handleRestore}
+            onCompareRevision={handleCompareRevision}
+            onClose={handleCloseHistory}
+          />
+        </Suspense>
       )}
     </div>
   );

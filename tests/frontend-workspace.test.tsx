@@ -6,6 +6,8 @@ import { fromTiptapJson, toTiptapJson, type TiptapNode } from "@ai-office-suite/
 import { DocumentEditor } from "../apps/web/src/components/DocumentEditor.tsx";
 import { VersionAuditDrawer } from "../apps/web/src/components/VersionAuditDrawer.tsx";
 import { AiVoicePanel } from "../apps/web/src/components/AiVoicePanel.tsx";
+import { ErrorBoundary } from "../apps/web/src/components/ErrorBoundary.tsx";
+import { NewDocumentModal } from "../apps/web/src/components/NewDocumentModal.tsx";
 import { App } from "../apps/web/src/App.tsx";
 
 const sampleBilingualDoc: StudioDocument = {
@@ -249,5 +251,158 @@ describe("Wave 1 Frontend & Tiptap Codec Verification (C8 & C9)", () => {
       expect(screen.getByText(/Sign In \(PostgreSQL RLS Session\)/)).toBeTruthy();
     });
     expect(screen.getByPlaceholderText("editor@company.example")).toBeTruthy();
+  });
+
+  it("Wave 5B (H25, H26, M14, M15, M16): verifies ErrorBoundary, NewDocumentModal Escape/inline error, aria-pressed, offline retry, pagination, and voice provenance/offsets", async () => {
+    // H25: ErrorBoundary catches render crashes cleanly and provides recovery controls
+    const consoleErr = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    function Boom(): never {
+      throw new Error("Simulated Tiptap render crash");
+    }
+    render(
+      <ErrorBoundary scopeLabel="Document Editor">
+        <Boom />
+      </ErrorBoundary>,
+    );
+    expect(screen.getByRole("alert").textContent).toContain("Document Editor encountered an error");
+    expect(screen.getByText(/Simulated Tiptap render crash/)).toBeTruthy();
+    consoleErr.mockRestore();
+    cleanup();
+
+    // H26 & M14: NewDocumentModal closes on Escape and shows inline error message
+    const onModalClose = vi.fn();
+    render(
+      <NewDocumentModal
+        title="Q4 Report"
+        language="bilingual"
+        size="A4"
+        orientation="portrait"
+        isCreating={false}
+        errorMessage="Title already exists"
+        onTitleChange={() => {}}
+        onLanguageChange={() => {}}
+        onSizeChange={() => {}}
+        onOrientationChange={() => {}}
+        onSubmit={async () => {}}
+        onClose={onModalClose}
+      />,
+    );
+    expect(screen.getByRole("alert").textContent).toContain("Title already exists");
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(onModalClose).toHaveBeenCalledTimes(1);
+    cleanup();
+
+    // H26 & M15: DocumentEditor exposes aria-pressed on formatting buttons and honest scroll-view footer
+    render(
+      <DocumentEditor
+        document={sampleBilingualDoc}
+        tiptapContent={toTiptapJson(sampleBilingualDoc) as unknown as Record<string, unknown>}
+        readOnly={false}
+        onSelectionChange={() => {}}
+      />,
+    );
+    await waitFor(() => {
+      const boldBtn = screen.getByRole("button", { name: "Bold" });
+      expect(boldBtn.getAttribute("aria-pressed")).toMatch(/^(true|false)$/);
+    });
+    expect(screen.getByText(/Scroll View \(Paginated on PDF Export\)/)).toBeTruthy();
+    cleanup();
+
+    // M16: AiVoicePanel forwards NFC startOffset/endOffset and preserves voice_command provenance on transcript edit
+    let capturedPlanBody: Record<string, unknown> | null = null;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        if (url.includes("/api/speech/transcribe")) {
+          return new Response(
+            JSON.stringify({
+              recognition: {
+                provider: "mock",
+                isMock: true,
+                language: "en-US",
+                transcript: "make bold",
+                confidence: 0.99,
+              },
+            }),
+            { status: 200 },
+          );
+        }
+        if (url.includes("/ai/plan")) {
+          capturedPlanBody = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
+          return new Response(JSON.stringify({ error: "Rate limit exceeded" }), {
+            status: 429,
+            headers: { "Retry-After": "12" },
+          });
+        }
+        return new Response(JSON.stringify({}), { status: 200 });
+      }),
+    );
+
+    render(
+      <AiVoicePanel
+        documentId={sampleBilingualDoc.documentId}
+        revision={2}
+        readOnly={false}
+        selectionBlockId="blk_para_en"
+        selectedText="Operational"
+        selectionGraphemeCount={11}
+        selectionStartOffset={0}
+        selectionEndOffset={11}
+        onDocumentUpdated={async () => {}}
+        apiHeaders={{}}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Mock EN Voice" }));
+    await waitFor(() => {
+      expect(screen.getByText(/^Voice$/)).toBeTruthy();
+    });
+    // Edit transcript -> provenance MUST stay voice_command (not silently reset to typed_ai)
+    const textarea = screen.getByRole("textbox");
+    fireEvent.change(textarea, { target: { value: "make bold please" } });
+    expect(screen.getByText(/Voice \(edited\)/)).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: "Plan Operation" }));
+    await waitFor(() => {
+      expect(screen.getByRole("alert").textContent).toContain("wait 12s");
+    });
+    const planBody = capturedPlanBody as Record<string, unknown> | null;
+    expect(planBody?.source).toBe("voice_command");
+    expect((planBody?.selection as Record<string, unknown>)?.startOffset).toBe(0);
+    expect((planBody?.selection as Record<string, unknown>)?.endOffset).toBe(11);
+    cleanup();
+
+    // M14 & M15 & H26: App renders offline retry screen on API failure, then recovers on Retry + shows pagination & aria-current
+    let healthAttempt = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.includes("/api/health")) {
+          healthAttempt++;
+          if (healthAttempt === 1) {
+            throw new Error("ECONNREFUSED");
+          }
+          return new Response(JSON.stringify({ status: "ok", authMode: "provisional-local" }), { status: 200 });
+        }
+        if (url.includes("/api/documents")) {
+          return new Response(JSON.stringify({ documents: [sampleBilingualDoc], total: 65 }), { status: 200 });
+        }
+        return new Response(JSON.stringify({}), { status: 200 });
+      }),
+    );
+
+    render(<App />);
+    await waitFor(() => {
+      expect(screen.getByText(/Workspace API Unreachable/)).toBeTruthy();
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Retry Connection" }));
+    await waitFor(() => {
+      expect(screen.getByRole("heading", { level: 1, name: "AI Office Suite" })).toBeTruthy();
+      expect(screen.getByRole("navigation", { name: "Document pagination" })).toBeTruthy();
+    });
+    const activeDocBtn = screen.getByRole("button", { name: /Monthly Report/ });
+    expect(activeDocBtn.getAttribute("aria-current")).toBe("true");
+    expect(screen.getByLabelText("Import DOCX file")).toBeTruthy();
   });
 });

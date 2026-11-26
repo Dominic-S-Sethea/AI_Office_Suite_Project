@@ -1,5 +1,6 @@
-import { useEffect, useRef, useState } from "react";
+import { memo, useEffect, useRef, useState } from "react";
 import type { DocumentOperationProposal, SpeechRecognitionResult } from "@ai-office-suite/shared-contracts";
+import { formatApiErrorMessage, safeReadJson } from "../lib/apiClient.ts";
 
 interface AiVoicePanelProps {
   documentId: string;
@@ -8,27 +9,23 @@ interface AiVoicePanelProps {
   selectionBlockId?: string;
   selectedText: string;
   selectionGraphemeCount?: number;
+  selectionStartOffset?: number;
+  selectionEndOffset?: number;
   onDocumentUpdated: () => Promise<void>;
   onRevisionConflict?: (message: string) => void;
   onUnauthorized?: () => void;
   apiHeaders: Record<string, string>;
 }
 
-async function safeReadJson(res: Response): Promise<Record<string, unknown>> {
-  try {
-    return (await res.json()) as Record<string, unknown>;
-  } catch {
-    return { error: `Request failed with HTTP ${res.status}` };
-  }
-}
-
-export function AiVoicePanel({
+function AiVoicePanelInner({
   documentId,
   revision,
   readOnly,
   selectionBlockId,
   selectedText,
   selectionGraphemeCount,
+  selectionStartOffset,
+  selectionEndOffset,
   onDocumentUpdated,
   onRevisionConflict,
   onUnauthorized,
@@ -39,6 +36,7 @@ export function AiVoicePanel({
   const [mode, setMode] = useState<"command" | "dictation" | "contextual">("contextual");
   const [command, setCommand] = useState("");
   const [source, setSource] = useState<"typed_ai" | "voice_command">("typed_ai");
+  const [voiceEdited, setVoiceEdited] = useState(false);
   const [recording, setRecording] = useState(false);
   const [isTranscribing, setIsTranscribing] = useState(false);
   const [isPlanning, setIsPlanning] = useState(false);
@@ -70,7 +68,7 @@ export function AiVoicePanel({
   async function startPushToTalk() {
     if (readOnly || busy) return;
     setErrorMsg(null);
-    setMicStatus("Requesting microphone permission...");
+    setMicStatus("Requesting browser microphone permission (hardware check only — mock STT active)...");
     try {
       if (!navigator.mediaDevices?.getUserMedia) {
         setMicStatus("Browser microphone unavailable; use Mock EN/KM Voice or type a command.");
@@ -80,7 +78,7 @@ export function AiVoicePanel({
       streamRef.current = stream;
       setRecording(true);
       setMicStatus(
-        `Recording (${inputLanguage === "km" ? "ខ្មែរ km-KH" : "English en-US"})... Click Stop to transcribe via Mock Speech Adapter (isMock: true).`,
+        `Mic active (${inputLanguage === "km" ? "ខ្មែរ km-KH" : "English en-US"}) — hardware capture check only. Click Stop to run deterministic MockSpeechAdapter (isMock: true).`,
       );
     } catch {
       setMicStatus("Microphone permission denied or unavailable. Text controls remain active.");
@@ -121,13 +119,14 @@ export function AiVoicePanel({
         return;
       }
       if (!res.ok) {
-        setErrorMsg(String(data.error ?? "Speech transcription failed"));
+        setErrorMsg(formatApiErrorMessage(res, data, "Speech transcription failed"));
         return;
       }
       const rec = data.recognition as SpeechRecognitionResult;
       setRecognitionMeta(rec);
       setInputLanguage(lang === "km-KH" ? "km" : "en");
       setSource("voice_command");
+      setVoiceEdited(false);
       setCommand(rec.transcript);
     } catch {
       setErrorMsg("Network error contacting speech transcription API.");
@@ -142,22 +141,42 @@ export function AiVoicePanel({
     setProposal(null);
     setIsPlanning(true);
     try {
+      // Honor interaction mode cleanly (M16):
+      // - contextual: attach blockId + NFC selectedText + NFC startOffset/endOffset
+      // - dictation: convert plain dictated text into explicit insert_text command when not already a command
+      // - command: send document-level command with blockId target (no accidental partial range overwrite)
+      const normalizedCmd = command.normalize("NFC").trim();
+      const effectiveCommand =
+        mode === "dictation" && !/^(insert|replace|make|bold|italic|heading|undo|translate|បញ្ចូល|ធ្វើឱ្យ|បកប្រែ|មិនធ្វើវិញ)/i.test(normalizedCmd)
+          ? `insert "${normalizedCmd.replace(/"/g, "'")}"`
+          : normalizedCmd;
+
+      const selectionPayload =
+        mode === "contextual" && selectionBlockId
+          ? {
+              blockId: selectionBlockId,
+              ...(selectedText ? { selectedText: selectedText.normalize("NFC") } : {}),
+              ...(typeof selectionStartOffset === "number" &&
+              typeof selectionEndOffset === "number" &&
+              selectionEndOffset > selectionStartOffset
+                ? { startOffset: selectionStartOffset, endOffset: selectionEndOffset }
+                : {}),
+            }
+          : selectionBlockId
+            ? { blockId: selectionBlockId }
+            : undefined;
+
       const res = await fetch(`/api/documents/${encodeURIComponent(documentId)}/ai/plan`, {
         method: "POST",
         credentials: "include",
         headers: { "Content-Type": "application/json", ...apiHeaders },
         body: JSON.stringify({
-          command: command.normalize("NFC"),
+          command: effectiveCommand,
           expectedRevision: revision,
           inputLanguage,
           outputLanguage,
           source,
-          selection: selectionBlockId
-            ? {
-                blockId: selectionBlockId,
-                selectedText: selectedText ? selectedText.normalize("NFC") : undefined,
-              }
-            : undefined,
+          selection: selectionPayload,
         }),
       });
       const data = await safeReadJson(res);
@@ -173,7 +192,7 @@ export function AiVoicePanel({
         return;
       }
       if (!res.ok) {
-        setErrorMsg(String(data.error ?? "Failed to plan AI operation"));
+        setErrorMsg(formatApiErrorMessage(res, data, "Failed to plan AI operation"));
         return;
       }
       setProposal(data.proposal as DocumentOperationProposal);
@@ -209,7 +228,7 @@ export function AiVoicePanel({
         return;
       }
       if (!res.ok) {
-        setErrorMsg(String(data.error ?? "Failed to apply AI operation"));
+        setErrorMsg(formatApiErrorMessage(res, data, "Failed to apply AI operation"));
         return;
       }
       setProposal(null);
@@ -251,7 +270,7 @@ export function AiVoicePanel({
         return;
       }
       if (!planRes.ok) {
-        setErrorMsg(String(planData.error ?? "Undo failed"));
+        setErrorMsg(formatApiErrorMessage(planRes, planData, "Undo failed"));
         return;
       }
       setProposal(planData.proposal as DocumentOperationProposal);
@@ -264,7 +283,7 @@ export function AiVoicePanel({
 
   return (
     <aside className="ai-panel" aria-label="AI and Voice Assistant">
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+      <div className="panel-header-row">
         <strong>AI &amp; Voice Assistant</strong>
         <span className="badge badge-warn">Mock Speech · Local Planner</span>
       </div>
@@ -281,12 +300,11 @@ export function AiVoicePanel({
         </div>
       )}
 
-      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6, fontSize: 12 }}>
-        <label>
+      <div className="panel-grid-2">
+        <label className="field-label">
           Input Language
           <select
-            className="btn"
-            style={{ width: "100%", marginTop: 3 }}
+            className="btn full-width-control"
             value={inputLanguage}
             onChange={(e) => setInputLanguage(e.target.value as "en" | "km")}
           >
@@ -294,11 +312,10 @@ export function AiVoicePanel({
             <option value="km">ខ្មែរ (km-KH)</option>
           </select>
         </label>
-        <label>
+        <label className="field-label">
           Output Language
           <select
-            className="btn"
-            style={{ width: "100%", marginTop: 3 }}
+            className="btn full-width-control"
             value={outputLanguage}
             onChange={(e) => setOutputLanguage(e.target.value as "match" | "en" | "km")}
           >
@@ -309,48 +326,59 @@ export function AiVoicePanel({
         </label>
       </div>
 
-      <label style={{ fontSize: 12 }}>
+      <label className="field-label">
         Interaction Mode
         <select
-          className="btn"
-          style={{ width: "100%", marginTop: 3 }}
+          className="btn full-width-control"
           value={mode}
           onChange={(e) => setMode(e.target.value as "command" | "dictation" | "contextual")}
         >
-          <option value="contextual">Contextual (Selected Block)</option>
-          <option value="command">Command Mode</option>
-          <option value="dictation">Dictation Mode</option>
+          <option value="contextual">Contextual (Selected Range / Block)</option>
+          <option value="command">Command Mode (Block / Document)</option>
+          <option value="dictation">Dictation Mode (Insert Text)</option>
         </select>
       </label>
 
       <div className="preview-card">
-        <div style={{ fontWeight: 600 }}>Active Selection Target</div>
-        <div style={{ color: "#475569" }}>
+        <div className="strong-text">Active Selection Target</div>
+        <div className="muted-text">
           Block: <code>{selectionBlockId ?? "auto"}</code>
           {typeof selectionGraphemeCount === "number" && selectionGraphemeCount > 0
             ? ` · ${selectionGraphemeCount} graphemes`
             : ""}
+          {mode === "contextual" &&
+          typeof selectionStartOffset === "number" &&
+          typeof selectionEndOffset === "number" &&
+          selectionEndOffset > selectionStartOffset
+            ? ` · [${selectionStartOffset}..${selectionEndOffset}]`
+            : ""}
         </div>
-        <div style={{ maxHeight: 54, overflow: "hidden", color: "#334155" }}>
+        <div className="selection-excerpt">
           {selectedText ? `"${selectedText}"` : "(Whole target block if no range highlighted)"}
         </div>
       </div>
 
-      <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+      <div className="row-actions wrap">
         {!recording ? (
-          <button type="button" className="btn" disabled={readOnly || busy} onClick={startPushToTalk}>
-            Mic Push-to-Talk
+          <button
+            type="button"
+            className="btn"
+            disabled={readOnly || busy}
+            title="Tests browser microphone permission and runs MockSpeechAdapter (isMock: true) on stop"
+            onClick={() => void startPushToTalk()}
+          >
+            Mic Test (Mock STT)
           </button>
         ) : (
-          <button type="button" className="btn primary" disabled={busy} onClick={() => stopPushToTalk()}>
-            Stop Recording
+          <button type="button" className="btn primary" disabled={busy} onClick={() => void stopPushToTalk()}>
+            Stop &amp; Run Mock STT
           </button>
         )}
         <button
           type="button"
           className="btn"
           disabled={readOnly || busy}
-          onClick={() => simulateVoiceFixture("en-translate-khmer")}
+          onClick={() => void simulateVoiceFixture("en-translate-khmer")}
         >
           {isTranscribing ? "Transcribing..." : "Mock EN Voice"}
         </button>
@@ -358,38 +386,37 @@ export function AiVoicePanel({
           type="button"
           className="btn"
           disabled={readOnly || busy}
-          onClick={() => simulateVoiceFixture("km-insert-table")}
+          onClick={() => void simulateVoiceFixture("km-insert-table")}
         >
           {isTranscribing ? "Transcribing..." : "Mock KM Voice"}
         </button>
       </div>
 
-      {micStatus && <div style={{ fontSize: 11, color: "#1d4ed8" }}>{micStatus}</div>}
+      {micStatus && (
+        <div className="mic-status-text" role="status">
+          {micStatus}
+        </div>
+      )}
 
       {recognitionMeta && (
-        <div
-          style={{
-            fontSize: 11,
-            color: "#475569",
-            background: "#f8fafc",
-            padding: 6,
-            borderRadius: 6,
-            border: "1px solid #e2e8f0",
-          }}
-        >
+        <div className="recognition-meta-box">
           Provider: <strong>{recognitionMeta.provider}</strong> ·{" "}
           <strong>{recognitionMeta.isMock ? "SIMULATED (isMock: true)" : "LIVE"}</strong>
           {recognitionMeta.disclaimer ? ` · ${recognitionMeta.disclaimer}` : ""}
         </div>
       )}
 
-      <label style={{ fontSize: 12 }}>
-        Editable Transcript / Typed Instruction
+      <label className="field-label">
+        <span>
+          Editable Transcript / Typed Instruction{" "}
+          {source === "voice_command" && (
+            <span className="badge badge-ok">{voiceEdited ? "Voice (edited)" : "Voice"}</span>
+          )}
+        </span>
         <textarea
           rows={3}
-          className="btn"
+          className="btn command-textarea"
           disabled={readOnly || busy}
-          style={{ width: "100%", marginTop: 4, textAlign: "left" }}
           placeholder="e.g. make bold | insert 3x3 table | ធ្វើឱ្យដិត | បញ្ចូលតារាង ៣x៣ | បកប្រែកថាខណ្ឌនេះជាភាសាខ្មែរ"
           value={command}
           onKeyDown={(e) => {
@@ -399,22 +426,29 @@ export function AiVoicePanel({
             }
           }}
           onChange={(e) => {
-            setSource("typed_ai");
-            setCommand(e.target.value);
+            const nextVal = e.target.value;
+            setCommand(nextVal);
+            // Preserve voice_command provenance when correcting a transcript; only reset when cleared (M16)
+            if (!nextVal.trim()) {
+              setSource("typed_ai");
+              setVoiceEdited(false);
+            } else if (source === "voice_command") {
+              setVoiceEdited(true);
+            }
           }}
         />
       </label>
 
-      <div style={{ display: "flex", gap: 6 }}>
+      <div className="row-actions">
         <button
           type="button"
           className="btn primary"
           disabled={readOnly || busy || !command.trim()}
-          onClick={handlePlan}
+          onClick={() => void handlePlan()}
         >
           {isPlanning ? "Planning..." : "Plan Operation"}
         </button>
-        <button type="button" className="btn" disabled={readOnly || busy || revision <= 1} onClick={handleUndoLast}>
+        <button type="button" className="btn" disabled={readOnly || busy || revision <= 1} onClick={() => void handleUndoLast()}>
           Undo Last Change
         </button>
       </div>
@@ -427,20 +461,20 @@ export function AiVoicePanel({
 
       {proposal && (
         <div className="preview-card">
-          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+          <div className="panel-header-row">
             <strong>Proposed Action: {proposal.action}</strong>
             <span className="badge">Risk: {proposal.riskLevel}</span>
           </div>
           <div>{proposal.explanation}</div>
-          <div style={{ fontSize: 11, color: "#475569" }}>
+          <div className="meta-caption">
             Rev {proposal.expectedRevision} · Source: {proposal.source}
           </div>
-          <div style={{ background: "#fff", border: "1px solid #e2e8f0", padding: 6, borderRadius: 4 }}>
-            <div style={{ color: "#991b1b" }}>Before: {proposal.previewDiff.beforeText}</div>
-            <div style={{ color: "#166534", marginTop: 4 }}>After: {proposal.previewDiff.afterText}</div>
+          <div className="proposal-diff-box">
+            <div className="diff-before">Before: {proposal.previewDiff.beforeText}</div>
+            <div className="diff-after">After: {proposal.previewDiff.afterText}</div>
           </div>
-          <div style={{ display: "flex", gap: 6 }}>
-            <button type="button" className="btn primary" disabled={busy || readOnly} onClick={handleApply}>
+          <div className="row-actions">
+            <button type="button" className="btn primary" disabled={busy || readOnly} onClick={() => void handleApply()}>
               {isApplying ? "Applying..." : "Approve & Apply"}
             </button>
             <button type="button" className="btn" disabled={busy} onClick={() => setProposal(null)}>
@@ -452,3 +486,5 @@ export function AiVoicePanel({
     </aside>
   );
 }
+
+export const AiVoicePanel = memo(AiVoicePanelInner);
