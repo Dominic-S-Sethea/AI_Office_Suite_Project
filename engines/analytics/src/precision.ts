@@ -4,10 +4,13 @@ import type {
   RoundingMode,
 } from "@ai-office-suite/shared-contracts";
 import {
+  currencyScaleFor,
   ExactDecimalError,
   parseExactDecimalToMinorUnits,
   roundExactQuotient,
 } from "@ai-office-suite/validation";
+
+export { currencyScaleFor };
 
 export class AnalyticsError extends Error {
   readonly statusCode: number;
@@ -148,10 +151,34 @@ export function convertCurrencyMinorUnits(
   targetCurrency: string,
   rateSpec?: ExchangeRateSpecification,
   roundingMode: RoundingMode = "HALF_UP",
+  sourceScale: number = currencyScaleFor(sourceCurrency),
 ): bigint {
+  if (!Number.isInteger(targetScale) || targetScale < 0 || targetScale > 12) {
+    throw new AnalyticsError(422, "INVALID_PRECISION_SCALE", `Unsupported targetScale '${targetScale}'.`);
+  }
+  if (!Number.isInteger(sourceScale) || sourceScale < 0 || sourceScale > 12) {
+    throw new AnalyticsError(422, "INVALID_PRECISION_SCALE", `Unsupported sourceScale '${sourceScale}'.`);
+  }
+
   const fromNorm = sourceCurrency.trim().toUpperCase();
   const toNorm = targetCurrency.trim().toUpperCase();
-  if (fromNorm === toNorm) return amountMinor;
+  const scaleDiff = targetScale - sourceScale;
+
+  if (fromNorm === toNorm) {
+    if (scaleDiff === 0) return amountMinor;
+    if (scaleDiff > 0) {
+      const scaledSame = amountMinor * pow10BigInt(scaleDiff);
+      if (scaledSame > MAX_ABS_MINOR || scaledSame < -MAX_ABS_MINOR) {
+        throw new AnalyticsError(
+          422,
+          "NUMERIC_OVERFLOW",
+          "Currency rescaling result exceeds configured financial overflow guard.",
+        );
+      }
+      return scaledSame;
+    }
+    return roundQuotientExact(amountMinor, pow10BigInt(-scaleDiff), roundingMode);
+  }
 
   if (
     !rateSpec ||
@@ -173,9 +200,10 @@ export function convertCurrencyMinorUnits(
     throw new AnalyticsError(422, "INVALID_EXCHANGE_RATE", "Exchange rate must be strictly positive.");
   }
 
-  // amountMinor is already in 10^targetScale minor units assuming monetary scale match, scale by rate/10^rateScale
-  void targetScale;
-  const converted = roundQuotientExact(amountMinor * scaledRate, pow10BigInt(rateScale), roundingMode);
+  // Convert source minor units (10^sourceScale) by rate (scaledRate / 10^rateScale) to target minor units (10^targetScale).
+  const numerator = scaleDiff >= 0 ? amountMinor * scaledRate * pow10BigInt(scaleDiff) : amountMinor * scaledRate;
+  const denominator = scaleDiff >= 0 ? pow10BigInt(rateScale) : pow10BigInt(rateScale + -scaleDiff);
+  const converted = roundQuotientExact(numerator, denominator, roundingMode);
   if (converted > MAX_ABS_MINOR || converted < -MAX_ABS_MINOR) {
     throw new AnalyticsError(
       422,

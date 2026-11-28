@@ -188,6 +188,7 @@ export function createGoldenManagementDeck(params: {
   opMarginRef: LinkedMetricReference;
   revenueChartSpec: ChartSpec;
   budgetChartSpec: ChartSpec;
+  departmentTableRows: string[][];
 }): StudioPresentation {
   const lang = params.language ?? "bilingual";
   const scopeLabel = params.scopeLabel ?? "All Departments (November 2026)";
@@ -408,12 +409,17 @@ export function createGoldenManagementDeck(params: {
             lang === "km"
               ? ["ផ្នែក", "ចំណូលសុទ្ធ (USD)", "ចំណាយប្រតិបត្តិការ & ថ្លៃដើម", "ប្រាក់ចំណេញប្រតិបត្តិការ"]
               : ["Department", "Net Sales (USD)", "Total Costs (COGS + OpEx)", "Operating Profit"],
-          rows: [
-            ["Sales", "$80,000.00", "$60,000.00", "$20,000.00"],
-            ["Services", "$45,000.00", "$30,000.00", "$15,000.00"],
-            ["Retail", "$25,000.00", "$20,000.00", "$5,000.00"],
-            ["Combined Total", params.netSalesRef.cachedFormattedValue, "Scoped Total", params.opProfitRef.cachedFormattedValue],
-          ],
+          rows:
+            params.departmentTableRows.length > 0
+              ? structuredClone(params.departmentTableRows)
+              : [
+                  [
+                    scopeLabel,
+                    params.netSalesRef.cachedFormattedValue,
+                    "—",
+                    params.opProfitRef.cachedFormattedValue,
+                  ],
+                ],
           bounds: { xIn: 0.8, yIn: 1.6, wIn: 11.7, hIn: 4.5 },
           zIndex: 2,
           locked: false,
@@ -537,6 +543,22 @@ export class PresentationWorkspaceStore {
     const clone = structuredClone(deck);
     this.decks.set(clone.presentationId, clone);
     this.history.set(clone.presentationId, [structuredClone(clone)]);
+    return structuredClone(clone);
+  }
+
+  updateDeckRevision(actor: ActorContext, deck: StudioPresentation): StudioPresentation {
+    assertCanPerform(actor, "document", "write");
+    assertTenantWorkspaceAccess(actor, deck.tenantId, deck.workspaceId);
+    const existing = this.decks.get(deck.presentationId);
+    if (!existing) {
+      throw new PresentationEngineError(404, "PRESENTATION_NOT_FOUND", `Presentation '${deck.presentationId}' not found.`);
+    }
+    assertTenantWorkspaceAccess(actor, existing.tenantId, existing.workspaceId);
+    const clone = structuredClone(deck);
+    this.decks.set(clone.presentationId, clone);
+    const stack = this.history.get(clone.presentationId) ?? [];
+    stack.push(structuredClone(clone));
+    this.history.set(clone.presentationId, stack);
     return structuredClone(clone);
   }
 
@@ -890,4 +912,27 @@ export class PresentationWorkspaceStore {
       },
     };
   }
+}
+
+export type PresentationDeliveryKey = "ArrowRight" | "ArrowLeft" | "Home" | "End" | "Escape";
+
+export function createPresentationDeliverySession(deck: StudioPresentation) {
+  const visibleSlides = [...deck.slides].filter((s) => !s.hidden).sort((a, b) => a.order - b.order);
+  let activeIndex = 0;
+  let presenting = true;
+
+  return {
+    visibleSlides,
+    getActiveSlide: () => visibleSlides[activeIndex],
+    getActiveIndex: () => activeIndex,
+    isPresenting: () => presenting,
+    handleKey: (key: PresentationDeliveryKey) => {
+      if (!presenting) return;
+      if (key === "ArrowRight") activeIndex = Math.min(visibleSlides.length - 1, activeIndex + 1);
+      else if (key === "ArrowLeft") activeIndex = Math.max(0, activeIndex - 1);
+      else if (key === "Home") activeIndex = 0;
+      else if (key === "End") activeIndex = visibleSlides.length - 1;
+      else if (key === "Escape") presenting = false;
+    },
+  };
 }

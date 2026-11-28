@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -8,9 +8,10 @@ import * as echarts from "echarts";
 import type { ChartSpec } from "@ai-office-suite/shared-contracts";
 import { escapeHtml, validateChartSpecSafety } from "@ai-office-suite/validation";
 import {
+  buildHardenedChromiumArgs,
   buildSanitizedSubprocessEnv,
+  cleanupTempDirBestEffort,
   detectChromiumBinary,
-  HARDENED_CHROMIUM_BASE_ARGS,
   PDF_RENDER_CSP_META,
   PdfExportError,
   resolveLocalFontFacesCss,
@@ -234,7 +235,7 @@ export async function renderChartSpecPngViaEdge(
     await execFileAsync(
       browserPath,
       [
-        ...HARDENED_CHROMIUM_BASE_ARGS,
+        ...buildHardenedChromiumArgs(),
         `--user-data-dir=${userDataDir}`,
         `--window-size=${width + 40},${height + 40}`,
         `--screenshot=${path.resolve(outputPngPath)}`,
@@ -244,6 +245,6 @@ export async function renderChartSpecPngViaEdge(
     );
     return { pngPath: outputPngPath, byteLength: readFileSync(outputPngPath).byteLength };
   } finally {
-    rmSync(tmpDir, { recursive: true, force: true });
+    cleanupTempDirBestEffort(tmpDir);
   }
 }

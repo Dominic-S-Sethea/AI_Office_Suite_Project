@@ -5,6 +5,7 @@ import { assertCanPerform, assertTenantWorkspaceAccess } from "@ai-office-suite/
 import {
   BusinessAnalysisEngine,
   type AnalyticalFinanceRow,
+  currencyScaleFor,
   formatCurrencyOrRatioDisplay,
   parseDecimalToMinorUnits,
 } from "@ai-office-suite/analytics-engine";
@@ -140,6 +141,12 @@ function sha256Json(payload: unknown): string {
   return createHash("sha256").update(JSON.stringify(payload)).digest("hex");
 }
 
+function shiftIsoMonth(isoDate: string, monthsDelta: number): string {
+  const [yStr = "2026", mStr = "1", dStr = "1"] = isoDate.split("-");
+  const date = new Date(Date.UTC(Number(yStr), Number(mStr) - 1 + monthsDelta, Number(dStr)));
+  return date.toISOString().slice(0, 10);
+}
+
 function classificationRank(c: ArtifactClassification): number {
   switch (c) {
     case "public":
@@ -162,7 +169,9 @@ export interface ManagedDatasetEntry {
 }
 
 export interface SyncedBundleOutputs {
+  datasetId: string;
   datasetVersion: number;
+  reportingPeriod: { start: string; endExclusive: string };
   effectiveDepartments: string[];
   workbookArtifact: ArtifactReference;
   workbook: SpreadsheetWorkbook;
@@ -200,8 +209,11 @@ export class CrossModuleIntegrationEngine {
   private readonly revokedPrincipals = new Set<string>();
   private readonly principalPolicies = new Map<string, DataScopePolicy>();
   private readonly queryCache = new Map<string, { result: AnalyticalResult; ref: AnalyticalResultReference }>();
+  private readonly stagedByByPkgKey = new Map<string, string>();
+  private nextInteractionSeq = 0;
+  private readonly enforceTwoPersonApproval: boolean;
 
-  constructor(opts?: { db?: PgDatabaseAdapter }) {
+  constructor(opts?: { db?: PgDatabaseAdapter; enforceTwoPersonApproval?: boolean }) {
     this.audit = new InMemoryAuditStore();
     this.docStorage = new InMemoryStorageAdapter();
     this.documents = new DocumentService(this.docStorage, this.audit);
@@ -209,6 +221,7 @@ export class CrossModuleIntegrationEngine {
     this.intelligence = new IntelligenceStudioEngine(this.analytics, this.audit);
     this.presentations = this.intelligence.presentations;
     this.db = opts?.db;
+    this.enforceTwoPersonApproval = opts?.enforceTwoPersonApproval ?? false;
   }
 
   private assertPrincipalActive(actor: ActorContext): void {
@@ -516,8 +529,14 @@ export class CrossModuleIntegrationEngine {
   private resolveCallerDepartments(
     policy: DataScopePolicy,
     requestedDepartments?: string[],
+    availableRows?: AnalyticalFinanceRow[],
   ): string[] {
-    const allDepts = ["Sales", "Services", "Retail"];
+    const fallbackDepts = ["Sales", "Services", "Retail"];
+    const derivedDepts =
+      availableRows && availableRows.length > 0
+        ? Array.from(new Set(availableRows.map((r) => r.department).filter((d) => d.trim().length > 0)))
+        : fallbackDepts;
+    const allDepts = derivedDepts.length > 0 ? derivedDepts : fallbackDepts;
     const allowedSet = policy.allowedDepartments === "ALL" ? new Set(allDepts) : new Set(policy.allowedDepartments);
     if (!requestedDepartments || requestedDepartments.length === 0) {
       return Array.from(allowedSet);
@@ -533,6 +552,7 @@ export class CrossModuleIntegrationEngine {
     requiredColumns: string[],
   ): ManagedDatasetEntry {
     this.assertPrincipalActive(actor);
+    assertCanPerform(actor, "document", "read");
     if (policy.tenantId !== actor.tenantId) {
       throw new IntegrationError(403, "TENANT_POLICY_MISMATCH", "Policy tenant does not match actor tenant.");
     }
@@ -544,8 +564,14 @@ export class CrossModuleIntegrationEngine {
     if (entry.meta.status === "withdrawn") {
       throw new IntegrationError(403, "DATASET_WITHDRAWN", `Dataset '${datasetId}' v${version} has been withdrawn.`);
     }
-    if (entry.classification === "restricted" && actor.role === "viewer" && policy.allowedDepartments !== "ALL") {
-      throw new IntegrationError(403, "SOURCE_ACCESS_DENIED", `Principal lacks clearance for restricted dataset '${datasetId}'.`);
+    const effectiveMaxClassification: ArtifactClassification =
+      policy.maxClassification ?? (actor.workspaceContentGrant === true ? "restricted" : "confidential");
+    if (classificationRank(entry.classification) > classificationRank(effectiveMaxClassification)) {
+      throw new IntegrationError(
+        403,
+        "SOURCE_ACCESS_DENIED",
+        `Principal lacks explicit '${entry.classification}' classification clearance for dataset '${datasetId}'.`,
+      );
     }
     const policyColSet = new Set(policy.allowedColumns);
     for (const col of requiredColumns) {
@@ -598,7 +624,7 @@ export class CrossModuleIntegrationEngine {
       }
     }
 
-    const effectiveDepts = this.resolveCallerDepartments(policy, params.requestedDepartments);
+    const effectiveDepts = this.resolveCallerDepartments(policy, params.requestedDepartments, ds.rows);
     if (effectiveDepts.length === 0) {
       throw new IntegrationError(
         403,
@@ -1020,6 +1046,8 @@ export class CrossModuleIntegrationEngine {
     params: {
       datasetId: string;
       datasetVersion: number;
+      periodStart?: string;
+      periodEndExclusive?: string;
       requestedDepartments?: string[];
       language?: "en" | "km" | "bilingual";
       mode?: LinkedObjectBindingMode;
@@ -1035,19 +1063,25 @@ export class CrossModuleIntegrationEngine {
     assertCanPerform(actor, "document", "write");
     const mode = params.mode ?? "refreshable_link";
     const lang = params.language ?? "bilingual";
-    const effectiveDepts = this.resolveCallerDepartments(policy, params.requestedDepartments);
+    const pStart = params.periodStart ?? "2026-11-01";
+    const pEnd = params.periodEndExclusive ?? "2026-12-01";
+    const priorStart = shiftIsoMonth(pStart, -1);
+    const priorEnd = pStart;
+
+    const dsEntry = this.datasetRegistry.get(`${actor.tenantId}::${params.datasetId}::v${params.datasetVersion}`);
+    const effectiveDepts = this.resolveCallerDepartments(policy, params.requestedDepartments, dsEntry?.rows);
     if (effectiveDepts.length === 0) {
       throw new IntegrationError(403, "SOURCE_ACCESS_DENIED", "No permitted departments matched request.");
     }
 
     const [netSalesQ, cogsQ, opexQ, opProfitQ, opMarginQ, revGrowthQ, priorSalesQ] = await Promise.all([
-      this.queryCertifiedResult(actor, policy, { datasetId: params.datasetId, datasetVersion: params.datasetVersion, metricId: "FIN-NET-SALES", requestedDepartments: effectiveDepts, bindingMode: mode }),
-      this.queryCertifiedResult(actor, policy, { datasetId: params.datasetId, datasetVersion: params.datasetVersion, metricId: "FIN-COGS", requestedDepartments: effectiveDepts, bindingMode: mode }),
-      this.queryCertifiedResult(actor, policy, { datasetId: params.datasetId, datasetVersion: params.datasetVersion, metricId: "FIN-OPEX", requestedDepartments: effectiveDepts, bindingMode: mode }),
-      this.queryCertifiedResult(actor, policy, { datasetId: params.datasetId, datasetVersion: params.datasetVersion, metricId: "FIN-OPERATING-PROFIT", requestedDepartments: effectiveDepts, bindingMode: mode }),
-      this.queryCertifiedResult(actor, policy, { datasetId: params.datasetId, datasetVersion: params.datasetVersion, metricId: "FIN-OPERATING-MARGIN", requestedDepartments: effectiveDepts, bindingMode: mode }),
-      this.queryCertifiedResult(actor, policy, { datasetId: params.datasetId, datasetVersion: params.datasetVersion, metricId: "FIN-REVENUE-GROWTH", comparison: "previous_month", requestedDepartments: effectiveDepts, bindingMode: mode }),
-      this.queryCertifiedResult(actor, policy, { datasetId: params.datasetId, datasetVersion: params.datasetVersion, metricId: "FIN-NET-SALES", periodStart: "2026-10-01", periodEndExclusive: "2026-11-01", requestedDepartments: effectiveDepts, bindingMode: mode }),
+      this.queryCertifiedResult(actor, policy, { datasetId: params.datasetId, datasetVersion: params.datasetVersion, metricId: "FIN-NET-SALES", periodStart: pStart, periodEndExclusive: pEnd, requestedDepartments: effectiveDepts, bindingMode: mode }),
+      this.queryCertifiedResult(actor, policy, { datasetId: params.datasetId, datasetVersion: params.datasetVersion, metricId: "FIN-COGS", periodStart: pStart, periodEndExclusive: pEnd, requestedDepartments: effectiveDepts, bindingMode: mode }),
+      this.queryCertifiedResult(actor, policy, { datasetId: params.datasetId, datasetVersion: params.datasetVersion, metricId: "FIN-OPEX", periodStart: pStart, periodEndExclusive: pEnd, requestedDepartments: effectiveDepts, bindingMode: mode }),
+      this.queryCertifiedResult(actor, policy, { datasetId: params.datasetId, datasetVersion: params.datasetVersion, metricId: "FIN-OPERATING-PROFIT", periodStart: pStart, periodEndExclusive: pEnd, requestedDepartments: effectiveDepts, bindingMode: mode }),
+      this.queryCertifiedResult(actor, policy, { datasetId: params.datasetId, datasetVersion: params.datasetVersion, metricId: "FIN-OPERATING-MARGIN", periodStart: pStart, periodEndExclusive: pEnd, requestedDepartments: effectiveDepts, bindingMode: mode }),
+      this.queryCertifiedResult(actor, policy, { datasetId: params.datasetId, datasetVersion: params.datasetVersion, metricId: "FIN-REVENUE-GROWTH", periodStart: pStart, periodEndExclusive: pEnd, comparison: "previous_month", requestedDepartments: effectiveDepts, bindingMode: mode }),
+      this.queryCertifiedResult(actor, policy, { datasetId: params.datasetId, datasetVersion: params.datasetVersion, metricId: "FIN-NET-SALES", periodStart: priorStart, periodEndExclusive: priorEnd, requestedDepartments: effectiveDepts, bindingMode: mode }),
     ]);
 
     const deptBreakdown: Array<{
@@ -1061,10 +1095,10 @@ export class CrossModuleIntegrationEngine {
     }> = [];
     for (const dept of effectiveDepts) {
       const [dSales, dCogs, dOpex, dProfit] = await Promise.all([
-        this.queryCertifiedResult(actor, policy, { datasetId: params.datasetId, datasetVersion: params.datasetVersion, metricId: "FIN-NET-SALES", requestedDepartments: [dept], bindingMode: mode }),
-        this.queryCertifiedResult(actor, policy, { datasetId: params.datasetId, datasetVersion: params.datasetVersion, metricId: "FIN-COGS", requestedDepartments: [dept], bindingMode: mode }),
-        this.queryCertifiedResult(actor, policy, { datasetId: params.datasetId, datasetVersion: params.datasetVersion, metricId: "FIN-OPEX", requestedDepartments: [dept], bindingMode: mode }),
-        this.queryCertifiedResult(actor, policy, { datasetId: params.datasetId, datasetVersion: params.datasetVersion, metricId: "FIN-OPERATING-PROFIT", requestedDepartments: [dept], bindingMode: mode }),
+        this.queryCertifiedResult(actor, policy, { datasetId: params.datasetId, datasetVersion: params.datasetVersion, metricId: "FIN-NET-SALES", periodStart: pStart, periodEndExclusive: pEnd, requestedDepartments: [dept], bindingMode: mode }),
+        this.queryCertifiedResult(actor, policy, { datasetId: params.datasetId, datasetVersion: params.datasetVersion, metricId: "FIN-COGS", periodStart: pStart, periodEndExclusive: pEnd, requestedDepartments: [dept], bindingMode: mode }),
+        this.queryCertifiedResult(actor, policy, { datasetId: params.datasetId, datasetVersion: params.datasetVersion, metricId: "FIN-OPEX", periodStart: pStart, periodEndExclusive: pEnd, requestedDepartments: [dept], bindingMode: mode }),
+        this.queryCertifiedResult(actor, policy, { datasetId: params.datasetId, datasetVersion: params.datasetVersion, metricId: "FIN-OPERATING-PROFIT", periodStart: pStart, periodEndExclusive: pEnd, requestedDepartments: [dept], bindingMode: mode }),
       ]);
       const costsMinor = parseDecimalToMinorUnits(dCogs.result.value.decimalString ?? "0", 2) + parseDecimalToMinorUnits(dOpex.result.value.decimalString ?? "0", 2);
       deptBreakdown.push({
@@ -1216,6 +1250,7 @@ export class CrossModuleIntegrationEngine {
     } else {
       report = this.intelligence.createManagementReport(actor, {
         title: `Management Dashboard (${effectiveDepts.join("+")})`,
+        datasetManifestId: params.datasetId,
       });
       if (params.datasetVersion > 1) {
         report = this.intelligence.requestDraftRefresh(actor, report.reportId, params.datasetVersion, {
@@ -1226,8 +1261,10 @@ export class CrossModuleIntegrationEngine {
 
     const evaluatedDashboard = await this.intelligence.evaluateReport(actor, policy, report.reportId, {
       requestedDepartments: effectiveDepts,
+      periodStart: pStart,
+      periodEndExclusive: pEnd,
       language: lang === "km" ? "km" : "en",
-      interactionSeq: Math.floor(Date.now() % 1_000_000) + 10,
+      interactionSeq: ++this.nextInteractionSeq,
     });
 
     const existingDashArt = this.artifacts.get(report.reportId);
@@ -1250,36 +1287,32 @@ export class CrossModuleIntegrationEngine {
     const revChartSpec = structuredClone(evaluatedDashboard.visualResults.vis_chart_dept_revenue!.chartSpec!);
     const budgetChartSpec = structuredClone(evaluatedDashboard.visualResults.vis_chart_budget_vs_actual!.chartSpec!);
 
+    const totalCostsMinor =
+      parseDecimalToMinorUnits(cogsQ.result.value.decimalString ?? "0", 2) +
+      parseDecimalToMinorUnits(opexQ.result.value.decimalString ?? "0", 2);
+    const slide4Rows: string[][] = [
+      ...deptBreakdown.map((d) => [d.dept, d.salesFmt, d.costsFmt, d.profitFmt]),
+      [
+        `Combined Total (${effectiveDepts.join("+")})`,
+        netSalesQ.result.value.displayValue,
+        formatCurrencyOrRatioDisplay(totalCostsMinor, 2, { currency: "USD" }),
+        opProfitQ.result.value.displayValue,
+      ],
+    ];
+
     let deck = createGoldenManagementDeck({
       tenantId: actor.tenantId,
       workspaceId: actor.workspaceId,
       actorId: actor.userId,
       language: lang,
-      scopeLabel: `Departments: ${effectiveDepts.join(" + ")} (v${params.datasetVersion})`,
+      scopeLabel: `Departments: ${effectiveDepts.join(" + ")} (${pStart}..${pEnd}, v${params.datasetVersion})`,
       netSalesRef,
       opProfitRef,
       opMarginRef,
       revenueChartSpec: revChartSpec,
       budgetChartSpec,
+      departmentTableRows: slide4Rows,
     });
-
-    // Replace Slide 4 static table rows with live FR-05 policy+version-accurate rows so V2 / scoped never drifts or leaks!
-    const totalCostsMinor =
-      parseDecimalToMinorUnits(cogsQ.result.value.decimalString ?? "0", 2) +
-      parseDecimalToMinorUnits(opexQ.result.value.decimalString ?? "0", 2);
-    const slide4 = deck.slides.find((s) => s.slideId === "slide_4_cost_table");
-    const slide4Table = slide4?.elements.find((e) => e.type === "table");
-    if (slide4Table && slide4Table.type === "table") {
-      slide4Table.rows = [
-        ...deptBreakdown.map((d) => [d.dept, d.salesFmt, d.costsFmt, d.profitFmt]),
-        [
-          `Combined Total (${effectiveDepts.join("+")})`,
-          netSalesQ.result.value.displayValue,
-          formatCurrencyOrRatioDisplay(totalCostsMinor, 2, { currency: "USD" }),
-          opProfitQ.result.value.displayValue,
-        ],
-      ];
-    }
 
     if (params.existingIds?.presentationId) {
       deck = this.presentations.refreshDraftBindings(
@@ -1296,10 +1329,7 @@ export class CrossModuleIntegrationEngine {
             slide_3_rev_chart: revChartSpec,
             slide_5_budget_chart: budgetChartSpec,
           },
-          tableRowsBySlideId:
-            slide4Table && slide4Table.type === "table"
-              ? { slide_4_cost_table: slide4Table.rows }
-              : undefined,
+          tableRowsBySlideId: { slide_4_cost_table: slide4Rows },
         },
       );
     } else {
@@ -1351,7 +1381,9 @@ export class CrossModuleIntegrationEngine {
     }
 
     return {
+      datasetId: params.datasetId,
       datasetVersion: params.datasetVersion,
+      reportingPeriod: { start: pStart, endExclusive: pEnd },
       effectiveDepartments: effectiveDepts,
       workbookArtifact,
       workbook,
@@ -1404,7 +1436,7 @@ export class CrossModuleIntegrationEngine {
     });
     deck.revision += 1;
     deck.updatedAt = new Date().toISOString();
-    const saved = this.presentations.saveInitialDeck(actor, deck);
+    const saved = this.presentations.updateDeckRevision(actor, deck);
 
     const art = this.artifacts.get(params.presentationId);
     if (art) {
@@ -1704,6 +1736,8 @@ export class CrossModuleIntegrationEngine {
           (await this.syncWorkspaceModules(actor, policy, {
             datasetId: run.context.datasetId,
             datasetVersion: run.context.datasetVersion,
+            periodStart: run.context.periodStart,
+            periodEndExclusive: run.context.periodEndExclusive,
             requestedDepartments: run.context.requestedDepartments,
             language: run.context.language,
             mode: "refreshable_link",
@@ -1717,6 +1751,8 @@ export class CrossModuleIntegrationEngine {
           (await this.syncWorkspaceModules(actor, policy, {
             datasetId: run.context.datasetId,
             datasetVersion: run.context.datasetVersion,
+            periodStart: run.context.periodStart,
+            periodEndExclusive: run.context.periodEndExclusive,
             requestedDepartments: run.context.requestedDepartments,
             language: run.context.language,
             mode: "refreshable_link",
@@ -1730,6 +1766,8 @@ export class CrossModuleIntegrationEngine {
           (await this.syncWorkspaceModules(actor, policy, {
             datasetId: run.context.datasetId,
             datasetVersion: run.context.datasetVersion,
+            periodStart: run.context.periodStart,
+            periodEndExclusive: run.context.periodEndExclusive,
             requestedDepartments: run.context.requestedDepartments,
             language: run.context.language,
             mode: "refreshable_link",
@@ -1800,16 +1838,25 @@ export class CrossModuleIntegrationEngine {
     const validationChecks = this.runCrossModuleValidation(b);
     const allValidationsPassed = validationChecks.every((c) => c.passed);
 
+    const sourceMeta =
+      this.datasetRegistry.get(`${actor.tenantId}::${b.datasetId}::v${b.datasetVersion}`)?.meta ??
+      this.datasetRegistry.get(`${actor.tenantId}::ds_s12_finance_${actor.tenantId}::v${b.datasetVersion}`)?.meta;
+    if (!sourceMeta) {
+      throw new IntegrationError(
+        404,
+        "DATASET_NOT_FOUND",
+        `Dataset '${b.datasetId}' v${b.datasetVersion} metadata missing for reporting package.`,
+      );
+    }
+
     const coreBody = {
       packageId,
       packageVersion,
       tenantId: actor.tenantId,
       workspaceId: actor.workspaceId,
       title: params.title,
-      reportingPeriod: { start: "2026-11-01", endExclusive: "2026-12-01" },
-      sourceVersions: [
-        this.datasetRegistry.get(`${actor.tenantId}::ds_s12_finance_${actor.tenantId}::v${b.datasetVersion}`)!.meta,
-      ],
+      reportingPeriod: structuredClone(b.reportingPeriod),
+      sourceVersions: [sourceMeta],
       metricVersions: Object.values(b.resultRefs).map((r) => ({
         metricId: r.metricId,
         version: r.metricVersion,
@@ -1839,6 +1886,7 @@ export class CrossModuleIntegrationEngine {
     }
 
     this.stagedPackages.set(`${packageId}::v${packageVersion}`, structuredClone(manifest));
+    this.stagedByByPkgKey.set(`${packageId}::v${packageVersion}`, actor.userId);
     if (this.db) {
       await persistReportingPackageRow(this.db, manifest);
     }
@@ -1846,8 +1894,10 @@ export class CrossModuleIntegrationEngine {
   }
 
   private runCrossModuleValidation(b: SyncedBundleOutputs): PublicationValidationCheck[] {
-    const netSalesNum = Number(b.resultRefs["FIN-NET-SALES"]!.minorUnits ?? "0") / 100;
-    const opProfitNum = Number(b.resultRefs["FIN-OPERATING-PROFIT"]!.minorUnits ?? "0") / 100;
+    const scale = currencyScaleFor(b.resultRefs["FIN-NET-SALES"]?.currency ?? "USD");
+    const divisor = 10 ** scale;
+    const netSalesNum = Number(b.resultRefs["FIN-NET-SALES"]!.minorUnits ?? "0") / divisor;
+    const opProfitNum = Number(b.resultRefs["FIN-OPERATING-PROFIT"]!.minorUnits ?? "0") / divisor;
     const sheetCells = b.workbook.sheets[0]!.cells;
     const totalRowIdx = 2 + b.effectiveDepartments.length;
     const wbSales = sheetCells[`B${totalRowIdx}`]?.evaluatedValue;
@@ -1895,16 +1945,38 @@ export class CrossModuleIntegrationEngine {
     packageVersion: number,
   ): Promise<ReportingPackageManifest> {
     this.assertPrincipalActive(actor);
-    if (actor.role !== "owner" && actor.role !== "administrator" && actor.role !== "reviewer") {
-      assertCanPerform(actor, "document", "write");
-    }
-    const pkg = this.stagedPackages.get(`${packageId}::v${packageVersion}`);
+    assertCanPerform(actor, "reporting_package", "approve");
+    const pkgKey = `${packageId}::v${packageVersion}`;
+    const pkg = this.stagedPackages.get(pkgKey);
     if (!pkg) {
       throw new IntegrationError(404, "PACKAGE_NOT_FOUND", `Staged package '${packageId}' v${packageVersion} not found.`);
     }
     assertTenantWorkspaceAccess(actor, pkg.tenantId, pkg.workspaceId);
     if (!pkg.allValidationsPassed) {
       throw new IntegrationError(422, "VALIDATION_BLOCKERS_PRESENT", "Cannot approve package with failing validation checks.");
+    }
+    const stagedBy = this.stagedByByPkgKey.get(pkgKey);
+    if (stagedBy && stagedBy === actor.userId) {
+      if (this.enforceTwoPersonApproval || actor.role !== "owner") {
+        throw new IntegrationError(
+          403,
+          "SELF_APPROVAL_FORBIDDEN",
+          "Segregation of duties violation: the principal who staged a reporting package cannot self-approve it.",
+        );
+      }
+      this.audit.append({
+        auditId: `aud_${randomUUID()}`,
+        tenantId: actor.tenantId,
+        workspaceId: actor.workspaceId,
+        actorId: actor.userId,
+        actorRole: actor.role,
+        source: "system",
+        action: "reporting_package.self_approved_by_owner",
+        outcome: "success",
+        metadata: { packageId, packageVersion },
+        summary: `Single-owner SME self-approval recorded for package '${packageId}' v${packageVersion}.`,
+        createdAt: new Date().toISOString(),
+      });
     }
 
     const approval: PublicationApproval = {
@@ -1985,6 +2057,11 @@ export class CrossModuleIntegrationEngine {
       if (prevKey === params.idempotencyKey) {
         return structuredClone(alreadyPublished);
       }
+      throw new IntegrationError(
+        409,
+        "ALREADY_PUBLISHED",
+        `Reporting package '${params.packageId}' v${params.packageVersion} is already published.`,
+      );
     }
     const pkg = this.stagedPackages.get(pkgKey);
     if (!pkg) {

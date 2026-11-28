@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -11,10 +11,11 @@ import type {
 } from "@ai-office-suite/shared-contracts";
 import { escapeHtml as esc } from "@ai-office-suite/validation";
 import {
+  buildHardenedChromiumArgs,
   buildSanitizedSubprocessEnv,
+  cleanupTempDirBestEffort,
   countPdfPages,
   detectChromiumBinary,
-  HARDENED_CHROMIUM_BASE_ARGS,
   PDF_RENDER_CSP_META,
   PdfExportError,
   resolveLocalFontFacesCss,
@@ -170,7 +171,7 @@ export async function exportPresentationPdf(deck: StudioPresentation): Promise<{
     await execFileAsync(
       browserPath,
       [
-        ...HARDENED_CHROMIUM_BASE_ARGS,
+        ...buildHardenedChromiumArgs(),
         `--user-data-dir=${userDataDir}`,
         "--no-pdf-header-footer",
         `--print-to-pdf=${pdfPath}`,
@@ -181,7 +182,7 @@ export async function exportPresentationPdf(deck: StudioPresentation): Promise<{
     const pdfBuffer = readFileSync(pdfPath);
     return { pdfBuffer, pageCount: countPdfPages(pdfBuffer), engine: "chromium-harfbuzz" };
   } finally {
-    rmSync(tmpDir, { recursive: true, force: true });
+    cleanupTempDirBestEffort(tmpDir);
   }
 }
 
@@ -203,7 +204,7 @@ export async function renderPresentationSlideScreenshot(
     await execFileAsync(
       browserPath,
       [
-        ...HARDENED_CHROMIUM_BASE_ARGS,
+        ...buildHardenedChromiumArgs(),
         `--user-data-dir=${userDataDir}`,
         "--window-size=1280,720",
         `--screenshot=${path.resolve(outputPngPath)}`,
@@ -213,6 +214,6 @@ export async function renderPresentationSlideScreenshot(
     );
     return { pngPath: outputPngPath, byteLength: readFileSync(outputPngPath).byteLength };
   } finally {
-    rmSync(tmpDir, { recursive: true, force: true });
+    cleanupTempDirBestEffort(tmpDir);
   }
 }

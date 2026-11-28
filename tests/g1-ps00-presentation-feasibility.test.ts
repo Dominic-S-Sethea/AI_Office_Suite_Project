@@ -161,6 +161,12 @@ describe("FR-06 PS-00 — Presentation Studio Feasibility, PPTX/PDF Round-Trip &
       opMarginRef: makeRef("FIN-OPERATING-MARGIN", "Operating margin", "26.67%"),
       revenueChartSpec: makeRevenueChartSpec(),
       budgetChartSpec: makeBudgetChartSpec(),
+      departmentTableRows: [
+        ["Sales", "$80,000.00", "$60,000.00", "$20,000.00"],
+        ["Services", "$45,000.00", "$30,000.00", "$15,000.00"],
+        ["Retail", "$25,000.00", "$20,000.00", "$5,000.00"],
+        ["Combined Total", "$150,000.00", "$110,000.00", "$40,000.00"],
+      ],
     });
     expect(deck.slides).toHaveLength(6); // PPT-T01
     store.saveInitialDeck(EDITOR_A, deck);
@@ -304,6 +310,12 @@ describe("FR-06 PS-00 — Presentation Studio Feasibility, PPTX/PDF Round-Trip &
       opMarginRef: makeRef("FIN-OPERATING-MARGIN", "Operating margin", "26.67%"),
       revenueChartSpec: makeRevenueChartSpec(),
       budgetChartSpec: makeBudgetChartSpec(),
+      departmentTableRows: [
+        ["Sales", "$80,000.00", "$60,000.00", "$20,000.00"],
+        ["Services", "$45,000.00", "$30,000.00", "$15,000.00"],
+        ["Retail", "$25,000.00", "$20,000.00", "$5,000.00"],
+        ["Combined Total", "$150,000.00", "$110,000.00", "$40,000.00"],
+      ],
     });
     // Add a hidden slide containing confidential draft text to test disclosure control PPT-T19
     deck.slides.push({

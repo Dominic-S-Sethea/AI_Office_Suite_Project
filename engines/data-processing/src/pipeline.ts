@@ -13,6 +13,7 @@ import type {
 } from "@ai-office-suite/shared-contracts";
 import { assertCanPerform, assertTenantWorkspaceAccess } from "@ai-office-suite/authorization";
 import {
+  currencyScaleFor,
   escapeSafeCsvCell,
   inspectAndExtractOoxmlZip,
   parseExactDecimalToMinorUnits,
@@ -308,11 +309,7 @@ export interface CertifiedCsvExportResult {
   status: CertifiedDatasetArtifact["status"];
 }
 
-const ZERO_DECIMAL_CURRENCIES = new Set(["KHR", "JPY", "KRW", "VND"]);
-
-export function currencyScaleFor(currency: string): number {
-  return ZERO_DECIMAL_CURRENCIES.has(currency.trim().toUpperCase()) ? 0 : 2;
-}
+export { currencyScaleFor };
 
 export function normalizeKhmerDigitsText(raw: string, stripCurrencySymbols = false): string {
   let out = raw.normalize("NFC").replace(/[\u17E0-\u17E9]/g, (ch) => String(ch.charCodeAt(0) - 0x17e0));
@@ -731,12 +728,29 @@ export function profileDataset(
   };
 }
 
+function isValidGregorianDate(year: number, month: number, day: number): boolean {
+  if (!Number.isInteger(year) || !Number.isInteger(month) || !Number.isInteger(day)) return false;
+  if (year < 1 || year > 9999 || month < 1 || month > 12 || day < 1 || day > 31) return false;
+  const d = new Date(Date.UTC(year, month - 1, day));
+  d.setUTCFullYear(year);
+  return d.getUTCFullYear() === year && d.getUTCMonth() === month - 1 && d.getUTCDate() === day;
+}
+
 function parseExplicitDate(
   raw: string,
   locale: "ISO" | "DMY" | "MDY" | "UNSPECIFIED",
 ): { ok: true; isoDate: string } | { ok: false; reason: string } {
   const s = raw.trim();
-  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return { ok: true, isoDate: s };
+  const isoMatch = s.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (isoMatch) {
+    const year = Number(isoMatch[1]);
+    const month = Number(isoMatch[2]);
+    const day = Number(isoMatch[3]);
+    if (!isValidGregorianDate(year, month, day)) {
+      return { ok: false, reason: `Calendar out-of-range ISO date '${s}'.` };
+    }
+    return { ok: true, isoDate: s };
+  }
   const slash = s.match(/^(\d{2})\/(\d{2})\/(\d{4})$/);
   if (!slash) return { ok: false, reason: `Unrecognized date format '${s}'.` };
   const p1 = Number(slash[1]);
@@ -750,7 +764,7 @@ function parseExplicitDate(
   }
   const day = locale === "MDY" ? p2 : p1;
   const month = locale === "MDY" ? p1 : p2;
-  if (month < 1 || month > 12 || day < 1 || day > 31) {
+  if (!isValidGregorianDate(Number(year), month, day)) {
     return { ok: false, reason: `Calendar out-of-range date '${s}' under locale '${locale}'.` };
   }
   return { ok: true, isoDate: `${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}` };

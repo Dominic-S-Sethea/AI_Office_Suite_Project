@@ -11,6 +11,33 @@ import {
   shiftFormulaReferences,
 } from "./formulaEngine.ts";
 
+export const MAX_AI_PROPOSAL_RANGE_CELLS = 50_000;
+
+function parseBoundedTargetRange(rangeStr: string): { r1: number; r2: number; c1: number; c2: number } {
+  const parts = rangeStr.split(":");
+  if (parts.length > 2) {
+    throw new SpreadsheetAiError(400, "INVALID_RANGE", `Invalid target range '${rangeStr}'.`);
+  }
+  const start = parseCellRef(parts[0]!.trim());
+  const end = parseCellRef((parts[1] ?? parts[0]!).trim());
+  if (!start || !end) {
+    throw new SpreadsheetAiError(400, "INVALID_RANGE", `Invalid target range '${rangeStr}'.`);
+  }
+  const r1 = Math.min(start.row, end.row);
+  const r2 = Math.max(start.row, end.row);
+  const c1 = Math.min(start.col, end.col);
+  const c2 = Math.max(start.col, end.col);
+  const totalCells = (r2 - r1 + 1) * (c2 - c1 + 1);
+  if (totalCells > MAX_AI_PROPOSAL_RANGE_CELLS) {
+    throw new SpreadsheetAiError(
+      400,
+      "RANGE_LIMIT_EXCEEDED",
+      `Target range '${rangeStr}' contains ${totalCells} cells, exceeding limit of ${MAX_AI_PROPOSAL_RANGE_CELLS}.`,
+    );
+  }
+  return { r1, r2, c1, c2 };
+}
+
 export class SpreadsheetAiError extends Error {
   readonly statusCode: number;
   readonly code: string;
@@ -174,15 +201,10 @@ export function applySpreadsheetProposal(
   }
 
   if (proposal.action === "set_range_formula" && proposal.formula) {
-    const parts = proposal.targetRange.split(":");
-    const start = parseCellRef(parts[0]!.trim());
-    const end = parseCellRef((parts[1] ?? parts[0]!).trim());
-    if (!start || !end) {
-      throw new SpreadsheetAiError(400, "INVALID_RANGE", `Invalid target range '${proposal.targetRange}'.`);
-    }
+    const { r1, r2, c1, c2 } = parseBoundedTargetRange(proposal.targetRange);
 
-    for (let r = start.row; r <= end.row; r++) {
-      for (let c = start.col; c <= end.col; c++) {
+    for (let r = r1; r <= r2; r++) {
+      for (let c = c1; c <= c2; c++) {
         const addr = `${colIndexToLetters(c)}${r}`;
         const existing = sheet.cells[addr];
         if (existing?.protected) {
@@ -194,7 +216,7 @@ export function applySpreadsheetProposal(
         }
         const shifted =
           proposal.fillMode === "adjust_relative_references"
-            ? shiftFormulaReferences(proposal.formula, c - start.col, r - start.row)
+            ? shiftFormulaReferences(proposal.formula, c - c1, r - r1)
             : proposal.formula;
         sheet.cells[addr] = {
           ...(existing ?? { value: null }),
@@ -204,16 +226,18 @@ export function applySpreadsheetProposal(
       }
     }
   } else if (proposal.action === "format_currency" && proposal.currencyDisplayOnly) {
-    const parts = proposal.targetRange.split(":");
-    const start = parseCellRef(parts[0]!.trim());
-    const end = parseCellRef((parts[1] ?? parts[0]!).trim());
-    if (!start || !end) {
-      throw new SpreadsheetAiError(400, "INVALID_RANGE", `Invalid target range '${proposal.targetRange}'.`);
-    }
-    for (let r = start.row; r <= end.row; r++) {
-      for (let c = start.col; c <= end.col; c++) {
+    const { r1, r2, c1, c2 } = parseBoundedTargetRange(proposal.targetRange);
+    for (let r = r1; r <= r2; r++) {
+      for (let c = c1; c <= c2; c++) {
         const addr = `${colIndexToLetters(c)}${r}`;
         const existing = sheet.cells[addr];
+        if (existing?.protected) {
+          throw new SpreadsheetAiError(
+            403,
+            "PROTECTED_CELL",
+            `Cell ${proposal.sheetName}!${addr} is protected and cannot be formatted by AI.`,
+          );
+        }
         if (existing) {
           existing.numberFormat = proposal.currencyDisplayOnly === "USD" ? "$#,##0.00" : "៛#,##0";
           existing.currency = proposal.currencyDisplayOnly;

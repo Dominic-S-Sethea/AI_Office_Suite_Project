@@ -93,6 +93,9 @@ export interface EvaluatedReportResponse {
   report: StudioReport;
   interactionSeq: number;
   effectiveDepartments: string[];
+  periodStart: string;
+  periodEndExclusive: string;
+  departmentSummaryRows: string[][];
   policyScope: string;
   cacheHit: boolean;
   visualResults: Record<string, EvaluatedVisualResult>;
@@ -113,6 +116,24 @@ export interface BiOperationPlan {
 }
 
 const ALL_SECTION_12_DEPARTMENTS = ["Sales", "Services", "Retail"] as const;
+export const MAX_BI_CACHE_ENTRIES = 500;
+export const MAX_BI_SEQ_ENTRIES = 2_000;
+
+function setBoundedLru<K, V>(map: Map<K, V>, key: K, value: V, maxSize: number): void {
+  if (map.has(key)) {
+    map.delete(key);
+  } else if (map.size >= maxSize) {
+    const oldest = map.keys().next().value;
+    if (oldest !== undefined) map.delete(oldest);
+  }
+  map.set(key, value);
+}
+
+function shiftIsoMonth(isoDate: string, monthsDelta: number): string {
+  const [yStr = "2026", mStr = "1", dStr = "1"] = isoDate.split("-");
+  const date = new Date(Date.UTC(Number(yStr), Number(mStr) - 1 + monthsDelta, Number(dStr)));
+  return date.toISOString().slice(0, 10);
+}
 
 export class IntelligenceStudioEngine {
   readonly analytics: BusinessAnalysisEngine;
@@ -181,9 +202,13 @@ export class IntelligenceStudioEngine {
     this.datasetRowsByManifest.set(`${tenantId}::${datasetId}::${version}`, structuredClone(rows));
   }
 
-  createManagementReport(actor: ActorContext, opts?: { title?: string }): StudioReport {
+  createManagementReport(
+    actor: ActorContext,
+    opts?: { title?: string; datasetManifestId?: string; datasetVersion?: number },
+  ): StudioReport {
     assertCanPerform(actor, "document", "create");
-    const datasetId = `ds_s12_finance_${actor.tenantId}`;
+    const datasetId = opts?.datasetManifestId ?? `ds_s12_finance_${actor.tenantId}`;
+    const datasetVersion = opts?.datasetVersion ?? 1;
     const pages: ReportPage[] = [
       {
         pageId: "page_overview",
@@ -283,7 +308,7 @@ export class IntelligenceStudioEngine {
       semanticModelId: "management-model",
       semanticModelVersion: 1,
       datasetManifestId: datasetId,
-      datasetVersion: 1,
+      datasetVersion,
       sourceAsOfTimestamp: "2026-11-30T23:59:59.000Z",
       lastSuccessfulRefreshAt: now,
       lastComputedAt: now,
@@ -304,6 +329,7 @@ export class IntelligenceStudioEngine {
 
   getReport(actor: ActorContext, reportId: string): StudioReport {
     this.assertNotRevoked(actor);
+    assertCanPerform(actor, "dashboard", "read");
     const rep = this.reports.get(reportId);
     if (!rep) {
       throw new IntelligenceEngineError(404, "REPORT_NOT_FOUND", `Report '${reportId}' not found.`);
@@ -334,10 +360,16 @@ export class IntelligenceStudioEngine {
   private resolveEffectiveDepartments(
     policy: DataScopePolicy,
     requestedDepartments?: string[],
+    availableRows?: AnalyticalFinanceRow[],
   ): string[] {
+    const derivedDepts =
+      availableRows && availableRows.length > 0
+        ? Array.from(new Set(availableRows.map((r) => r.department).filter((d) => d.trim().length > 0)))
+        : [...ALL_SECTION_12_DEPARTMENTS];
+    const baseDepts = derivedDepts.length > 0 ? derivedDepts : [...ALL_SECTION_12_DEPARTMENTS];
     const allowedSet =
       policy.allowedDepartments === "ALL"
-        ? new Set<string>(ALL_SECTION_12_DEPARTMENTS)
+        ? new Set<string>(baseDepts)
         : new Set<string>(policy.allowedDepartments);
 
     if (!requestedDepartments || requestedDepartments.length === 0) {
@@ -367,6 +399,7 @@ export class IntelligenceStudioEngine {
     },
   ): Promise<EvaluatedReportResponse> {
     this.assertNotRevoked(actor);
+    assertCanPerform(actor, "dashboard", "read");
     if (policy.tenantId !== actor.tenantId) {
       throw new IntelligenceEngineError(403, "POLICY_TENANT_MISMATCH", "DataScopePolicy tenant mismatch.");
     }
@@ -382,11 +415,18 @@ export class IntelligenceStudioEngine {
     if (seq < prevSeq) {
       throw new IntelligenceEngineError(409, "STALE_INTERACTION_DISCARDED", `Superseded interaction sequence ${seq} < ${prevSeq}.`);
     }
-    this.latestSeqByReportActor.set(seqKey, seq);
+    setBoundedLru(this.latestSeqByReportActor, seqKey, seq, MAX_BI_SEQ_ENTRIES);
 
-    const effectiveDepartments = this.resolveEffectiveDepartments(policy, opts?.requestedDepartments);
+    const baseRows =
+      this.datasetRowsByManifest.get(`${actor.tenantId}::${report.datasetManifestId}::${report.datasetVersion}`) ?? [];
+    const budgetRows =
+      this.budgetRowsByManifest.get(`${actor.tenantId}::ds_s12_budget_${actor.tenantId}::1`) ?? [];
+
+    const effectiveDepartments = this.resolveEffectiveDepartments(policy, opts?.requestedDepartments, baseRows);
     const periodStart = opts?.periodStart ?? "2026-11-01";
     const periodEndExclusive = opts?.periodEndExclusive ?? "2026-12-01";
+    const trendStart = shiftIsoMonth(periodStart, -1);
+    const activeReportingMonth = periodStart.slice(0, 7);
     const lang = opts?.language ?? "en";
 
     // Policy-keyed cache preventing cross-role & column-scope cache leaks (BI-T18)
@@ -409,16 +449,12 @@ export class IntelligenceStudioEngine {
 
     const cached = this.policyResultCache.get(cacheKey);
     if (cached && !opts?.chartKindOverride) {
+      setBoundedLru(this.policyResultCache, cacheKey, cached, MAX_BI_CACHE_ENTRIES);
       return { ...structuredClone(cached), interactionSeq: seq, cacheHit: true };
     }
 
-    const baseRows =
-      this.datasetRowsByManifest.get(`${actor.tenantId}::${report.datasetManifestId}::${report.datasetVersion}`) ?? [];
-    const budgetRows =
-      this.budgetRowsByManifest.get(`${actor.tenantId}::ds_s12_budget_${actor.tenantId}::1`) ?? [];
-
     // Materialize a policy+filter scoped ephemeral view in BusinessAnalysisEngine so all FR-05 precision holds
-    const scopedDatasetId = `scoped_${policy.policyId}_${report.reportId}_${seq}`;
+    const scopedDatasetId = `scoped_${policy.policyId}_${report.reportId}_${seq}_${randomUUID().slice(0, 8)}`;
     const deptSet = new Set(effectiveDepartments);
     const scopedRows = baseRows.filter((r) => deptSet.has(r.department));
     const scopedBudgetRows = budgetRows.filter((b) => deptSet.has(b.department));
@@ -443,60 +479,78 @@ export class IntelligenceStudioEngine {
       rows: scopedBudgetRows,
     });
 
-    const runMetric = async (
-      metricId: string,
-      extra?: {
-        groupBy?: string[];
-        comparison?: "none" | "previous_month";
-        operation?: "calculate_metric" | "group_by_dimension" | "budget_vs_actual" | "distinct_count";
-        pStart?: string;
-        pEnd?: string;
-      },
-    ) =>
-      this.analytics.executeQuery(actor, {
-        queryId: `bi_q_${randomUUID().slice(0, 8)}`,
-        idempotencyKey: `bi_idem_${randomUUID()}`,
-        tenantId: actor.tenantId,
-        workspaceId: actor.workspaceId,
-        operation: extra?.operation ?? (extra?.groupBy ? "group_by_dimension" : "calculate_metric"),
-        dataset: { id: scopedDatasetId, version: report.datasetVersion },
-        budgetDataset: extra?.operation === "budget_vs_actual" ? { id: scopedBudgetId, version: 1 } : undefined,
-        metrics: [{ id: metricId }],
-        period: { start: extra?.pStart ?? periodStart, endExclusive: extra?.pEnd ?? periodEndExclusive },
-        comparison: extra?.comparison ?? "none",
-        groupBy: extra?.groupBy,
-        currency: "USD",
-        outputLanguage: lang,
-      });
+    try {
+      const runMetric = async (
+        metricId: string,
+        extra?: {
+          groupBy?: string[];
+          comparison?: "none" | "previous_month";
+          operation?: "calculate_metric" | "group_by_dimension" | "budget_vs_actual" | "distinct_count";
+          pStart?: string;
+          pEnd?: string;
+        },
+      ) =>
+        this.analytics.executeQuery(actor, {
+          queryId: `bi_q_${randomUUID().slice(0, 8)}`,
+          idempotencyKey: `bi_idem_${randomUUID()}`,
+          tenantId: actor.tenantId,
+          workspaceId: actor.workspaceId,
+          operation: extra?.operation ?? (extra?.groupBy ? "group_by_dimension" : "calculate_metric"),
+          dataset: { id: scopedDatasetId, version: report.datasetVersion },
+          budgetDataset: extra?.operation === "budget_vs_actual" ? { id: scopedBudgetId, version: 1 } : undefined,
+          metrics: [{ id: metricId }],
+          period: { start: extra?.pStart ?? periodStart, endExclusive: extra?.pEnd ?? periodEndExclusive },
+          comparison: extra?.comparison ?? "none",
+          groupBy: extra?.groupBy,
+          currency: "USD",
+          outputLanguage: lang,
+        });
 
-    if (effectiveDepartments.length === 0 || scopedRows.length === 0) {
-      const emptyVisuals: Record<string, EvaluatedVisualResult> = {};
-      for (const page of report.pages) {
-        for (const v of page.visuals) {
-          emptyVisuals[v.visualId] = { visualId: v.visualId, state: "empty", metricResults: {} };
+      if (effectiveDepartments.length === 0 || scopedRows.length === 0) {
+        const emptyVisuals: Record<string, EvaluatedVisualResult> = {};
+        for (const page of report.pages) {
+          for (const v of page.visuals) {
+            emptyVisuals[v.visualId] = { visualId: v.visualId, state: "empty", metricResults: {} };
+          }
         }
+        return {
+          report,
+          interactionSeq: seq,
+          effectiveDepartments,
+          periodStart,
+          periodEndExclusive,
+          departmentSummaryRows: [],
+          policyScope: `${policy.policyId}:v${policy.policyVersion}`,
+          cacheHit: false,
+          visualResults: emptyVisuals,
+        };
       }
-      return {
-        report,
-        interactionSeq: seq,
-        effectiveDepartments,
-        policyScope: `${policy.policyId}:v${policy.policyVersion}`,
-        cacheHit: false,
-        visualResults: emptyVisuals,
-      };
-    }
 
-    const [netSales, revGrowth, opProfit, opMargin, netSalesByDept, budgetVar, distinctCust, netSalesByMonth] =
-      await Promise.all([
+      const [
+        netSales,
+        revGrowth,
+        opProfit,
+        opMargin,
+        totalCosts,
+        netSalesByDept,
+        totalCostsByDept,
+        opProfitByDept,
+        budgetVar,
+        distinctCust,
+        netSalesByMonth,
+      ] = await Promise.all([
         runMetric("FIN-NET-SALES"),
         runMetric("FIN-REVENUE-GROWTH", { comparison: "previous_month" }),
         runMetric("FIN-OPERATING-PROFIT"),
         runMetric("FIN-OPERATING-MARGIN"),
+        runMetric("FIN-TOTAL-COSTS"),
         runMetric("FIN-NET-SALES", { groupBy: ["department"] }),
-        runMetric("FIN-BUDGET-VARIANCE", { operation: "budget_vs_actual", groupBy: ["department"] }),
-        runMetric("FIN-DISTINCT-CUSTOMERS", { operation: "distinct_count", groupBy: ["department"] }),
-        runMetric("FIN-NET-SALES", { groupBy: ["reportingMonth"], pStart: "2026-10-01", pEnd: periodEndExclusive }),
-      ]);
+        runMetric("FIN-TOTAL-COSTS", { groupBy: ["department"] }),
+        runMetric("FIN-OPERATING-PROFIT", { groupBy: ["department"] }),
+      runMetric("FIN-BUDGET-VARIANCE", { operation: "budget_vs_actual", groupBy: ["department"] }),
+      runMetric("FIN-DISTINCT-CUSTOMERS", { operation: "distinct_count", groupBy: ["department"] }),
+      runMetric("FIN-NET-SALES", { groupBy: ["reportingMonth"], pStart: trendStart, pEnd: periodEndExclusive }),
+    ]);
 
     const buildBinding = (metricId: string, provenanceId: string) => ({
       datasetId: report.datasetManifestId,
@@ -518,6 +572,28 @@ export class IntelligenceStudioEngine {
         fmt: b.value.displayValue,
       });
     }
+    const deptCostsFmtMap = new Map<string, string>();
+    for (const b of totalCostsByDept.breakdown ?? []) {
+      deptCostsFmtMap.set(b.dimensionValues.department!, b.value.displayValue);
+    }
+    const deptProfitFmtMap = new Map<string, string>();
+    for (const b of opProfitByDept.breakdown ?? []) {
+      deptProfitFmtMap.set(b.dimensionValues.department!, b.value.displayValue);
+    }
+    const departmentSummaryRows: string[][] = [
+      ...deptNames.map((dept) => [
+        dept,
+        deptRevenueMap.get(dept)?.fmt ?? "$0.00",
+        deptCostsFmtMap.get(dept) ?? "$0.00",
+        deptProfitFmtMap.get(dept) ?? "$0.00",
+      ]),
+      [
+        `Combined Total (${deptNames.join("+")})`,
+        netSales.value.displayValue,
+        totalCosts.value.displayValue,
+        opProfit.value.displayValue,
+      ],
+    ];
 
     const revChartSpec: ChartSpec = {
       chartId: "chart_dept_revenue",
@@ -555,7 +631,9 @@ export class IntelligenceStudioEngine {
     };
 
     const revBudgetByDept = new Map<string, { val: number; fmt: string }>();
-    for (const b of scopedBudgetRows.filter((row) => row.budgetCategory === "revenue")) {
+    for (const b of scopedBudgetRows.filter(
+      (row) => row.budgetCategory === "revenue" && (!row.reportingMonth || row.reportingMonth === activeReportingMonth),
+    )) {
       const m = parseDecimalToMinorUnits(b.budgetAmount, 2);
       revBudgetByDept.set(b.department, {
         val: Number(m) / 100,
@@ -599,7 +677,7 @@ export class IntelligenceStudioEngine {
       linkedMetricRefs: [budgetVar.linkedMetricReference],
     };
 
-    const months = ["2026-10", "2026-11"];
+    const months = [trendStart.slice(0, 7), activeReportingMonth];
     const monthRevMap = new Map<string, { val: number; fmt: string }>();
     for (const b of netSalesByMonth.breakdown ?? []) {
       monthRevMap.set(b.dimensionValues.reportingMonth!, {
@@ -613,8 +691,8 @@ export class IntelligenceStudioEngine {
       kind: "line",
       titleEn: "Monthly net sales trend",
       titleKm: "និន្នាការចំណូលប្រចាំខែ",
-      altSummaryEn: `Monthly net sales grew ${revGrowth.value.displayValue} from Oct to Nov 2026.`,
-      altSummaryKm: `ចំណូលប្រចាំខែបានកើនឡើង ${revGrowth.value.displayValue} ពីតុលាដល់វិច្ឆិកា ២០២៦។`,
+      altSummaryEn: `Monthly net sales changed ${revGrowth.value.displayValue} from ${months[0]} to ${months[1]}.`,
+      altSummaryKm: `ចំណូលប្រចាំខែ (${months[0]} - ${months[1]}) ប្រែប្រួល ${revGrowth.value.displayValue}។`,
       unit: "currency",
       currency: "USD",
       yAxisStartsAtZero: true,
@@ -700,40 +778,55 @@ export class IntelligenceStudioEngine {
       report: { ...report, lastComputedAt: new Date().toISOString() },
       interactionSeq: seq,
       effectiveDepartments,
+      periodStart,
+      periodEndExclusive,
+      departmentSummaryRows,
       policyScope: `${policy.policyId}:v${policy.policyVersion}`,
       cacheHit: false,
       visualResults,
     };
 
-    if (!opts?.chartKindOverride) {
-      if (this.policyResultCache.size >= 500) {
-        const oldest = this.policyResultCache.keys().next().value;
-        if (oldest !== undefined) this.policyResultCache.delete(oldest);
+      if (!opts?.chartKindOverride) {
+        setBoundedLru(this.policyResultCache, cacheKey, structuredClone(response), MAX_BI_CACHE_ENTRIES);
       }
-      this.policyResultCache.set(cacheKey, structuredClone(response));
+
+      this.audit?.append({
+        auditId: `aud_${randomUUID()}`,
+        tenantId: actor.tenantId,
+        workspaceId: actor.workspaceId,
+        actorId: actor.userId,
+        actorRole: actor.role,
+        source: "system",
+        action: "bi.evaluate",
+        outcome: "success",
+        summary: `Evaluated report '${report.reportId}' for scope [${effectiveDepartments.join(",")}] (${response.policyScope})`,
+        createdAt: response.report.lastComputedAt,
+      });
+
+      return response;
+    } finally {
+      this.analytics.unregisterDataset(actor.tenantId, actor.workspaceId, scopedDatasetId, report.datasetVersion);
+      this.analytics.unregisterDataset(actor.tenantId, actor.workspaceId, scopedBudgetId, 1);
     }
+  }
 
-    this.audit?.append({
-      auditId: `aud_${randomUUID()}`,
-      tenantId: actor.tenantId,
-      workspaceId: actor.workspaceId,
-      actorId: actor.userId,
-      actorRole: actor.role,
-      source: "system",
-      action: "bi.evaluate",
-      outcome: "success",
-      summary: `Evaluated report '${report.reportId}' for scope [${effectiveDepartments.join(",")}] (${response.policyScope})`,
-      createdAt: response.report.lastComputedAt,
-    });
-
-    return response;
+  getCacheStats(): {
+    policyResultCache: number;
+    latestSeqEntries: number;
+    analytics: ReturnType<BusinessAnalysisEngine["getCacheStats"]>;
+  } {
+    return {
+      policyResultCache: this.policyResultCache.size,
+      latestSeqEntries: this.latestSeqByReportActor.size,
+      analytics: this.analytics.getCacheStats(),
+    };
   }
 
   drillToPermittedDetail(
     actor: ActorContext,
     policy: DataScopePolicy,
     reportId: string,
-    filter: { departments?: string[]; page?: number; pageSize?: number },
+    filter: { departments?: string[]; page?: number; pageSize?: number; reportingMonth?: string; periodStart?: string },
   ): {
     rows: Array<Record<string, unknown>>;
     totalPermittedRows: number;
@@ -741,18 +834,20 @@ export class IntelligenceStudioEngine {
     returnFilterContext: { departments?: string[] };
   } {
     this.assertNotRevoked(actor);
+    assertCanPerform(actor, "dashboard", "read");
     if (policy.tenantId !== actor.tenantId) {
       throw new IntelligenceEngineError(403, "POLICY_TENANT_MISMATCH", "DataScopePolicy tenant mismatch.");
     }
     const report = this.getReport(actor, reportId);
-    const effectiveDepartments = this.resolveEffectiveDepartments(policy, filter.departments);
     const baseRows =
       this.datasetRowsByManifest.get(`${actor.tenantId}::${report.datasetManifestId}::${report.datasetVersion}`) ?? [];
+    const effectiveDepartments = this.resolveEffectiveDepartments(policy, filter.departments, baseRows);
     const allowedDeptSet = new Set(effectiveDepartments);
     const allowedColSet = new Set(policy.allowedColumns);
+    const targetMonth = filter.reportingMonth ?? filter.periodStart?.slice(0, 7) ?? report.sourceAsOfTimestamp.slice(0, 7);
 
     const permitted = baseRows
-      .filter((r) => r.reportingMonth === "2026-11" && allowedDeptSet.has(r.department))
+      .filter((r) => r.reportingMonth === targetMonth && allowedDeptSet.has(r.department))
       .map((r) => {
         const sanitized: Record<string, unknown> = {};
         for (const [k, v] of Object.entries(r)) {
@@ -864,8 +959,8 @@ export class IntelligenceStudioEngine {
       semanticModelVersion: evaluated.report.semanticModelVersion,
       datasetManifestId: evaluated.report.datasetManifestId,
       datasetVersion: evaluated.report.datasetVersion,
-      periodStart: "2026-11-01",
-      periodEndExclusive: "2026-12-01",
+      periodStart: evaluated.periodStart,
+      periodEndExclusive: evaluated.periodEndExclusive,
       timezone: "Asia/Phnom_Penh",
       reportFilters: [{ dimension: "department", operator: "in", values: evaluated.effectiveDepartments }],
       pageFilters: [],
@@ -907,6 +1002,7 @@ export class IntelligenceStudioEngine {
 
   getPublishedSnapshot(actor: ActorContext, snapshotId: string): PublishedBiSnapshot {
     this.assertNotRevoked(actor);
+    assertCanPerform(actor, "dashboard", "read");
     const snap = this.snapshots.get(snapshotId);
     if (!snap) {
       throw new IntelligenceEngineError(404, "SNAPSHOT_NOT_FOUND", `BI snapshot '${snapshotId}' not found.`);
@@ -976,6 +1072,7 @@ export class IntelligenceStudioEngine {
     language: "en" | "km" | "bilingual" = "bilingual",
   ): StudioPresentation {
     this.assertNotRevoked(actor);
+    assertCanPerform(actor, "dashboard", "read");
     assertTenantWorkspaceAccess(actor, evaluated.report.tenantId, evaluated.report.workspaceId);
     const netSalesRef: LinkedMetricReference =
       evaluated.visualResults.vis_kpi_net_sales!.metricResults["FIN-NET-SALES"]!.linkedMetricReference;
@@ -989,12 +1086,13 @@ export class IntelligenceStudioEngine {
       workspaceId: actor.workspaceId,
       actorId: actor.userId,
       language,
-      scopeLabel: `Departments: ${evaluated.effectiveDepartments.join(" + ")} (v${evaluated.report.datasetVersion})`,
+      scopeLabel: `Departments: ${evaluated.effectiveDepartments.join(" + ")} (${evaluated.periodStart}..${evaluated.periodEndExclusive}, v${evaluated.report.datasetVersion})`,
       netSalesRef,
       opProfitRef,
       opMarginRef,
       revenueChartSpec: evaluated.visualResults.vis_chart_dept_revenue!.chartSpec!,
       budgetChartSpec: evaluated.visualResults.vis_chart_budget_vs_actual!.chartSpec!,
+      departmentTableRows: evaluated.departmentSummaryRows,
     });
     return this.presentations.saveInitialDeck(actor, deck);
   }

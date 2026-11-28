@@ -1,4 +1,5 @@
 import { DuckDBInstance } from "@duckdb/node-api";
+import { currencyScaleFor } from "@ai-office-suite/validation";
 
 export interface EngineComparisonRow {
   organization_id: string;
@@ -35,12 +36,6 @@ export interface EngineStressResult {
   p50Ms: number;
   p95Ms: number;
   rssDeltaMb: number;
-}
-
-function currencyScaleForCode(currency: string): number {
-  const c = currency.trim().toUpperCase();
-  if (c === "KHR" || c === "JPY" || c === "KRW" || c === "VND") return 0;
-  return 2;
 }
 
 export async function runDuckDbComparison(
@@ -162,7 +157,7 @@ export async function runDuckDbComparison(
     const currencyMinorTotals: Record<string, string> = {};
     for (const row of totalsReader.getRowObjects()) {
       const code = String(row.currency);
-      const scale = currencyScaleForCode(code);
+      const scale = currencyScaleFor(code);
       currencyTotals[code] = Math.round(Number(row.total_amt) * 100) / 100;
       currencyMinorTotals[code] = String(scale === 0 ? row.total_minor_scale0 : row.total_minor_scale2);
     }
