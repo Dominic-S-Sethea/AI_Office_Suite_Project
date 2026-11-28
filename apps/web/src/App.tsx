@@ -35,15 +35,79 @@ import {
   formatApiErrorMessage,
   MAX_DOCX_UPLOAD_BYTES,
   safeReadJson,
+  trapDialogTabKey,
 } from "./lib/apiClient.ts";
 
 const LazyVersionAuditDrawer = lazy(() => import("./components/VersionAuditDrawer.tsx"));
+
+function DrawerLoadingFallback({ onClose }: { onClose: () => void }) {
+  const panelRef = useRef<HTMLDivElement | null>(null);
+  const closeBtnRef = useRef<HTMLButtonElement | null>(null);
+
+  useEffect(() => {
+    closeBtnRef.current?.focus();
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        onClose();
+        return;
+      }
+      trapDialogTabKey(panelRef.current, e);
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [onClose]);
+
+  return (
+    <div
+      className="drawer-backdrop"
+      role="dialog"
+      aria-modal="true"
+      aria-label="Loading history drawer"
+      onClick={(e) => {
+        if (e.target === e.currentTarget) onClose();
+      }}
+    >
+      <div ref={panelRef} className="drawer-panel">
+        <div className="panel-header-row">
+          <strong className="modal-title">Version &amp; Audit History</strong>
+          <button ref={closeBtnRef} type="button" className="btn" onClick={onClose}>
+            Close
+          </button>
+        </div>
+        <div className="preview-card" role="status">
+          Loading version &amp; audit drawer...
+        </div>
+      </div>
+    </div>
+  );
+}
 
 type AuthMode = "provisional-local" | "jwt-pg";
 type BootState = "loading" | "ready" | "unreachable";
 type ActiveStudioId = "documents" | "spreadsheets" | "presentations" | "analytics";
 
 const PAGE_SIZE = 50;
+
+const DOC_WRITE_ROLES = new Set<WorkspaceRole>(["owner", "administrator", "workspace_manager", "editor"]);
+const DOC_EXPORT_ROLES = new Set<WorkspaceRole>(["owner", "administrator", "workspace_manager", "editor", "reviewer"]);
+const DOC_READ_ROLES = new Set<WorkspaceRole>([
+  "owner",
+  "administrator",
+  "workspace_manager",
+  "editor",
+  "reviewer",
+  "viewer",
+]);
+const AUDIT_READ_ROLES = new Set<WorkspaceRole>([
+  "owner",
+  "administrator",
+  "workspace_manager",
+  "billing_admin",
+  "auditor",
+  "editor",
+  "reviewer",
+]);
 
 const DEFAULT_PAGE_LAYOUT: PageLayoutConfig = {
   size: "A4",
@@ -64,7 +128,12 @@ export function App() {
   // 3-zone workspace navigation state
   const [activeStudio, setActiveStudio] = useState<ActiveStudioId>("documents");
   const [openFixedHeader, setOpenFixedHeader] = useState<FixedHeaderId | null>(null);
-  const [docsDrawerOpen, setDocsDrawerOpen] = useState(true);
+  const [mobileNavOpen, setMobileNavOpen] = useState(false);
+  const [docsDrawerOpen, setDocsDrawerOpen] = useState(() =>
+    typeof window !== "undefined" && typeof window.matchMedia === "function"
+      ? !window.matchMedia("(max-width: 960px)").matches
+      : true,
+  );
   const [activeSubPanel, setActiveSubPanel] = useState<WorkspaceUtilityPanelId>(null);
   const scrollStageRef = useRef<HTMLDivElement | null>(null);
 
@@ -72,7 +141,11 @@ export function App() {
     setActiveSubPanel((prev) => {
       const next = prev === panel ? null : panel;
       if (next && scrollStageRef.current && typeof scrollStageRef.current.scrollTo === "function") {
-        scrollStageRef.current.scrollTo({ top: 0, behavior: "smooth" });
+        const prefersReduced =
+          typeof window !== "undefined" &&
+          typeof window.matchMedia === "function" &&
+          window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+        scrollStageRef.current.scrollTo({ top: 0, behavior: prefersReduced ? "auto" : "smooth" });
       }
       return next;
     });
@@ -102,6 +175,18 @@ export function App() {
   const [draftLayout, setDraftLayout] = useState<PageLayoutConfig | null>(null);
   const [selection, setSelection] = useState<EditorSelectionState>({ selectedText: "" });
 
+  const handleSelectionChange = useCallback((next: EditorSelectionState) => {
+    setSelection((prev) =>
+      prev.blockId === next.blockId &&
+      prev.selectedText === next.selectedText &&
+      prev.graphemeCount === next.graphemeCount &&
+      prev.startOffset === next.startOffset &&
+      prev.endOffset === next.endOffset
+        ? prev
+        : next,
+    );
+  }, []);
+
   // New blank document modal state
   const [newDocModalOpen, setNewDocModalOpen] = useState(false);
   const [newDocTitle, setNewDocTitle] = useState("");
@@ -121,12 +206,14 @@ export function App() {
   const [versions, setVersions] = useState<DocumentVersion[]>([]);
   const [auditEvents, setAuditEvents] = useState<AuditEvent[]>([]);
 
-  // Request abort / sequence guards (H23)
+  // Request abort / sequence guards (H23, F-17)
   const listAbortRef = useRef<AbortController | null>(null);
   const listSeqRef = useRef(0);
   const historyAbortRef = useRef<AbortController | null>(null);
   const historySeqRef = useRef(0);
   const diffAbortRef = useRef<AbortController | null>(null);
+  const reloadAbortRef = useRef<AbortController | null>(null);
+  const reloadSeqRef = useRef(0);
 
   const [isLoadingDocs, setIsLoadingDocs] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
@@ -140,11 +227,27 @@ export function App() {
   const [conflictMessage, setConflictMessage] = useState<string | null>(null);
 
   const effectiveRole: WorkspaceRole = authMode === "jwt-pg" ? (sessionActor?.role ?? "viewer") : prototypeRole;
-  const readOnly = effectiveRole === "viewer" || effectiveRole === "reviewer";
-  const canExport = effectiveRole !== "viewer";
+  const canReadDocs = DOC_READ_ROLES.has(effectiveRole);
+  const readOnly = !DOC_WRITE_ROLES.has(effectiveRole);
+  const canExport = DOC_EXPORT_ROLES.has(effectiveRole);
+  const canReadAudit = AUDIT_READ_ROLES.has(effectiveRole);
   const isAuthenticated = bootState === "ready" && (authMode === "provisional-local" || sessionActor !== null);
   const hasUnsavedChanges =
     editorDirty || draftTitle !== null || draftLanguage !== null || draftLayout !== null;
+
+  useEffect(() => {
+    if (typeof window === "undefined" || typeof window.matchMedia !== "function") return;
+    const mq = window.matchMedia("(max-width: 960px)");
+    const onViewportChange = (e: MediaQueryListEvent) => {
+      if (e.matches) {
+        setDocsDrawerOpen(false);
+      } else {
+        setMobileNavOpen(false);
+      }
+    };
+    mq.addEventListener?.("change", onViewportChange);
+    return () => mq.removeEventListener?.("change", onViewportChange);
+  }, []);
 
   const hasUnsavedChangesRef = useRef(hasUnsavedChanges);
   useEffect(() => {
@@ -162,12 +265,13 @@ export function App() {
     return () => window.removeEventListener("beforeunload", onBeforeUnload);
   }, [hasUnsavedChanges]);
 
-  // Abort any in-flight fetches on unmount (H23)
+  // Abort any in-flight fetches on unmount (H23, F-17)
   useEffect(() => {
     return () => {
       listAbortRef.current?.abort();
       historyAbortRef.current?.abort();
       diffAbortRef.current?.abort();
+      reloadAbortRef.current?.abort();
     };
   }, []);
 
@@ -180,6 +284,7 @@ export function App() {
 
   const confirmDiscardUnsavedChanges = useCallback((actionDescription: string): boolean => {
     if (!hasUnsavedChangesRef.current) return true;
+    if (typeof window.confirm !== "function") return true;
     return window.confirm(`You have unsaved changes on the current document. Discard them and ${actionDescription}?`);
   }, []);
 
@@ -264,6 +369,15 @@ export function App() {
   const loadDocuments = useCallback(
     async (opts?: { forceSyncActive?: boolean }) => {
       if (bootState !== "ready" || !isAuthenticated) return;
+      if (!canReadDocs) {
+        listAbortRef.current?.abort();
+        setDocs([]);
+        setTotalDocs(0);
+        setActiveDoc(null);
+        setIsLoadingDocs(false);
+        setStatusMessage(`Governance role (${effectiveRole}) active: document content access is restricted.`);
+        return;
+      }
       listAbortRef.current?.abort();
       const controller = new AbortController();
       listAbortRef.current = controller;
@@ -330,7 +444,7 @@ export function App() {
         }
       }
     },
-    [apiHeaders, bootState, isAuthenticated, handleUnauthorized, searchQuery, languageFilter, docOffset],
+    [apiHeaders, bootState, isAuthenticated, canReadDocs, effectiveRole, handleUnauthorized, searchQuery, languageFilter, docOffset],
   );
 
   useEffect(() => {
@@ -412,17 +526,25 @@ export function App() {
 
   async function reloadActiveDocument() {
     if (!activeDoc) return;
+    const targetDocId = activeDoc.documentId;
+    reloadAbortRef.current?.abort();
+    const controller = new AbortController();
+    reloadAbortRef.current = controller;
+    const seq = ++reloadSeqRef.current;
     setErrorBanner(null);
     try {
-      const res = await fetch(`/api/documents/${encodeURIComponent(activeDoc.documentId)}`, {
+      const res = await fetch(`/api/documents/${encodeURIComponent(targetDocId)}`, {
         credentials: "include",
         headers: apiHeaders,
+        signal: controller.signal,
       });
+      if (seq !== reloadSeqRef.current || activeDocIdRef.current !== targetDocId) return;
       if (res.status === 401) {
         handleUnauthorized();
         return;
       }
       const data = await safeReadJson(res);
+      if (seq !== reloadSeqRef.current || activeDocIdRef.current !== targetDocId) return;
       if (!res.ok) {
         setErrorBanner(formatApiErrorMessage(res, data, "Failed to reload latest document."));
         return;
@@ -433,8 +555,11 @@ export function App() {
       setConflictMessage(null);
       setDocs((prev) => prev.map((d) => (d.documentId === latest.documentId ? latest : d)));
       setStatusMessage(`Reloaded latest revision ${latest.revision}.`);
-    } catch {
-      setErrorBanner("Network error reloading latest revision.");
+    } catch (err) {
+      if (err instanceof DOMException && err.name === "AbortError") return;
+      if (seq === reloadSeqRef.current) {
+        setErrorBanner("Network error reloading latest revision.");
+      }
     }
   }
 
@@ -540,7 +665,7 @@ export function App() {
     }
   }
 
-  async function handleSeedBilingual() {
+  const handleSeedBilingual = useCallback(async () => {
     if (readOnly || isSeeding) return;
     if (!confirmDiscardUnsavedChanges("load a new bilingual sample document")) return;
     setErrorBanner(null);
@@ -574,7 +699,7 @@ export function App() {
     } finally {
       setIsSeeding(false);
     }
-  }
+  }, [readOnly, isSeeding, confirmDiscardUnsavedChanges, apiHeaders, handleUnauthorized, clearDrafts, loadDocuments]);
 
   const handleSave = useCallback(async () => {
     if (!activeDoc || !hasUnsavedChanges || readOnly || isSaving) return;
@@ -658,97 +783,115 @@ export function App() {
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [handleSave]);
 
-  async function handleExport(kind: "docx" | "pdf") {
-    if (!activeDoc || !canExport || isExporting) return;
-    setErrorBanner(null);
-    setIsExporting(kind);
-    try {
-      const res = await fetch(`/api/documents/${encodeURIComponent(activeDoc.documentId)}/export/${kind}`, {
-        method: "POST",
-        credentials: "include",
-        headers: apiHeaders,
-      });
-      if (res.status === 401) {
-        handleUnauthorized();
-        return;
-      }
-      if (!res.ok) {
-        const data = await safeReadJson(res);
-        const msg = formatApiErrorMessage(res, data, `${kind.toUpperCase()} export failed`);
-        setErrorBanner(msg);
-        setStatusMessage(msg);
-        return;
-      }
-      const blob = await res.blob();
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = `${activeDoc.documentId}-rev${activeDoc.revision}.${kind}`;
-      a.click();
-      // Defer object URL revocation so Safari & slow download managers finish streaming cleanly (M14)
-      window.setTimeout(() => URL.revokeObjectURL(url), 60_000);
-      setStatusMessage(`Exported ${kind.toUpperCase()} snapshot (rev ${activeDoc.revision}).`);
-    } catch {
-      setErrorBanner(`Network error during ${kind.toUpperCase()} export.`);
-    } finally {
-      setIsExporting(null);
-    }
-  }
-
-  async function openHistory(section: HistorySectionTab = "all") {
-    if (!activeDoc) return;
-    historyAbortRef.current?.abort();
-    const controller = new AbortController();
-    historyAbortRef.current = controller;
-    const seq = ++historySeqRef.current;
-
-    setErrorBanner(null);
-    setHistorySection(section);
-    setHistoryOpen(true);
-    setIsLoadingHistory(true);
-    try {
-      const [vRes, aRes] = await Promise.all([
-        fetch(`/api/documents/${encodeURIComponent(activeDoc.documentId)}/versions`, {
+  const handleExport = useCallback(
+    async (kind: "docx" | "pdf") => {
+      if (!activeDoc || !canExport || isExporting) return;
+      setErrorBanner(null);
+      setIsExporting(kind);
+      setStatusMessage(kind === "docx" ? "Exporting DOCX snapshot..." : "Rendering PDF snapshot (HarfBuzz)...");
+      try {
+        const res = await fetch(`/api/documents/${encodeURIComponent(activeDoc.documentId)}/export/${kind}`, {
+          method: "POST",
           credentials: "include",
           headers: apiHeaders,
-          signal: controller.signal,
-        }),
-        fetch(`/api/documents/${encodeURIComponent(activeDoc.documentId)}/audit`, {
-          credentials: "include",
-          headers: apiHeaders,
-          signal: controller.signal,
-        }),
-      ]);
-      if (seq !== historySeqRef.current) return;
-      if (vRes.status === 401 || aRes.status === 401) {
-        setHistoryOpen(false);
-        handleUnauthorized();
-        return;
+        });
+        if (res.status === 401) {
+          handleUnauthorized();
+          return;
+        }
+        if (!res.ok) {
+          const data = await safeReadJson(res);
+          const msg = formatApiErrorMessage(res, data, `${kind.toUpperCase()} export failed`);
+          setErrorBanner(msg);
+          setStatusMessage(msg);
+          return;
+        }
+        const blob = await res.blob();
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = `${activeDoc.documentId}-rev${activeDoc.revision}.${kind}`;
+        a.click();
+        // Defer object URL revocation so Safari & slow download managers finish streaming cleanly (M14)
+        window.setTimeout(() => URL.revokeObjectURL(url), 60_000);
+        setStatusMessage(`Exported ${kind.toUpperCase()} snapshot (rev ${activeDoc.revision}).`);
+      } catch {
+        setErrorBanner(`Network error during ${kind.toUpperCase()} export.`);
+      } finally {
+        setIsExporting(null);
       }
-      if (!vRes.ok || !aRes.ok) {
-        const badRes = !vRes.ok ? vRes : aRes;
-        const errData = await safeReadJson(badRes);
-        setErrorBanner(formatApiErrorMessage(badRes, errData, "Failed to load version & audit history."));
-        setHistoryOpen(false);
-        return;
+    },
+    [activeDoc, canExport, isExporting, apiHeaders, handleUnauthorized],
+  );
+
+  const openHistory = useCallback(
+    async (section: HistorySectionTab = "all") => {
+      if (!activeDoc) return;
+      historyAbortRef.current?.abort();
+      const controller = new AbortController();
+      historyAbortRef.current = controller;
+      const seq = ++historySeqRef.current;
+
+      setErrorBanner(null);
+      setHistorySection(section);
+      setHistoryOpen(true);
+      setIsLoadingHistory(true);
+      try {
+        const [vRes, aRes] = await Promise.all([
+          fetch(`/api/documents/${encodeURIComponent(activeDoc.documentId)}/versions`, {
+            credentials: "include",
+            headers: apiHeaders,
+            signal: controller.signal,
+          }),
+          canReadAudit
+            ? fetch(`/api/documents/${encodeURIComponent(activeDoc.documentId)}/audit`, {
+                credentials: "include",
+                headers: apiHeaders,
+                signal: controller.signal,
+              })
+            : Promise.resolve(null),
+        ]);
+        if (seq !== historySeqRef.current) return;
+        if (vRes.status === 401 || aRes?.status === 401) {
+          setHistoryOpen(false);
+          handleUnauthorized();
+          return;
+        }
+        if (!vRes.ok) {
+          const errData = await safeReadJson(vRes);
+          setErrorBanner(formatApiErrorMessage(vRes, errData, "Failed to load version history."));
+          setHistoryOpen(false);
+          return;
+        }
+        const vData = await safeReadJson(vRes);
+        if (seq !== historySeqRef.current) return;
+        setVersions((vData.versions ?? []) as DocumentVersion[]);
+
+        if (aRes && aRes.ok) {
+          const aData = await safeReadJson(aRes);
+          if (seq !== historySeqRef.current) return;
+          setAuditEvents((aData.events ?? []) as AuditEvent[]);
+        } else {
+          if (aRes && aRes.status !== 403) {
+            const errData = await safeReadJson(aRes);
+            setErrorBanner(formatApiErrorMessage(aRes, errData, "Failed to load audit log."));
+          }
+          setAuditEvents([]);
+        }
+      } catch (err) {
+        if (err instanceof DOMException && err.name === "AbortError") return;
+        if (seq === historySeqRef.current) {
+          setErrorBanner("Network error loading version & audit history.");
+          setHistoryOpen(false);
+        }
+      } finally {
+        if (seq === historySeqRef.current) {
+          setIsLoadingHistory(false);
+        }
       }
-      const vData = await safeReadJson(vRes);
-      const aData = await safeReadJson(aRes);
-      if (seq !== historySeqRef.current) return;
-      setVersions((vData.versions ?? []) as DocumentVersion[]);
-      setAuditEvents((aData.events ?? []) as AuditEvent[]);
-    } catch (err) {
-      if (err instanceof DOMException && err.name === "AbortError") return;
-      if (seq === historySeqRef.current) {
-        setErrorBanner("Network error loading version & audit history.");
-        setHistoryOpen(false);
-      }
-    } finally {
-      if (seq === historySeqRef.current) {
-        setIsLoadingHistory(false);
-      }
-    }
-  }
+    },
+    [activeDoc, apiHeaders, canReadAudit, handleUnauthorized],
+  );
 
   const handleCompareRevision = useCallback(
     async (fromRev: number, toRev: number): Promise<RevisionDiffPayload | null> => {
@@ -784,7 +927,6 @@ export function App() {
   const handleRestore = useCallback(
     async (revision: number) => {
       if (!activeDoc || readOnly || restoringRevision !== null) return;
-      if (!confirmDiscardUnsavedChanges(`restore revision ${revision}`)) return;
       setErrorBanner(null);
       setRestoringRevision(revision);
       try {
@@ -793,7 +935,8 @@ export function App() {
           {
             method: "POST",
             credentials: "include",
-            headers: apiHeaders,
+            headers: { "Content-Type": "application/json", ...apiHeaders },
+            body: JSON.stringify({ expectedRevision: activeDoc.revision }),
           },
         );
         if (res.status === 401) {
@@ -802,6 +945,16 @@ export function App() {
           return;
         }
         const data = await safeReadJson(res);
+        if (res.status === 409) {
+          const msg = String(
+            data.error ??
+              `Revision conflict: expected rev ${activeDoc.revision}, but the document was modified elsewhere.`,
+          );
+          setConflictMessage(msg);
+          setHistoryOpen(false);
+          setStatusMessage("Restore blocked by revision conflict (409).");
+          return;
+        }
         if (res.ok) {
           const restored = data.document as StudioDocument;
           setActiveDoc(restored);
@@ -821,12 +974,14 @@ export function App() {
         setRestoringRevision(null);
       }
     },
-    [activeDoc, readOnly, restoringRevision, confirmDiscardUnsavedChanges, apiHeaders, handleUnauthorized, clearDrafts, loadDocuments],
+    [activeDoc, readOnly, restoringRevision, apiHeaders, handleUnauthorized, clearDrafts, loadDocuments],
   );
 
   function handleSelectDocument(nextDoc: StudioDocument) {
     if (activeDoc?.documentId === nextDoc.documentId) return;
     if (!confirmDiscardUnsavedChanges("switch documents")) return;
+    reloadAbortRef.current?.abort();
+    reloadSeqRef.current += 1;
     setActiveDoc(nextDoc);
     clearDrafts();
     setConflictMessage(null);
@@ -880,240 +1035,376 @@ export function App() {
     analytics: "Intelligence BI",
   };
 
-  const navGroups: NavFixedHeaderGroup[] = [
-    {
-      id: "files",
-      label: "Files & Docs",
-      shortTag: "FD",
-      subHeaders: [
-        {
-          id: "all_docs",
-          label: docsDrawerOpen ? "Hide Document List" : "All Documents",
-          badge: String(totalDocs),
-          active: docsDrawerOpen,
-          onSelect: () => {
-            setActiveStudio("documents");
-            setDocsDrawerOpen((v) => !v);
+  const navGroups = useMemo<NavFixedHeaderGroup[]>(() => {
+    const readOnlyTooltip = !canReadDocs
+      ? `Governance role (${effectiveRole}): document reading and writing are disabled.`
+      : effectiveRole === "reviewer"
+        ? "Read-only role (Reviewer): creating, importing, editing, and saving documents are disabled."
+        : effectiveRole === "viewer"
+          ? "Read-only role (Viewer): creating, importing, editing, saving, and exporting are disabled."
+          : "Read-only role active: document mutations are disabled.";
+    const noDocTooltip = "Select or create a document first.";
+    const exportTooltip = !activeDoc
+      ? noDocTooltip
+      : !canExport
+        ? "Role lacks export permission (export:export); Reviewer or Editor role required."
+        : isExporting !== null
+          ? "Another export is already in progress."
+          : undefined;
+    const saveTooltip = readOnly
+      ? readOnlyTooltip
+      : !hasUnsavedChanges
+        ? "No unsaved changes to save."
+        : isSaving
+          ? "Saving changes..."
+          : "Save current changes (Ctrl+S / Cmd+S)";
+
+    return [
+      {
+        id: "files",
+        label: "Files & Docs",
+        shortTag: "FD",
+        subHeaders: [
+          {
+            id: "all_docs",
+            label: docsDrawerOpen ? "Hide Document List" : "All Documents",
+            badge: String(totalDocs),
+            active: docsDrawerOpen,
+            title: docsDrawerOpen ? "Collapse workspace documents drawer" : "Show workspace documents drawer",
+            onSelect: () => {
+              setActiveStudio("documents");
+              setDocsDrawerOpen((v) => !v);
+              setMobileNavOpen(false);
+            },
           },
-        },
-        {
-          id: "new_blank",
-          label: "+ New Blank",
-          disabled: readOnly,
-          onSelect: () => {
-            setActiveStudio("documents");
-            setNewDocError(null);
-            setNewDocModalOpen(true);
+          {
+            id: "new_blank",
+            label: "+ New Blank",
+            disabled: readOnly,
+            title: readOnly ? readOnlyTooltip : "Create a new blank English, Khmer, or bilingual document",
+            onSelect: () => {
+              setActiveStudio("documents");
+              setNewDocError(null);
+              setNewDocModalOpen(true);
+              setMobileNavOpen(false);
+            },
           },
-        },
-        {
-          id: "seed_bilingual",
-          label: isSeeding ? "Creating..." : "Bilingual Sample",
-          disabled: readOnly || isSeeding,
-          onSelect: () => {
-            setActiveStudio("documents");
-            void handleSeedBilingual();
+          {
+            id: "seed_bilingual",
+            label: isSeeding ? "Creating..." : "Bilingual Sample",
+            disabled: readOnly || isSeeding,
+            title: readOnly ? readOnlyTooltip : "Load the bilingual EN/KM management report fixture",
+            onSelect: () => {
+              setActiveStudio("documents");
+              setMobileNavOpen(false);
+              void handleSeedBilingual();
+            },
           },
-        },
-        {
-          id: "import_docx",
-          label: isImportingDocx ? "Importing..." : "Import DOCX",
-          disabled: readOnly || isImportingDocx,
-          onSelect: () => {
-            setActiveStudio("documents");
-            fileInputRef.current?.click();
+          {
+            id: "import_docx",
+            label: isImportingDocx ? "Importing..." : "Import DOCX",
+            disabled: readOnly || isImportingDocx,
+            title: readOnly ? readOnlyTooltip : "Import a .docx file into Document Studio",
+            onSelect: () => {
+              setActiveStudio("documents");
+              setMobileNavOpen(false);
+              fileInputRef.current?.click();
+            },
           },
-        },
-        {
-          id: "save_doc",
-          label: isSaving ? "Saving..." : `Save${hasUnsavedChanges ? " *" : ""}`,
-          disabled: readOnly || !hasUnsavedChanges || isSaving,
-          onSelect: () => void handleSave(),
-        },
-        {
-          id: "export_docx",
-          label: isExporting === "docx" ? "Exporting..." : "Export DOCX",
-          disabled: !activeDoc || !canExport || isExporting !== null,
-          title: !canExport ? "Viewers cannot export files; Reviewer or Editor role required." : undefined,
-          onSelect: () => void handleExport("docx"),
-        },
-        {
-          id: "export_pdf",
-          label: isExporting === "pdf" ? "Rendering..." : "Export PDF",
-          disabled: !activeDoc || !canExport || isExporting !== null,
-          title: !canExport ? "Viewers cannot export files; Reviewer or Editor role required." : undefined,
-          onSelect: () => void handleExport("pdf"),
-        },
-      ],
-    },
-    {
-      id: "layout",
-      label: "Page & Style",
-      shortTag: "PS",
-      subHeaders: [
-        {
-          id: "page_size",
-          label: `Page Size (${effectiveActiveDoc?.layout.size ?? "A4"})`,
-          active: activeSubPanel === "page_size",
-          disabled: !activeDoc,
-          onSelect: () => {
-            setActiveStudio("documents");
-            toggleSubPanel("page_size");
+          {
+            id: "save_doc",
+            label: isSaving ? "Saving..." : `Save${hasUnsavedChanges ? " *" : ""}`,
+            disabled: readOnly || !hasUnsavedChanges || isSaving,
+            title: saveTooltip,
+            onSelect: () => {
+              setMobileNavOpen(false);
+              void handleSave();
+            },
           },
-        },
-        {
-          id: "orientation",
-          label: `Orientation (${effectiveActiveDoc?.layout.orientation ?? "portrait"})`,
-          disabled: readOnly || !effectiveActiveDoc,
-          onSelect: () => {
-            if (!effectiveActiveDoc) return;
-            setActiveStudio("documents");
-            setDraftLayout({
-              ...effectiveActiveDoc.layout,
-              orientation: effectiveActiveDoc.layout.orientation === "portrait" ? "landscape" : "portrait",
-            });
+          {
+            id: "export_docx",
+            label: isExporting === "docx" ? "Exporting..." : "Export DOCX",
+            disabled: !activeDoc || !canExport || isExporting !== null,
+            title: exportTooltip ?? "Export editable DOCX snapshot",
+            onSelect: () => {
+              setMobileNavOpen(false);
+              void handleExport("docx");
+            },
           },
-        },
-        {
-          id: "khmer_fonts",
-          label: "Khmer Fonts & Headers",
-          active: activeSubPanel === "page_fonts",
-          disabled: !activeDoc,
-          onSelect: () => {
-            setActiveStudio("documents");
-            toggleSubPanel("page_fonts");
+          {
+            id: "export_pdf",
+            label: isExporting === "pdf" ? "Rendering..." : "Export PDF",
+            disabled: !activeDoc || !canExport || isExporting !== null,
+            title: exportTooltip ?? "Render paginated PDF snapshot (HarfBuzz)",
+            onSelect: () => {
+              setMobileNavOpen(false);
+              void handleExport("pdf");
+            },
           },
-        },
-        {
-          id: "linked_metrics",
-          label: "Linked Metrics",
-          active: activeSubPanel === "linked_metrics",
-          onSelect: () => toggleSubPanel("linked_metrics"),
-        },
-      ],
-    },
-    {
-      id: "data",
-      label: "Data & Analytics",
-      shortTag: "DA",
-      subHeaders: [
-        {
-          id: "stage_profile",
-          label: "Stage & Profile",
-          badge: "API",
-          active: activeSubPanel === "data_prep",
-          onSelect: () => toggleSubPanel("data_prep"),
-        },
-        {
-          id: "certified_metrics",
-          label: "Certified Metrics",
-          badge: "V1",
-          active: activeSubPanel === "certified_metrics",
-          onSelect: () => toggleSubPanel("certified_metrics"),
-        },
-        {
-          id: "duckdb_spill",
-          label: "DuckDB 1M Spill",
-          badge: "TF-04",
-          active: activeSubPanel === "duckdb_spill",
-          onSelect: () => toggleSubPanel("duckdb_spill"),
-        },
-      ],
-    },
-    {
-      id: "workflows",
-      label: "Workflows",
-      shortTag: "WF",
-      subHeaders: [
-        {
-          id: "linked_objects",
-          label: "Linked Objects",
-          active: activeSubPanel === "workflow_links",
-          onSelect: () => toggleSubPanel("workflow_links"),
-        },
-        {
-          id: "reporting_packages",
-          label: "Reporting Packages",
-          badge: "XI-00",
-          active: activeSubPanel === "workflow_packages",
-          onSelect: () => toggleSubPanel("workflow_packages"),
-        },
-        {
-          id: "outbox_status",
-          label: "Publication Outbox",
-          active: activeSubPanel === "workflow_outbox",
-          onSelect: () => toggleSubPanel("workflow_outbox"),
-        },
-      ],
-    },
-    {
-      id: "versions",
-      label: "Versions & Audit",
-      shortTag: "VA",
-      subHeaders: [
-        {
-          id: "version_history",
-          label: "Version History",
-          disabled: !activeDoc,
-          active: historyOpen && (historySection === "versions" || historySection === "all"),
-          onSelect: () => void openHistory("versions"),
-        },
-        {
-          id: "revision_diff",
-          label: "Revision Diff",
-          disabled: !activeDoc,
-          active: historyOpen && historySection === "diff",
-          onSelect: () => void openHistory("diff"),
-        },
-        {
-          id: "audit_trail",
-          label: "Audit Trail",
-          disabled: !activeDoc,
-          active: historyOpen && historySection === "audit",
-          onSelect: () => void openHistory("audit"),
-        },
-        {
-          id: "backup_restore",
-          label: "Backup & Restore",
-          active: activeSubPanel === "backup_restore",
-          onSelect: () => toggleSubPanel("backup_restore"),
-        },
-      ],
-    },
-    {
-      id: "admin",
-      label: "Admin & Governance",
-      shortTag: "AG",
-      subHeaders: [
-        {
-          id: "role_rbac",
-          label: `Role & RBAC (${effectiveRole})`,
-          active: activeSubPanel === "admin_rbac",
-          onSelect: () => toggleSubPanel("admin_rbac"),
-        },
-        {
-          id: "ai_voice_policy",
-          label: "AI & Voice Policy",
-          badge: "423",
-          active: activeSubPanel === "admin_policies",
-          onSelect: () => toggleSubPanel("admin_policies"),
-        },
-        {
-          id: "quotas_jobs",
-          label: "Quotas & Jobs",
-          badge: "PA-00",
-          active: activeSubPanel === "admin_quotas",
-          onSelect: () => toggleSubPanel("admin_quotas"),
-        },
-        {
-          id: "session_health",
-          label: "Session & Health",
-          active: activeSubPanel === "admin_health",
-          onSelect: () => toggleSubPanel("admin_health"),
-        },
-      ],
-    },
-  ];
+        ],
+      },
+      {
+        id: "layout",
+        label: "Page & Style",
+        shortTag: "PS",
+        subHeaders: [
+          {
+            id: "page_size",
+            label: `Page Size (${effectiveActiveDoc?.layout.size ?? "A4"})`,
+            active: activeSubPanel === "page_size",
+            disabled: !activeDoc,
+            title: !activeDoc ? noDocTooltip : "Configure paper size and margins",
+            onSelect: () => {
+              setActiveStudio("documents");
+              toggleSubPanel("page_size");
+              setMobileNavOpen(false);
+            },
+          },
+          {
+            id: "orientation",
+            label: `Orientation (${effectiveActiveDoc?.layout.orientation ?? "portrait"})`,
+            disabled: readOnly || !effectiveActiveDoc,
+            title: readOnly
+              ? readOnlyTooltip
+              : !effectiveActiveDoc
+                ? noDocTooltip
+                : "Toggle portrait / landscape orientation",
+            onSelect: () => {
+              if (!effectiveActiveDoc) return;
+              setActiveStudio("documents");
+              setDraftLayout({
+                ...effectiveActiveDoc.layout,
+                orientation: effectiveActiveDoc.layout.orientation === "portrait" ? "landscape" : "portrait",
+              });
+              setMobileNavOpen(false);
+            },
+          },
+          {
+            id: "khmer_fonts",
+            label: "Khmer Fonts & Headers",
+            active: activeSubPanel === "page_fonts",
+            disabled: !activeDoc,
+            title: !activeDoc ? noDocTooltip : "Configure document language, headers, footers, and Khmer fonts",
+            onSelect: () => {
+              setActiveStudio("documents");
+              toggleSubPanel("page_fonts");
+              setMobileNavOpen(false);
+            },
+          },
+          {
+            id: "linked_metrics",
+            label: "Linked Metrics",
+            active: activeSubPanel === "linked_metrics",
+            onSelect: () => {
+              toggleSubPanel("linked_metrics");
+              setMobileNavOpen(false);
+            },
+          },
+        ],
+      },
+      {
+        id: "data",
+        label: "Data & Analytics",
+        shortTag: "DA",
+        subHeaders: [
+          {
+            id: "stage_profile",
+            label: "Stage & Profile",
+            badge: "API",
+            active: activeSubPanel === "data_prep",
+            onSelect: () => {
+              toggleSubPanel("data_prep");
+              setMobileNavOpen(false);
+            },
+          },
+          {
+            id: "certified_metrics",
+            label: "Certified Metrics",
+            badge: "V1",
+            active: activeSubPanel === "certified_metrics",
+            onSelect: () => {
+              toggleSubPanel("certified_metrics");
+              setMobileNavOpen(false);
+            },
+          },
+          {
+            id: "duckdb_spill",
+            label: "DuckDB 1M Spill",
+            badge: "TF-04",
+            active: activeSubPanel === "duckdb_spill",
+            onSelect: () => {
+              toggleSubPanel("duckdb_spill");
+              setMobileNavOpen(false);
+            },
+          },
+        ],
+      },
+      {
+        id: "workflows",
+        label: "Workflows",
+        shortTag: "WF",
+        subHeaders: [
+          {
+            id: "linked_objects",
+            label: "Linked Objects",
+            active: activeSubPanel === "workflow_links",
+            onSelect: () => {
+              toggleSubPanel("workflow_links");
+              setMobileNavOpen(false);
+            },
+          },
+          {
+            id: "reporting_packages",
+            label: "Reporting Packages",
+            badge: "XI-00",
+            active: activeSubPanel === "workflow_packages",
+            onSelect: () => {
+              toggleSubPanel("workflow_packages");
+              setMobileNavOpen(false);
+            },
+          },
+          {
+            id: "outbox_status",
+            label: "Publication Outbox",
+            active: activeSubPanel === "workflow_outbox",
+            onSelect: () => {
+              toggleSubPanel("workflow_outbox");
+              setMobileNavOpen(false);
+            },
+          },
+        ],
+      },
+      {
+        id: "versions",
+        label: "Versions & Audit",
+        shortTag: "VA",
+        subHeaders: [
+          {
+            id: "version_history",
+            label: "Version History",
+            disabled: !activeDoc,
+            active: historyOpen && (historySection === "versions" || historySection === "all"),
+            title: !activeDoc ? noDocTooltip : "Inspect immutable document revisions",
+            onSelect: () => {
+              setMobileNavOpen(false);
+              void openHistory("versions");
+            },
+          },
+          {
+            id: "revision_diff",
+            label: "Revision Diff",
+            disabled: !activeDoc,
+            active: historyOpen && historySection === "diff",
+            title: !activeDoc ? noDocTooltip : "Compare block-level EN/KM changes between revisions",
+            onSelect: () => {
+              setMobileNavOpen(false);
+              void openHistory("diff");
+            },
+          },
+          {
+            id: "audit_trail",
+            label: "Audit Trail",
+            disabled: !activeDoc || !canReadAudit,
+            active: historyOpen && historySection === "audit",
+            title: !activeDoc
+              ? noDocTooltip
+              : !canReadAudit
+                ? "Audit trail requires Reviewer, Editor, Auditor, or Owner permission (audit:read)."
+                : "Review append-only security and edit audit events",
+            onSelect: () => {
+              setMobileNavOpen(false);
+              void openHistory("audit");
+            },
+          },
+          {
+            id: "backup_restore",
+            label: "Backup & Restore",
+            active: activeSubPanel === "backup_restore",
+            onSelect: () => {
+              toggleSubPanel("backup_restore");
+              setMobileNavOpen(false);
+            },
+          },
+        ],
+      },
+      {
+        id: "admin",
+        label: "Admin & Governance",
+        shortTag: "AG",
+        subHeaders: [
+          {
+            id: "role_rbac",
+            label: `Role & RBAC (${effectiveRole})`,
+            active: activeSubPanel === "admin_rbac",
+            onSelect: () => {
+              toggleSubPanel("admin_rbac");
+              setMobileNavOpen(false);
+            },
+          },
+          {
+            id: "ai_voice_policy",
+            label: "AI & Voice Policy",
+            badge: "423",
+            active: activeSubPanel === "admin_policies",
+            onSelect: () => {
+              toggleSubPanel("admin_policies");
+              setMobileNavOpen(false);
+            },
+          },
+          {
+            id: "quotas_jobs",
+            label: "Quotas & Jobs",
+            badge: "PA-00",
+            active: activeSubPanel === "admin_quotas",
+            onSelect: () => {
+              toggleSubPanel("admin_quotas");
+              setMobileNavOpen(false);
+            },
+          },
+          {
+            id: "session_health",
+            label: "Session & Health",
+            active: activeSubPanel === "admin_health",
+            onSelect: () => {
+              toggleSubPanel("admin_health");
+              setMobileNavOpen(false);
+            },
+          },
+        ],
+      },
+    ];
+  }, [
+    docsDrawerOpen,
+    totalDocs,
+    canReadDocs,
+    readOnly,
+    effectiveRole,
+    isSeeding,
+    isImportingDocx,
+    isSaving,
+    hasUnsavedChanges,
+    activeDoc,
+    canExport,
+    canReadAudit,
+    isExporting,
+    effectiveActiveDoc,
+    activeSubPanel,
+    historyOpen,
+    historySection,
+    handleSeedBilingual,
+    handleSave,
+    handleExport,
+    toggleSubPanel,
+    openHistory,
+  ]);
+
+  const titleReadOnlyTooltip = !canReadDocs
+    ? `Governance role (${effectiveRole}): document content access is disabled.`
+    : effectiveRole === "reviewer"
+      ? "Read-only role (Reviewer): title editing and saving are disabled."
+      : effectiveRole === "viewer"
+        ? "Read-only role (Viewer): title editing and saving are disabled."
+        : "Read-only role active: title editing and saving are disabled.";
 
   return (
     <div className="app-shell">
@@ -1138,17 +1429,27 @@ export function App() {
           {PLANNED_FUTURE_STUDIOS.map((studio) => {
             const tabId = studio.studioId as ActiveStudioId;
             const isActive = activeStudio === tabId;
+            const descId = `studio-planned-desc-${studio.studioId}`;
             return (
-              <button
-                key={studio.studioId}
-                type="button"
-                className={`studio-tab ${isActive ? "active" : ""}`}
-                aria-current={isActive ? "page" : undefined}
-                title="Local Stage 1–3 engine verified; full production UI gated for S2/S3"
-                onClick={() => setActiveStudio(tabId)}
-              >
-                {studioLabelMap[studio.studioId] ?? studio.studioId}
-              </button>
+              <div key={studio.studioId} className="studio-tab-wrap">
+                <button
+                  type="button"
+                  className={`studio-tab studio-tab-gated ${isActive ? "active" : ""}`}
+                  aria-current={isActive ? "page" : undefined}
+                  aria-describedby={descId}
+                  aria-description="Planned — Local Stage 1–3 engine verified; interactive studio UI planned for S2/S3"
+                  title="Local Stage 1–3 engine verified; interactive studio UI planned for S2/S3"
+                  onClick={() => setActiveStudio(tabId)}
+                >
+                  <span>{studioLabelMap[studio.studioId] ?? studio.studioId}</span>
+                  <span className="studio-tab-tag" aria-hidden="true">
+                    Planned
+                  </span>
+                </button>
+                <span id={descId} className="visually-hidden">
+                  Planned — Local Stage 1–3 engine verified; interactive studio UI planned for S2/S3
+                </span>
+              </div>
             );
           })}
         </nav>
@@ -1156,11 +1457,21 @@ export function App() {
         <div className="topbar-controls">
           <button
             type="button"
-            className="badge topbar-role-pill"
+            className="btn mobile-nav-toggle"
+            aria-expanded={mobileNavOpen}
+            aria-controls="workspace-left-rail"
+            onClick={() => setMobileNavOpen((v) => !v)}
+          >
+            {mobileNavOpen ? "Close Menu" : "Sections"}
+          </button>
+          <button
+            type="button"
+            className={`badge topbar-role-pill ${readOnly ? "is-readonly" : ""}`}
             title="Open Role & RBAC controls in Governance"
             onClick={() => {
               setOpenFixedHeader("admin");
               toggleSubPanel("admin_rbac");
+              setMobileNavOpen(false);
             }}
           >
             Role: {effectiveRole}
@@ -1291,6 +1602,7 @@ export function App() {
             groups={navGroups}
             openHeaderId={openFixedHeader}
             onToggleHeader={setOpenFixedHeader}
+            mobileOpen={mobileNavOpen}
           />
 
           {/* Optional Left Document Explorer (toggled via Files & Docs -> All Documents) */}
@@ -1425,9 +1737,11 @@ export function App() {
                     <div className="doc-meta-bar" aria-label="Document Settings">
                       <input
                         type="text"
+                        maxLength={200}
                         className="input-field"
                         disabled={readOnly}
                         aria-label="Document title"
+                        title={readOnly ? titleReadOnlyTooltip : "Edit document title"}
                         value={effectiveActiveDoc.title}
                         onChange={(e) => setDraftTitle(e.target.value)}
                       />
@@ -1435,11 +1749,25 @@ export function App() {
                         Rev {effectiveActiveDoc.revision} · {effectiveActiveDoc.language} ·{" "}
                         {effectiveActiveDoc.layout.size} {effectiveActiveDoc.layout.orientation}
                       </span>
+                      {readOnly && <span className="badge badge-readonly">Read-Only ({effectiveRole})</span>}
+                      {isExporting && (
+                        <span className="badge badge-warn" role="status">
+                          {isExporting === "docx" ? "Exporting DOCX..." : "Rendering PDF..."}
+                        </span>
+                      )}
                       <button
                         type="button"
                         className="btn primary btn-compact"
                         disabled={readOnly || !hasUnsavedChanges || isSaving}
-                        title="Save current changes (Ctrl+S / Cmd+S)"
+                        title={
+                          readOnly
+                            ? titleReadOnlyTooltip
+                            : !hasUnsavedChanges
+                              ? "No unsaved changes to save."
+                              : isSaving
+                                ? "Saving changes..."
+                                : "Save current changes (Ctrl+S / Cmd+S)"
+                        }
                         onClick={() => void handleSave()}
                       >
                         {isSaving ? "Saving..." : `Save${hasUnsavedChanges ? " *" : ""}`}
@@ -1451,8 +1779,9 @@ export function App() {
                         document={effectiveActiveDoc}
                         tiptapContent={tiptapContent}
                         readOnly={readOnly}
+                        effectiveRole={effectiveRole}
                         onDirtyChange={setEditorDirty}
-                        onSelectionChange={setSelection}
+                        onSelectionChange={handleSelectionChange}
                       />
                     </ErrorBoundary>
                   </>
@@ -1553,37 +1882,16 @@ export function App() {
       )}
 
       {historyOpen && (
-        <Suspense
-          fallback={
-            <div
-              className="drawer-backdrop"
-              role="dialog"
-              aria-modal="true"
-              aria-label="Loading history drawer"
-              onClick={(e) => {
-                if (e.target === e.currentTarget) handleCloseHistory();
-              }}
-            >
-              <div className="drawer-panel">
-                <div className="panel-header-row">
-                  <strong className="modal-title">Version &amp; Audit History</strong>
-                  <button type="button" className="btn" onClick={handleCloseHistory}>
-                    Close
-                  </button>
-                </div>
-                <div className="preview-card" role="status">
-                  Loading version &amp; audit drawer...
-                </div>
-              </div>
-            </div>
-          }
-        >
+        <Suspense fallback={<DrawerLoadingFallback onClose={handleCloseHistory} />}>
           <LazyVersionAuditDrawer
             versions={versions}
             auditEvents={auditEvents}
             currentRevision={activeDoc?.revision}
             initialSection={historySection}
             readOnly={readOnly}
+            canReadAudit={canReadAudit}
+            hasUnsavedChanges={hasUnsavedChanges}
+            effectiveRole={effectiveRole}
             isLoading={isLoadingHistory}
             restoringRevision={restoringRevision}
             onRestore={handleRestore}

@@ -15,3 +15,5 @@ __pycache__/
 *.pyc
 tests/artifacts/*
 !tests/artifacts/.gitkeep
+.impeccable/config.local.json
+.impeccable/hook.cache.json

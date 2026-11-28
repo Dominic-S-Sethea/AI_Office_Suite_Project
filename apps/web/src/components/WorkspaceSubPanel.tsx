@@ -1,4 +1,4 @@
-import { memo, useState } from "react";
+import { memo, useEffect, useRef, useState } from "react";
 import type { ActorContext, PageLayoutConfig, StudioDocument, WorkspaceRole } from "@ai-office-suite/shared-contracts";
 import { formatApiErrorMessage, safeReadJson } from "../lib/apiClient.ts";
 
@@ -59,6 +59,26 @@ const PANEL_TITLES: Record<Exclude<WorkspaceUtilityPanelId, null>, string> = {
   admin_health: "Admin & Governance · Session & Operational Health",
 };
 
+const PANEL_PROVENANCE: Record<
+  Exclude<WorkspaceUtilityPanelId, null>,
+  { label: string; tone: "ok" | "neutral" }
+> = {
+  page_size: { label: "Live Controls", tone: "ok" },
+  page_fonts: { label: "Live Controls", tone: "ok" },
+  linked_metrics: { label: "Reference Benchmark", tone: "neutral" },
+  data_prep: { label: "Live API", tone: "ok" },
+  certified_metrics: { label: "Reference Benchmark", tone: "neutral" },
+  duckdb_spill: { label: "Reference Benchmark", tone: "neutral" },
+  workflow_links: { label: "Reference Benchmark", tone: "neutral" },
+  workflow_packages: { label: "Reference Benchmark", tone: "neutral" },
+  workflow_outbox: { label: "Reference Benchmark", tone: "neutral" },
+  backup_restore: { label: "Reference Benchmark", tone: "neutral" },
+  admin_rbac: { label: "Live Controls", tone: "ok" },
+  admin_policies: { label: "Reference Benchmark", tone: "neutral" },
+  admin_quotas: { label: "Reference Benchmark", tone: "neutral" },
+  admin_health: { label: "Live API", tone: "ok" },
+};
+
 function WorkspaceSubPanelInner({
   panelId,
   onClose,
@@ -81,9 +101,30 @@ function WorkspaceSubPanelInner({
   const [healthText, setHealthText] = useState<string | null>(null);
   const [isCheckingHealth, setIsCheckingHealth] = useState(false);
 
+  const profileAbortRef = useRef<AbortController | null>(null);
+  const profileSeqRef = useRef(0);
+  const healthAbortRef = useRef<AbortController | null>(null);
+  const healthSeqRef = useRef(0);
+
+  useEffect(() => {
+    return () => {
+      profileAbortRef.current?.abort();
+      healthAbortRef.current?.abort();
+      profileSeqRef.current += 1;
+      healthSeqRef.current += 1;
+      setIsProfiling(false);
+      setIsCheckingHealth(false);
+    };
+  }, [panelId]);
+
   if (!panelId) return null;
 
   async function runStageAndProfile() {
+    profileAbortRef.current?.abort();
+    const controller = new AbortController();
+    profileAbortRef.current = controller;
+    const seq = ++profileSeqRef.current;
+
     setIsProfiling(true);
     setProfileError(null);
     setProfileResult(null);
@@ -92,42 +133,69 @@ function WorkspaceSubPanelInner({
         method: "POST",
         credentials: "include",
         headers: { "Content-Type": "application/json", ...apiHeaders },
+        signal: controller.signal,
         body: JSON.stringify({
           filename: "november-2026.csv",
           csvText,
           profileScope: "full",
         }),
       });
+      if (seq !== profileSeqRef.current) return;
       const data = await safeReadJson(res);
+      if (seq !== profileSeqRef.current) return;
       if (!res.ok) {
         setProfileError(formatApiErrorMessage(res, data, "Data preparation profiling failed"));
         return;
       }
       setProfileResult(JSON.stringify(data.profile ?? data, null, 2));
-    } catch {
-      setProfileError("Unable to contact /api/data-prep/stage-and-profile.");
+    } catch (err) {
+      if (err instanceof DOMException && err.name === "AbortError") return;
+      if (seq === profileSeqRef.current) {
+        setProfileError("Unable to contact /api/data-prep/stage-and-profile.");
+      }
     } finally {
-      setIsProfiling(false);
+      if (seq === profileSeqRef.current) {
+        setIsProfiling(false);
+      }
     }
   }
 
   async function checkHealthSnapshot() {
+    healthAbortRef.current?.abort();
+    const controller = new AbortController();
+    healthAbortRef.current = controller;
+    const seq = ++healthSeqRef.current;
+
     setIsCheckingHealth(true);
     try {
-      const res = await fetch("/api/health", { credentials: "include" });
+      const res = await fetch("/api/health", { credentials: "include", signal: controller.signal });
+      if (seq !== healthSeqRef.current) return;
       const data = await safeReadJson(res);
+      if (seq !== healthSeqRef.current) return;
       setHealthText(JSON.stringify(data, null, 2));
-    } catch {
-      setHealthText("Unable to fetch /api/health.");
+    } catch (err) {
+      if (err instanceof DOMException && err.name === "AbortError") return;
+      if (seq === healthSeqRef.current) {
+        setHealthText("Unable to fetch /api/health.");
+      }
     } finally {
-      setIsCheckingHealth(false);
+      if (seq === healthSeqRef.current) {
+        setIsCheckingHealth(false);
+      }
     }
   }
 
   return (
     <section className="workspace-subpanel" aria-label="Contextual Workspace Panel">
       <div className="panel-header-row">
-        <strong className="subpanel-title">{PANEL_TITLES[panelId]}</strong>
+        <div className="row-actions wrap">
+          <strong className="subpanel-title">{PANEL_TITLES[panelId]}</strong>
+          <span
+            className={`badge ${PANEL_PROVENANCE[panelId].tone === "ok" ? "badge-ok" : "badge-neutral"}`}
+          >
+            {PANEL_PROVENANCE[panelId].label}
+          </span>
+        </div>
         <button type="button" className="btn btn-compact" onClick={onClose}>
           Close Panel
         </button>
@@ -139,9 +207,10 @@ function WorkspaceSubPanelInner({
             <label className="field-label">
               Page Size
               <select
-                className="btn"
+                className="select-control"
                 disabled={readOnly}
                 aria-label="Subpanel page size"
+                title={readOnly ? "Read-only role cannot modify page setup." : undefined}
                 value={activeDoc.layout.size}
                 onChange={(e) =>
                   onLayoutChange({ ...activeDoc.layout, size: e.target.value as "A4" | "Letter" })
@@ -154,9 +223,10 @@ function WorkspaceSubPanelInner({
             <label className="field-label">
               Orientation
               <select
-                className="btn"
+                className="select-control"
                 disabled={readOnly}
                 aria-label="Subpanel orientation"
+                title={readOnly ? "Read-only role cannot modify page orientation." : undefined}
                 value={activeDoc.layout.orientation}
                 onChange={(e) =>
                   onLayoutChange({
@@ -185,9 +255,10 @@ function WorkspaceSubPanelInner({
             <label className="field-label">
               Document Language
               <select
-                className="btn"
+                className="select-control"
                 disabled={readOnly}
                 aria-label="Subpanel document language"
+                title={readOnly ? "Read-only role cannot modify document language." : undefined}
                 value={activeDoc.language}
                 onChange={(e) => onLanguageChange(e.target.value as StudioDocument["language"])}
               >
@@ -200,8 +271,10 @@ function WorkspaceSubPanelInner({
               Header Text
               <input
                 type="text"
+                maxLength={300}
                 className="input-field input-compact"
                 disabled={readOnly}
+                title={readOnly ? "Read-only role cannot edit header text." : undefined}
                 value={activeDoc.layout.headerText}
                 onChange={(e) => onLayoutChange({ ...activeDoc.layout, headerText: e.target.value })}
               />
@@ -210,8 +283,10 @@ function WorkspaceSubPanelInner({
               Footer Text
               <input
                 type="text"
+                maxLength={300}
                 className="input-field input-compact"
                 disabled={readOnly}
+                title={readOnly ? "Read-only role cannot edit footer text." : undefined}
                 value={activeDoc.layout.footerText}
                 onChange={(e) => onLayoutChange({ ...activeDoc.layout, footerText: e.target.value })}
               />
@@ -264,6 +339,11 @@ function WorkspaceSubPanelInner({
               type="button"
               className="btn primary"
               disabled={readOnly || isProfiling}
+              title={
+                readOnly
+                  ? "Read-only role cannot run staging mutations."
+                  : "Stage and profile CSV via live backend API"
+              }
               onClick={() => void runStageAndProfile()}
             >
               {isProfiling ? "Profiling..." : "Run Stage & Profile"}
@@ -406,7 +486,7 @@ function WorkspaceSubPanelInner({
               <label className="role-selector-label">
                 Prototype Role:&nbsp;
                 <select
-                  className="btn"
+                  className="select-control"
                   aria-label="Workspace role selector"
                   value={prototypeRole}
                   onChange={(e) => onRoleChange(e.target.value as WorkspaceRole)}

@@ -52,11 +52,19 @@ function AiVoicePanelInner({
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
+  const requestAbortRef = useRef<AbortController | null>(null);
+  const requestSeqRef = useRef(0);
 
   const busy = isTranscribing || isPlanning || isApplying;
 
-  // Clear stale proposals whenever document or revision changes so user cannot apply outdated diffs
+  // Clear stale proposals and cancel in-flight AI/voice requests when document or revision changes (F-17)
   useEffect(() => {
+    requestAbortRef.current?.abort();
+    requestAbortRef.current = null;
+    requestSeqRef.current += 1;
+    setIsTranscribing(false);
+    setIsPlanning(false);
+    setIsApplying(false);
     setProposal(null);
     setErrorMsg(null);
   }, [documentId, revision]);
@@ -75,9 +83,11 @@ function AiVoicePanelInner({
     return () => window.removeEventListener("keydown", onGlobalKeyDown);
   }, [variant]);
 
-  // Always stop active microphone stream on unmount
+  // Always stop active microphone stream and abort pending fetches on unmount
   useEffect(() => {
     return () => {
+      requestAbortRef.current?.abort();
+      requestSeqRef.current += 1;
       if (streamRef.current) {
         streamRef.current.getTracks().forEach((t) => t.stop());
         streamRef.current = null;
@@ -117,6 +127,11 @@ function AiVoicePanelInner({
 
   async function simulateVoiceFixture(fixtureId: string) {
     if (busy) return;
+    requestAbortRef.current?.abort();
+    const controller = new AbortController();
+    requestAbortRef.current = controller;
+    const seq = ++requestSeqRef.current;
+
     setErrorMsg(null);
     setIsTranscribing(true);
     const lang = fixtureId.startsWith("km-") ? "km-KH" : "en-US";
@@ -125,6 +140,7 @@ function AiVoicePanelInner({
         method: "POST",
         credentials: "include",
         headers: { "Content-Type": "application/json", ...apiHeaders },
+        signal: controller.signal,
         body: JSON.stringify({
           provider: "mock",
           language: lang,
@@ -132,7 +148,9 @@ function AiVoicePanelInner({
           fixtureId,
         }),
       });
+      if (seq !== requestSeqRef.current) return;
       const data = await safeReadJson(res);
+      if (seq !== requestSeqRef.current) return;
       if (res.status === 401) {
         onUnauthorized?.();
         setErrorMsg("Session expired. Please sign in again.");
@@ -148,15 +166,25 @@ function AiVoicePanelInner({
       setSource("voice_command");
       setVoiceEdited(false);
       setCommand(rec.transcript);
-    } catch {
-      setErrorMsg("Network error contacting speech transcription API.");
+    } catch (err) {
+      if (err instanceof DOMException && err.name === "AbortError") return;
+      if (seq === requestSeqRef.current) {
+        setErrorMsg("Network error contacting speech transcription API.");
+      }
     } finally {
-      setIsTranscribing(false);
+      if (seq === requestSeqRef.current) {
+        setIsTranscribing(false);
+      }
     }
   }
 
   async function handlePlan() {
     if (readOnly || busy || !command.trim()) return;
+    requestAbortRef.current?.abort();
+    const controller = new AbortController();
+    requestAbortRef.current = controller;
+    const seq = ++requestSeqRef.current;
+
     setErrorMsg(null);
     setProposal(null);
     setIsPlanning(true);
@@ -190,6 +218,7 @@ function AiVoicePanelInner({
         method: "POST",
         credentials: "include",
         headers: { "Content-Type": "application/json", ...apiHeaders },
+        signal: controller.signal,
         body: JSON.stringify({
           command: effectiveCommand,
           expectedRevision: revision,
@@ -199,7 +228,9 @@ function AiVoicePanelInner({
           selection: selectionPayload,
         }),
       });
+      if (seq !== requestSeqRef.current) return;
       const data = await safeReadJson(res);
+      if (seq !== requestSeqRef.current) return;
       if (res.status === 401) {
         onUnauthorized?.();
         setErrorMsg("Session expired. Please sign in again.");
@@ -216,15 +247,25 @@ function AiVoicePanelInner({
         return;
       }
       setProposal(data.proposal as DocumentOperationProposal);
-    } catch {
-      setErrorMsg("Network error planning AI operation.");
+    } catch (err) {
+      if (err instanceof DOMException && err.name === "AbortError") return;
+      if (seq === requestSeqRef.current) {
+        setErrorMsg("Network error planning AI operation.");
+      }
     } finally {
-      setIsPlanning(false);
+      if (seq === requestSeqRef.current) {
+        setIsPlanning(false);
+      }
     }
   }
 
   async function handleApply() {
     if (!proposal || readOnly || busy) return;
+    requestAbortRef.current?.abort();
+    const controller = new AbortController();
+    requestAbortRef.current = controller;
+    const seq = ++requestSeqRef.current;
+
     setErrorMsg(null);
     setIsApplying(true);
     try {
@@ -232,9 +273,12 @@ function AiVoicePanelInner({
         method: "POST",
         credentials: "include",
         headers: { "Content-Type": "application/json", ...apiHeaders },
+        signal: controller.signal,
         body: JSON.stringify({ proposal, approved: true }),
       });
+      if (seq !== requestSeqRef.current) return;
       const data = await safeReadJson(res);
+      if (seq !== requestSeqRef.current) return;
       if (res.status === 401) {
         onUnauthorized?.();
         setErrorMsg("Session expired. Please sign in again.");
@@ -253,15 +297,25 @@ function AiVoicePanelInner({
       }
       setProposal(null);
       await onDocumentUpdated();
-    } catch {
-      setErrorMsg("Network error applying AI operation.");
+    } catch (err) {
+      if (err instanceof DOMException && err.name === "AbortError") return;
+      if (seq === requestSeqRef.current) {
+        setErrorMsg("Network error applying AI operation.");
+      }
     } finally {
-      setIsApplying(false);
+      if (seq === requestSeqRef.current) {
+        setIsApplying(false);
+      }
     }
   }
 
   async function handleUndoLast() {
     if (readOnly || busy || revision <= 1) return;
+    requestAbortRef.current?.abort();
+    const controller = new AbortController();
+    requestAbortRef.current = controller;
+    const seq = ++requestSeqRef.current;
+
     setErrorMsg(null);
     setIsPlanning(true);
     try {
@@ -269,6 +323,7 @@ function AiVoicePanelInner({
         method: "POST",
         credentials: "include",
         headers: { "Content-Type": "application/json", ...apiHeaders },
+        signal: controller.signal,
         body: JSON.stringify({
           command: inputLanguage === "km" ? "មិនធ្វើវិញ" : "undo",
           expectedRevision: revision,
@@ -277,7 +332,9 @@ function AiVoicePanelInner({
           source: "typed_ai",
         }),
       });
+      if (seq !== requestSeqRef.current) return;
       const planData = await safeReadJson(planRes);
+      if (seq !== requestSeqRef.current) return;
       if (planRes.status === 401) {
         onUnauthorized?.();
         setErrorMsg("Session expired. Please sign in again.");
@@ -294,14 +351,20 @@ function AiVoicePanelInner({
         return;
       }
       setProposal(planData.proposal as DocumentOperationProposal);
-    } catch {
-      setErrorMsg("Network error planning undo operation.");
+    } catch (err) {
+      if (err instanceof DOMException && err.name === "AbortError") return;
+      if (seq === requestSeqRef.current) {
+        setErrorMsg("Network error planning undo operation.");
+      }
     } finally {
-      setIsPlanning(false);
+      if (seq === requestSeqRef.current) {
+        setIsPlanning(false);
+      }
     }
   }
 
   const isDock = variant === "dock";
+  const readOnlyTooltip = "Read-only role active: AI & voice document mutations are disabled.";
 
   return (
     <section
@@ -352,7 +415,13 @@ function AiVoicePanelInner({
             <div className="diff-after">After: {proposal.previewDiff.afterText}</div>
           </div>
           <div className="row-actions">
-            <button type="button" className="btn primary" disabled={busy || readOnly} onClick={() => void handleApply()}>
+            <button
+              type="button"
+              className="btn primary"
+              disabled={busy || readOnly}
+              title={readOnly ? readOnlyTooltip : "Approve and apply the planned edit to the document"}
+              onClick={() => void handleApply()}
+            >
               {isApplying ? "Applying..." : "Approve & Apply"}
             </button>
             <button type="button" className="btn" disabled={busy} onClick={() => setProposal(null)}>
@@ -369,7 +438,7 @@ function AiVoicePanelInner({
       )}
 
       {readOnly && (
-        <div className="notice-readonly" role="status">
+        <div id="ai-dock-readonly-notice" className="notice-readonly" role="status">
           Read-only role active: AI &amp; voice document mutations are disabled server-side and client-side.
         </div>
       )}
@@ -386,7 +455,7 @@ function AiVoicePanelInner({
             <label className="field-label">
               Input Language
               <select
-                className="btn full-width-control"
+                className="select-control full-width-control"
                 value={inputLanguage}
                 onChange={(e) => setInputLanguage(e.target.value as "en" | "km")}
               >
@@ -397,7 +466,7 @@ function AiVoicePanelInner({
             <label className="field-label">
               Output Language
               <select
-                className="btn full-width-control"
+                className="select-control full-width-control"
                 value={outputLanguage}
                 onChange={(e) => setOutputLanguage(e.target.value as "match" | "en" | "km")}
               >
@@ -409,7 +478,7 @@ function AiVoicePanelInner({
             <label className="field-label">
               Interaction Mode
               <select
-                className="btn full-width-control"
+                className="select-control full-width-control"
                 value={mode}
                 onChange={(e) => setMode(e.target.value as "command" | "dictation" | "contextual")}
               >
@@ -440,8 +509,11 @@ function AiVoicePanelInner({
           <textarea
             ref={textareaRef}
             rows={expanded ? 3 : 2}
-            className="btn command-textarea"
+            maxLength={2000}
+            className="input-field command-textarea"
             disabled={readOnly || busy}
+            aria-describedby={readOnly ? "ai-dock-readonly-notice" : undefined}
+            title={readOnly ? readOnlyTooltip : undefined}
             placeholder="e.g. make bold | insert 3x3 table | ធ្វើឱ្យដិត | បញ្ចូលតារាង ៣x៣ | Ctrl+Enter to plan"
             value={command}
             onKeyDown={(e) => {
@@ -471,7 +543,12 @@ function AiVoicePanelInner({
                 type="button"
                 className="btn"
                 disabled={readOnly || busy}
-                title="Tests browser microphone permission and runs MockSpeechAdapter (isMock: true) on stop"
+                aria-describedby={readOnly ? "ai-dock-readonly-notice" : undefined}
+                title={
+                  readOnly
+                    ? readOnlyTooltip
+                    : "Tests browser microphone permission and runs MockSpeechAdapter (isMock: true) on stop"
+                }
                 onClick={() => void startPushToTalk()}
               >
                 Mic Test (Mock STT)
@@ -485,6 +562,8 @@ function AiVoicePanelInner({
               type="button"
               className="btn"
               disabled={readOnly || busy}
+              aria-describedby={readOnly ? "ai-dock-readonly-notice" : undefined}
+              title={readOnly ? readOnlyTooltip : "Simulate English voice command using MockSpeechAdapter"}
               onClick={() => void simulateVoiceFixture("en-translate-khmer")}
             >
               {isTranscribing ? "Transcribing..." : "Mock EN Voice"}
@@ -493,6 +572,8 @@ function AiVoicePanelInner({
               type="button"
               className="btn"
               disabled={readOnly || busy}
+              aria-describedby={readOnly ? "ai-dock-readonly-notice" : undefined}
+              title={readOnly ? readOnlyTooltip : "Simulate Khmer voice command using MockSpeechAdapter"}
               onClick={() => void simulateVoiceFixture("km-insert-table")}
             >
               {isTranscribing ? "Transcribing..." : "Mock KM Voice"}
@@ -503,6 +584,14 @@ function AiVoicePanelInner({
               type="button"
               className="btn primary"
               disabled={readOnly || busy || !command.trim()}
+              aria-describedby={readOnly ? "ai-dock-readonly-notice" : undefined}
+              title={
+                readOnly
+                  ? readOnlyTooltip
+                  : !command.trim()
+                    ? "Enter or transcribe an instruction first (Ctrl+Enter to plan)."
+                    : "Preview deterministic AI plan before applying (Ctrl+Enter)"
+              }
               onClick={() => void handlePlan()}
             >
               {isPlanning ? "Planning..." : "Plan Operation"}
@@ -511,6 +600,14 @@ function AiVoicePanelInner({
               type="button"
               className="btn"
               disabled={readOnly || busy || revision <= 1}
+              aria-describedby={readOnly ? "ai-dock-readonly-notice" : undefined}
+              title={
+                readOnly
+                  ? readOnlyTooltip
+                  : revision <= 1
+                    ? "No earlier revision to undo on revision 1."
+                    : "Plan a non-destructive undo of the last change"
+              }
               onClick={() => void handleUndoLast()}
             >
               Undo Last Change

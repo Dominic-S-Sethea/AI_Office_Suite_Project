@@ -798,5 +798,224 @@ describe("Wave 1 Frontend & Tiptap Codec Verification (C8 & C9)", () => {
     expect(screen.getByRole("button", { name: "Compact Dock" })).toBeTruthy();
     expect(screen.getByText(/Explicit Mock Disclosure \(isMock: true\)/)).toBeTruthy();
   });
+
+  it("Impeccable UI Remediation: enforces 2-step restore guardrail, RBAC read-only explainability, bilingual lang, ARIA tabpanel, and LeftNavRail arrow keys", async () => {
+    const onClose = vi.fn();
+    const onRestore = vi.fn(async () => {});
+
+    // 1. VersionAuditDrawer 2-step restore confirmation (clean + dirty) & WAI-ARIA tabpanel/ArrowRight
+    render(
+      <VersionAuditDrawer
+        versions={[
+          {
+            versionId: "v1",
+            documentId: sampleBilingualDoc.documentId,
+            revision: 1,
+            snapshot: sampleBilingualDoc,
+            summary: "Initial",
+            source: "manual",
+            actorId: "u1",
+            createdAt: "2026-11-25T00:00:00.000Z",
+          },
+          {
+            versionId: "v2",
+            documentId: sampleBilingualDoc.documentId,
+            revision: 2,
+            snapshot: sampleBilingualDoc,
+            summary: "Second",
+            source: "manual",
+            actorId: "u1",
+            createdAt: "2026-11-25T01:00:00.000Z",
+          },
+        ]}
+        auditEvents={[]}
+        currentRevision={2}
+        readOnly={false}
+        hasUnsavedChanges={true}
+        effectiveRole="editor"
+        onRestore={onRestore}
+        onClose={onClose}
+      />,
+    );
+
+    const allTab = screen.getByRole("tab", { name: "All" });
+    expect(allTab.getAttribute("aria-controls")).toBe("history-tabpanel");
+    expect(screen.getByRole("tabpanel")).toBeTruthy();
+    fireEvent.keyDown(screen.getByRole("tablist"), { key: "ArrowRight" });
+    expect(screen.getByRole("tab", { name: "Versions" }).getAttribute("aria-selected")).toBe("true");
+
+    // Clicking Restore opens inline confirmation instead of mutating immediately
+    fireEvent.click(screen.getByRole("button", { name: "Restore" }));
+    expect(onRestore).not.toHaveBeenCalled();
+    expect(screen.getByText(/Unsaved edits on the current document will be discarded/)).toBeTruthy();
+
+    // First Escape dismisses only the restore confirmation, keeping the drawer open
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(onClose).not.toHaveBeenCalled();
+    expect(screen.queryByRole("button", { name: "Confirm Restore" })).toBeNull();
+
+    // Confirm Restore executes onRestore once
+    fireEvent.click(screen.getByRole("button", { name: "Restore" }));
+    fireEvent.click(screen.getByRole("button", { name: "Confirm Restore" }));
+    await waitFor(() => {
+      expect(onRestore).toHaveBeenCalledWith(1);
+    });
+    cleanup();
+
+    // 2. VersionAuditDrawer read-only Viewer banner & aria-describedby
+    render(
+      <VersionAuditDrawer
+        versions={[
+          {
+            versionId: "v1",
+            documentId: sampleBilingualDoc.documentId,
+            revision: 1,
+            snapshot: sampleBilingualDoc,
+            summary: "Initial",
+            source: "manual",
+            actorId: "u1",
+            createdAt: "2026-11-25T00:00:00.000Z",
+          },
+          {
+            versionId: "v2",
+            documentId: sampleBilingualDoc.documentId,
+            revision: 2,
+            snapshot: sampleBilingualDoc,
+            summary: "Current",
+            source: "manual",
+            actorId: "u1",
+            createdAt: "2026-11-25T01:00:00.000Z",
+          },
+        ]}
+        auditEvents={[]}
+        currentRevision={2}
+        readOnly={true}
+        canReadAudit={false}
+        effectiveRole="viewer"
+        onRestore={onRestore}
+        onClose={onClose}
+      />,
+    );
+    expect(
+      screen.getByText(/Read-only role \(Viewer\): Restoring revisions, exporting, and reading the audit log \(audit:read\) are disabled/),
+    ).toBeTruthy();
+    expect(screen.getByText(/Audit log inspection requires Reviewer, Editor, Auditor, or Owner permission/)).toBeTruthy();
+    const disabledRestore = screen.getByRole("button", { name: "Restore" }) as HTMLButtonElement;
+    expect(disabledRestore.disabled).toBe(true);
+    expect(disabledRestore.getAttribute("aria-describedby")).toBe("drawer-readonly-notice");
+    cleanup();
+
+    // 3. DocumentEditor read-only Reviewer banner + bilingual lang scoping (en with data-doc-language="bilingual")
+    const { container } = render(
+      <DocumentEditor
+        document={sampleBilingualDoc}
+        tiptapContent={toTiptapJson(sampleBilingualDoc) as unknown as Record<string, unknown>}
+        readOnly={true}
+        effectiveRole="reviewer"
+        onSelectionChange={() => {}}
+      />,
+    );
+    await waitFor(() => {
+      expect(screen.getByText(/Read-Only Mode \(reviewer\):/)).toBeTruthy();
+    });
+    const boldBtn = screen.getByRole("button", { name: "Bold" }) as HTMLButtonElement;
+    expect(boldBtn.disabled).toBe(true);
+    expect(boldBtn.getAttribute("aria-describedby")).toBe("editor-readonly-notice");
+    expect(boldBtn.getAttribute("title")).toContain("Reviewer");
+    const sheet = container.querySelector(".page-sheet");
+    expect(sheet?.getAttribute("lang")).toBe("en");
+    expect(sheet?.getAttribute("data-doc-language")).toBe("bilingual");
+    cleanup();
+
+    // 4. App LeftNavRail ArrowDown/ArrowRight/ArrowLeft + Viewer Save tooltip & Read-Only badge + Viewer Version History
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.includes("/api/health")) {
+          return new Response(JSON.stringify({ status: "ok", authMode: "provisional-local" }), { status: 200 });
+        }
+        if (url.includes("/api/documents") && url.includes("/versions")) {
+          return new Response(
+            JSON.stringify({
+              versions: [
+                {
+                  versionId: "v1",
+                  documentId: sampleBilingualDoc.documentId,
+                  revision: 1,
+                  snapshot: sampleBilingualDoc,
+                  summary: "Initial revision",
+                  source: "manual",
+                  actorId: "u1",
+                  createdAt: "2026-11-25T00:00:00.000Z",
+                },
+              ],
+            }),
+            { status: 200 },
+          );
+        }
+        if (url.includes("/api/documents") && url.includes("/audit")) {
+          return new Response(JSON.stringify({ error: "Role viewer is not authorized for audit:read." }), {
+            status: 403,
+          });
+        }
+        if (url.includes("/api/documents")) {
+          return new Response(JSON.stringify({ documents: [sampleBilingualDoc], total: 1 }), { status: 200 });
+        }
+        return new Response(JSON.stringify({}), { status: 200 });
+      }),
+    );
+
+    render(<App />);
+    await waitFor(() => {
+      expect(screen.getByRole("menuitem", { name: /Files & Docs/ })).toBeTruthy();
+      expect(screen.getByLabelText("Document title")).toBeTruthy();
+    });
+
+    const filesHeader = screen.getByRole("menuitem", { name: /Files & Docs/ });
+    const layoutHeader = screen.getByRole("menuitem", { name: /Page & Style/ });
+    filesHeader.focus();
+    fireEvent.keyDown(filesHeader, { key: "ArrowDown" });
+    expect(document.activeElement).toBe(layoutHeader);
+
+    fireEvent.keyDown(layoutHeader, { key: "ArrowRight" });
+    expect(layoutHeader.getAttribute("aria-expanded")).toBe("true");
+    await waitFor(() => {
+      const pageSizeItem = screen.getByRole("menuitem", { name: /Page Size/ });
+      expect(document.activeElement).toBe(pageSizeItem);
+    });
+    const pageSizeItem = screen.getByRole("menuitem", { name: /Page Size/ });
+    fireEvent.keyDown(pageSizeItem, { key: "ArrowLeft" });
+    expect(layoutHeader.getAttribute("aria-expanded")).toBe("false");
+    expect(document.activeElement).toBe(layoutHeader);
+
+    // Switch role to Viewer and verify Save tooltip does not advertise Ctrl+S while disabled
+    fireEvent.click(screen.getByRole("button", { name: /Role: editor/ }));
+    await waitFor(() => {
+      expect(screen.getByRole("combobox", { name: "Workspace role selector" })).toBeTruthy();
+    });
+    fireEvent.change(screen.getByRole("combobox", { name: "Workspace role selector" }), {
+      target: { value: "viewer" },
+    });
+    await waitFor(() => {
+      expect(screen.getByText("Read-Only (viewer)")).toBeTruthy();
+    });
+    const saveBtn = screen.getByRole("button", { name: /^Save/ }) as HTMLButtonElement;
+    expect(saveBtn.disabled).toBe(true);
+    expect(saveBtn.getAttribute("title")).toContain("Viewer");
+    expect(saveBtn.getAttribute("title")).not.toContain("Ctrl+S");
+
+    // Viewer can open Version History without 403 failure, while Audit Trail explains audit:read restriction
+    fireEvent.click(screen.getByRole("menuitem", { name: /Versions & Audit/ }));
+    const auditBtn = screen.getByRole("menuitem", { name: /Audit Trail/ }) as HTMLButtonElement;
+    expect(auditBtn.disabled).toBe(true);
+    expect(auditBtn.getAttribute("title")).toContain("audit:read");
+
+    fireEvent.click(screen.getByRole("menuitem", { name: /Version History/ }));
+    await waitFor(() => {
+      expect(screen.getByRole("dialog", { name: "Version & Audit History" })).toBeTruthy();
+      expect(screen.getByText(/Initial revision/)).toBeTruthy();
+    });
+  });
 });
 

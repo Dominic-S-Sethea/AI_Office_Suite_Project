@@ -1,4 +1,4 @@
-import { memo, useEffect, type CSSProperties } from "react";
+import { memo, useEffect, useRef, type CSSProperties, type KeyboardEvent as ReactKeyboardEvent } from "react";
 
 export type FixedHeaderId =
   | "files"
@@ -29,6 +29,7 @@ interface LeftNavRailProps {
   groups: NavFixedHeaderGroup[];
   openHeaderId: FixedHeaderId | null;
   onToggleHeader: (id: FixedHeaderId | null) => void;
+  mobileOpen?: boolean;
 }
 
 function SectionIcon({ id }: { id: FixedHeaderId }) {
@@ -85,7 +86,15 @@ function SectionIcon({ id }: { id: FixedHeaderId }) {
   }
 }
 
-function LeftNavRailInner({ groups, openHeaderId, onToggleHeader }: LeftNavRailProps) {
+function LeftNavRailInner({
+  groups,
+  openHeaderId,
+  onToggleHeader,
+  mobileOpen = false,
+}: LeftNavRailProps) {
+  const railRef = useRef<HTMLElement | null>(null);
+  const headerBtnRefs = useRef<Partial<Record<FixedHeaderId, HTMLButtonElement | null>>>({});
+
   useEffect(() => {
     if (!openHeaderId) return;
 
@@ -96,7 +105,13 @@ function LeftNavRailInner({ groups, openHeaderId, onToggleHeader }: LeftNavRailP
           return;
         }
         e.preventDefault();
+        const closingHeaderId = openHeaderId;
+        const focusWasInRail =
+          document.activeElement instanceof HTMLElement && railRef.current?.contains(document.activeElement);
         onToggleHeader(null);
+        if (focusWasInRail && closingHeaderId) {
+          headerBtnRefs.current[closingHeaderId]?.focus();
+        }
       }
     }
 
@@ -106,11 +121,95 @@ function LeftNavRailInner({ groups, openHeaderId, onToggleHeader }: LeftNavRailP
     };
   }, [openHeaderId, onToggleHeader]);
 
+  function handleHeaderKeyDown(
+    e: ReactKeyboardEvent<HTMLButtonElement>,
+    group: NavFixedHeaderGroup,
+    index: number,
+  ) {
+    if (groups.length === 0) return;
+
+    if (e.key === "ArrowDown") {
+      e.preventDefault();
+      const nextGroup = groups[(index + 1) % groups.length]!;
+      headerBtnRefs.current[nextGroup.id]?.focus();
+      return;
+    }
+    if (e.key === "ArrowUp") {
+      e.preventDefault();
+      const prevGroup = groups[(index - 1 + groups.length) % groups.length]!;
+      headerBtnRefs.current[prevGroup.id]?.focus();
+      return;
+    }
+    if (e.key === "Home") {
+      e.preventDefault();
+      const firstGroup = groups[0]!;
+      headerBtnRefs.current[firstGroup.id]?.focus();
+      return;
+    }
+    if (e.key === "End") {
+      e.preventDefault();
+      const lastGroup = groups[groups.length - 1]!;
+      headerBtnRefs.current[lastGroup.id]?.focus();
+      return;
+    }
+    if (e.key === "ArrowRight") {
+      e.preventDefault();
+      if (openHeaderId !== group.id) {
+        onToggleHeader(group.id);
+      }
+      requestAnimationFrame(() => {
+        const menuEl = document.getElementById(`subheaders-${group.id}`);
+        const firstEnabled = menuEl?.querySelector<HTMLButtonElement>('button[role="menuitem"]:not(:disabled)');
+        firstEnabled?.focus();
+      });
+    }
+  }
+
+  function handleSubHeaderKeyDown(
+    e: ReactKeyboardEvent<HTMLButtonElement>,
+    groupId: FixedHeaderId,
+  ) {
+    const menuEl = document.getElementById(`subheaders-${groupId}`);
+    if (!menuEl) return;
+
+    if (e.key === "ArrowLeft") {
+      e.preventDefault();
+      onToggleHeader(null);
+      headerBtnRefs.current[groupId]?.focus();
+      return;
+    }
+
+    const enabledItems = Array.from(
+      menuEl.querySelectorAll<HTMLButtonElement>('button[role="menuitem"]:not(:disabled)'),
+    );
+    if (enabledItems.length === 0) return;
+    const currentIdx = enabledItems.indexOf(e.currentTarget);
+
+    if (e.key === "ArrowDown") {
+      e.preventDefault();
+      enabledItems[(currentIdx + 1) % enabledItems.length]?.focus();
+    } else if (e.key === "ArrowUp") {
+      e.preventDefault();
+      enabledItems[(currentIdx - 1 + enabledItems.length) % enabledItems.length]?.focus();
+    } else if (e.key === "Home") {
+      e.preventDefault();
+      enabledItems[0]?.focus();
+    } else if (e.key === "End") {
+      e.preventDefault();
+      enabledItems[enabledItems.length - 1]?.focus();
+    }
+  }
+
   return (
-    <nav className="left-fixed-rail" aria-label="Workspace Sections">
+    <nav
+      id="workspace-left-rail"
+      ref={railRef}
+      className={`left-fixed-rail ${mobileOpen ? "is-mobile-open" : ""}`}
+      aria-label="Workspace Sections"
+    >
       <div className="left-rail-heading">Sections</div>
       <ul className="fixed-header-list" role="menubar" aria-orientation="vertical">
-        {groups.map((group) => {
+        {groups.map((group, groupIndex) => {
           const isOpen = openHeaderId === group.id;
           const menuId = `subheaders-${group.id}`;
           const hasActiveSub = group.subHeaders.some((s) => s.active);
@@ -122,6 +221,9 @@ function LeftNavRailInner({ groups, openHeaderId, onToggleHeader }: LeftNavRailP
               role="none"
             >
               <button
+                ref={(el) => {
+                  headerBtnRefs.current[group.id] = el;
+                }}
                 type="button"
                 role="menuitem"
                 aria-haspopup="menu"
@@ -129,6 +231,7 @@ function LeftNavRailInner({ groups, openHeaderId, onToggleHeader }: LeftNavRailP
                 aria-controls={menuId}
                 className={`fixed-header-btn ${isOpen ? "is-open" : ""} ${hasActiveSub ? "has-active" : ""}`}
                 onClick={() => onToggleHeader(isOpen ? null : group.id)}
+                onKeyDown={(e) => handleHeaderKeyDown(e, group, groupIndex)}
               >
                 <span className="fixed-header-accent" aria-hidden="true" />
                 <span className="fixed-header-icon" aria-hidden="true">
@@ -157,6 +260,7 @@ function LeftNavRailInner({ groups, openHeaderId, onToggleHeader }: LeftNavRailP
                 role="menu"
                 aria-label={`${group.label} sub-headers`}
                 aria-hidden={!isOpen}
+                inert={!isOpen ? true : undefined}
                 className={`vertical-dropdown-wrap ${isOpen ? "is-open" : ""}`}
               >
                 <div className="vertical-dropdown-inner">
@@ -176,6 +280,7 @@ function LeftNavRailInner({ groups, openHeaderId, onToggleHeader }: LeftNavRailP
                           title={sub.title}
                           className={`vertical-subheader-btn ${sub.active ? "is-active" : ""}`}
                           onClick={() => sub.onSelect()}
+                          onKeyDown={(e) => handleSubHeaderKeyDown(e, group.id)}
                         >
                           <span className="vertical-subheader-dot" aria-hidden="true" />
                           <span className="vertical-subheader-label">{sub.label}</span>
