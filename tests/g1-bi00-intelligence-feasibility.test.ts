@@ -120,6 +120,9 @@ describe("FR-07 BI-00 & Integrated X-VIS — Intelligence Studio Feasibility (BI
       );
       expect(chartShot.byteLength).toBeGreaterThan(5_000);
     } else {
+      if (process.env.REQUIRE_CHROMIUM === "true") {
+        throw new Error("REQUIRE_CHROMIUM=true but no Chromium/Chrome/Edge binary was detected for BI-00 PNG render.");
+      }
       console.warn("DISCLOSURE: Skipping BI chart PNG render — no Chromium/Chrome/Edge binary detected on host.");
     }
 

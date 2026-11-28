@@ -2,8 +2,9 @@ name: AI Office Suite — CI Validation, PostgreSQL 16 RLS & Docker Smoke
 
 on:
   push:
-    branches: [main]
+    branches: [main, "feasibility/**"]
   pull_request:
+  workflow_dispatch:
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
@@ -33,6 +34,11 @@ jobs:
       - name: Check dependency license compliance
         run: npm run lint:licenses
 
+      - name: Generate and verify CycloneDX SBOM
+        run: |
+          npm run sbom
+          node -e "const b = JSON.parse(require('node:fs').readFileSync('coverage/sbom.cdx.json','utf8')); const ms = b.components.find(c => c.name === 'ms' && c.version === '2.1.3'); if (!ms || ms.scope !== 'required') { console.error('Expected ms@2.1.3 scope=required in SBOM', ms); process.exit(1); }"
+
       - name: Typecheck
         run: npm run typecheck
 
@@ -40,6 +46,11 @@ jobs:
         run: npm run build
 
       - name: Run full self-contained test suite
+        env:
+          # Ubuntu 24.04 hosted runners enforce AppArmor unprivileged userns restrictions;
+          # opt into --no-sandbox only for CI tests while keeping production defaults sandboxed (F-14).
+          CHROMIUM_NO_SANDBOX: "true"
+          REQUIRE_CHROMIUM: "true"
         run: npm test
 
       - name: Verify performance regression budgets
@@ -71,6 +82,7 @@ jobs:
       POSTGRES_APP_USER: aios_app
       POSTGRES_APP_PASSWORD: ci_ephemeral_app_password_2026
       TEST_POSTGRES_URL: postgres://postgres:ci_ephemeral_pg16_password@127.0.0.1:5432/aios_ci
+      REQUIRE_LIVE_PG: "true"
       RUN_STRESS: "1"
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -95,6 +107,11 @@ jobs:
           npx vitest run tests/d2-live-postgres16-rls.test.ts --reporter=json --outputFile=/tmp/pg16-rls.json
           node -e 'const r = JSON.parse(require("node:fs").readFileSync("/tmp/pg16-rls.json","utf8")); if (!r.numPassedTests || r.numPendingTests > 0) { console.error("Expected zero skipped PG16 RLS tests", r); process.exit(1); }'
 
+      - name: Run live PostgreSQL 16 Platform Admin (PA-00) suite (must not skip)
+        run: |
+          npx vitest run tests/v13-pa00-platform-admin.test.ts --reporter=json --outputFile=/tmp/pg16-pa00.json
+          node -e 'const r = JSON.parse(require("node:fs").readFileSync("/tmp/pg16-pa00.json","utf8")); if (!r.numPassedTests || r.numPendingTests > 0) { console.error("Expected zero skipped PA-00 tests", r); process.exit(1); }'
+
       - name: Run PostgreSQL 16 + pipeline stress soak suite
         run: npx vitest run tests/stress-load-benchmarks.test.ts
 
@@ -110,12 +127,19 @@ jobs:
           POSTGRES_PASSWORD: ci_smoke_admin_password_2026
           POSTGRES_APP_PASSWORD: ci_smoke_app_password_2026
           JWT_SECRET: ci_smoke_jwt_secret_must_be_at_least_32_characters_long
+          PII_PSEUDONYMIZATION_KEY: ci_smoke_pii_key_must_be_distinct_32_characters_long
+          AI_PROPOSAL_SIGNING_SECRET: ci_smoke_ai_signing_secret_distinct_32_characters_long
         run: docker compose config --quiet
 
-      - name: Build production API image and verify config boot import
+      - name: Build production API image and verify runtime /api/health, prod config, db-cli & bundled fonts
         run: |
           docker build -f docker/Dockerfile.api -t aios-api:ci-smoke .
-          docker run --rm aios-api:ci-smoke node -e "import('./apps/api/src/config.ts').then(m => { const c = m.loadApiServerConfig({ AUTH_MODE: 'provisional-local', HOST: '127.0.0.1', NODE_ENV: 'development' }); if (c.port !== 4100) process.exit(1); console.log('API image config OK'); })"
+          docker run --rm aios-api:ci-smoke node --input-type=module -e "import { existsSync } from 'node:fs'; import { createApiApp } from './apps/api/src/app.ts'; import { loadApiServerConfig } from './apps/api/src/config.ts'; await import('./scripts/db-cli.mjs'); const prodCfg = loadApiServerConfig({ AUTH_MODE: 'jwt-pg', NODE_ENV: 'production', HOST: '0.0.0.0', DATABASE_URL: 'postgres://aios_app:ci_smoke@127.0.0.1:5432/aios_ci', PG_SSL_MODE: 'disable', CORS_ORIGIN: 'http://localhost:8080', JWT_SECRET: 'ci_smoke_jwt_secret_must_be_at_least_32_chars_a', PII_PSEUDONYMIZATION_KEY: 'ci_smoke_pii_key_must_be_at_least_32_chars_bbb', AI_PROPOSAL_SIGNING_SECRET: 'ci_smoke_ai_secret_must_be_at_least_32_chars_cc' }); if (prodCfg.nodeEnv !== 'production' || prodCfg.rateLimit.store !== 'postgres' || !prodCfg.workers.isolatedParsers) process.exit(1); const c = loadApiServerConfig({ AUTH_MODE: 'provisional-local', HOST: '127.0.0.1', NODE_ENV: 'development' }); if (c.port !== 4100) process.exit(1); if (!existsSync('node_modules/@fontsource/inter/files/inter-latin-400-normal.woff2') || !existsSync('node_modules/@fontsource/noto-sans-khmer/files/noto-sans-khmer-khmer-400-normal.woff2')) { console.error('Missing @fontsource runtime assets'); process.exit(1); } const app = createApiApp({ inMemory: true, rateLimit: { enabled: false } }); const srv = app.listen(0, '127.0.0.1'); try { await new Promise((r) => srv.once('listening', r)); const { port } = srv.address(); const res = await fetch(\`http://127.0.0.1:\${port}/api/health\`); if (res.status !== 200) process.exit(1); console.log('API image runtime health, prod config & db-cli OK'); } finally { srv.close(); }"
+
+      - name: Build isolated Workers image and verify secret stripping & zero-DB runtime
+        run: |
+          docker build -f docker/Dockerfile.workers -t aios-workers:ci-smoke .
+          docker run --rm -e JWT_SECRET=parent_secret_must_not_leak -e DATABASE_URL=postgres://user:pass@pg/db aios-workers:ci-smoke node --input-type=module -e "import { existsSync } from 'node:fs'; import { IsolatedParserWorkerClient } from './apps/workers/src/index.ts'; if (existsSync('node_modules/pg')) { console.error('pg must not be installed in isolated workers image'); process.exit(1); } const client = new IsolatedParserWorkerClient(); const probe = await client.probeIsolation(); if (!probe.ok || probe.pid === process.pid || probe.envKeys.includes('JWT_SECRET') || probe.envKeys.includes('DATABASE_URL')) { console.error('Worker isolation probe failed', probe); process.exit(1); } console.log('Workers image subprocess isolation & zero-DB check OK');"
 
       - name: Build production Web image and validate nginx.conf
         run: |

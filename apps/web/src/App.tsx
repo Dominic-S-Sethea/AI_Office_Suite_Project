@@ -26,21 +26,90 @@ import {
 } from "./components/DocumentEditor.tsx";
 import { AiVoicePanel } from "./components/AiVoicePanel.tsx";
 import { ErrorBoundary } from "./components/ErrorBoundary.tsx";
+import { LeftNavRail, type FixedHeaderId, type NavFixedHeaderGroup } from "./components/LeftNavRail.tsx";
 import { NewDocumentModal } from "./components/NewDocumentModal.tsx";
-import type { RevisionDiffPayload } from "./components/VersionAuditDrawer.tsx";
+import type { HistorySectionTab, RevisionDiffPayload } from "./components/VersionAuditDrawer.tsx";
+import { WorkspaceSubPanel, type WorkspaceUtilityPanelId } from "./components/WorkspaceSubPanel.tsx";
 import {
   arrayBufferToBase64,
   formatApiErrorMessage,
   MAX_DOCX_UPLOAD_BYTES,
   safeReadJson,
+  trapDialogTabKey,
 } from "./lib/apiClient.ts";
 
 const LazyVersionAuditDrawer = lazy(() => import("./components/VersionAuditDrawer.tsx"));
 
+function DrawerLoadingFallback({ onClose }: { onClose: () => void }) {
+  const panelRef = useRef<HTMLDivElement | null>(null);
+  const closeBtnRef = useRef<HTMLButtonElement | null>(null);
+
+  useEffect(() => {
+    closeBtnRef.current?.focus();
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        onClose();
+        return;
+      }
+      trapDialogTabKey(panelRef.current, e);
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [onClose]);
+
+  return (
+    <div
+      className="drawer-backdrop"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="history-loading-title"
+      onClick={(e) => {
+        if (e.target === e.currentTarget) onClose();
+      }}
+    >
+      <div ref={panelRef} className="drawer-panel">
+        <div className="panel-header-row">
+          <strong id="history-loading-title" className="modal-title">
+            Version &amp; Audit History
+          </strong>
+          <button ref={closeBtnRef} type="button" className="btn" onClick={onClose}>
+            Close
+          </button>
+        </div>
+        <div className="preview-card" role="status">
+          Loading version &amp; audit drawer...
+        </div>
+      </div>
+    </div>
+  );
+}
+
 type AuthMode = "provisional-local" | "jwt-pg";
 type BootState = "loading" | "ready" | "unreachable";
+type ActiveStudioId = "documents" | "spreadsheets" | "presentations" | "analytics";
 
 const PAGE_SIZE = 50;
+
+const DOC_WRITE_ROLES = new Set<WorkspaceRole>(["owner", "administrator", "workspace_manager", "editor"]);
+const DOC_EXPORT_ROLES = new Set<WorkspaceRole>(["owner", "administrator", "workspace_manager", "editor", "reviewer"]);
+const DOC_READ_ROLES = new Set<WorkspaceRole>([
+  "owner",
+  "administrator",
+  "workspace_manager",
+  "editor",
+  "reviewer",
+  "viewer",
+]);
+const AUDIT_READ_ROLES = new Set<WorkspaceRole>([
+  "owner",
+  "administrator",
+  "workspace_manager",
+  "billing_admin",
+  "auditor",
+  "editor",
+  "reviewer",
+]);
 
 const DEFAULT_PAGE_LAYOUT: PageLayoutConfig = {
   size: "A4",
@@ -57,6 +126,32 @@ export function App() {
   const [bootAttempt, setBootAttempt] = useState(0);
   const [sessionActor, setSessionActor] = useState<ActorContext | null>(null);
   const [prototypeRole, setPrototypeRole] = useState<WorkspaceRole>("editor");
+
+  // 3-zone workspace navigation state
+  const [activeStudio, setActiveStudio] = useState<ActiveStudioId>("documents");
+  const [openFixedHeader, setOpenFixedHeader] = useState<FixedHeaderId | null>(null);
+  const [mobileNavOpen, setMobileNavOpen] = useState(false);
+  const [docsDrawerOpen, setDocsDrawerOpen] = useState(() =>
+    typeof window !== "undefined" && typeof window.matchMedia === "function"
+      ? !window.matchMedia("(max-width: 960px)").matches
+      : true,
+  );
+  const [activeSubPanel, setActiveSubPanel] = useState<WorkspaceUtilityPanelId>(null);
+  const scrollStageRef = useRef<HTMLDivElement | null>(null);
+
+  const toggleSubPanel = useCallback((panel: Exclude<WorkspaceUtilityPanelId, null>) => {
+    setActiveSubPanel((prev) => {
+      const next = prev === panel ? null : panel;
+      if (next && scrollStageRef.current && typeof scrollStageRef.current.scrollTo === "function") {
+        const prefersReduced =
+          typeof window !== "undefined" &&
+          typeof window.matchMedia === "function" &&
+          window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+        scrollStageRef.current.scrollTo({ top: 0, behavior: prefersReduced ? "auto" : "smooth" });
+      }
+      return next;
+    });
+  }, []);
 
   // jwt-pg sign-in form state
   const [loginEmail, setLoginEmail] = useState("");
@@ -82,6 +177,18 @@ export function App() {
   const [draftLayout, setDraftLayout] = useState<PageLayoutConfig | null>(null);
   const [selection, setSelection] = useState<EditorSelectionState>({ selectedText: "" });
 
+  const handleSelectionChange = useCallback((next: EditorSelectionState) => {
+    setSelection((prev) =>
+      prev.blockId === next.blockId &&
+      prev.selectedText === next.selectedText &&
+      prev.graphemeCount === next.graphemeCount &&
+      prev.startOffset === next.startOffset &&
+      prev.endOffset === next.endOffset
+        ? prev
+        : next,
+    );
+  }, []);
+
   // New blank document modal state
   const [newDocModalOpen, setNewDocModalOpen] = useState(false);
   const [newDocTitle, setNewDocTitle] = useState("");
@@ -95,19 +202,32 @@ export function App() {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const [isImportingDocx, setIsImportingDocx] = useState(false);
 
-  // Responsive panels & drawers (H27)
-  const [sidebarOpen, setSidebarOpen] = useState(true);
-  const [panelOpen, setPanelOpen] = useState(true);
+  // Version & audit drawer
   const [historyOpen, setHistoryOpen] = useState(false);
+  const [historySection, setHistorySection] = useState<HistorySectionTab>("all");
   const [versions, setVersions] = useState<DocumentVersion[]>([]);
   const [auditEvents, setAuditEvents] = useState<AuditEvent[]>([]);
+  const [versionsTotal, setVersionsTotal] = useState<number | undefined>(undefined);
+  const [versionsHasMore, setVersionsHasMore] = useState(false);
+  const [isLoadingMoreVersions, setIsLoadingMoreVersions] = useState(false);
+  const [auditTotal, setAuditTotal] = useState<number | undefined>(undefined);
+  const [auditHasMore, setAuditHasMore] = useState(false);
+  const [isLoadingMoreAudit, setIsLoadingMoreAudit] = useState(false);
+  const drawerTriggerElRef = useRef<HTMLElement | null>(null);
 
-  // Request abort / sequence guards (H23)
+  // Request abort / sequence / session epoch guards (H23, F-17, FE-04, FE-05)
+  const sessionEpochRef = useRef(0);
+  const editGenRef = useRef(0);
+  const activeRevisionRef = useRef<number | null>(null);
   const listAbortRef = useRef<AbortController | null>(null);
   const listSeqRef = useRef(0);
   const historyAbortRef = useRef<AbortController | null>(null);
   const historySeqRef = useRef(0);
   const diffAbortRef = useRef<AbortController | null>(null);
+  const reloadAbortRef = useRef<AbortController | null>(null);
+  const reloadSeqRef = useRef(0);
+  const mutationAbortRef = useRef<AbortController | null>(null);
+  const exportAbortRef = useRef<AbortController | null>(null);
 
   const [isLoadingDocs, setIsLoadingDocs] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
@@ -115,17 +235,35 @@ export function App() {
   const [isExporting, setIsExporting] = useState<"docx" | "pdf" | null>(null);
   const [isLoadingHistory, setIsLoadingHistory] = useState(false);
   const [restoringRevision, setRestoringRevision] = useState<number | null>(null);
+  const [isLoggingOut, setIsLoggingOut] = useState(false);
+  const [editorSyncVersion, setEditorSyncVersion] = useState(0);
 
   const [statusMessage, setStatusMessage] = useState("Connecting to workspace API...");
   const [errorBanner, setErrorBanner] = useState<string | null>(null);
   const [conflictMessage, setConflictMessage] = useState<string | null>(null);
 
   const effectiveRole: WorkspaceRole = authMode === "jwt-pg" ? (sessionActor?.role ?? "viewer") : prototypeRole;
-  const readOnly = effectiveRole === "viewer" || effectiveRole === "reviewer";
-  const canExport = effectiveRole !== "viewer";
+  const canReadDocs = DOC_READ_ROLES.has(effectiveRole);
+  const readOnly = !DOC_WRITE_ROLES.has(effectiveRole);
+  const canExport = DOC_EXPORT_ROLES.has(effectiveRole);
+  const canReadAudit = AUDIT_READ_ROLES.has(effectiveRole);
   const isAuthenticated = bootState === "ready" && (authMode === "provisional-local" || sessionActor !== null);
   const hasUnsavedChanges =
     editorDirty || draftTitle !== null || draftLanguage !== null || draftLayout !== null;
+
+  useEffect(() => {
+    if (typeof window === "undefined" || typeof window.matchMedia !== "function") return;
+    const mq = window.matchMedia("(max-width: 960px)");
+    const onViewportChange = (e: MediaQueryListEvent) => {
+      if (e.matches) {
+        setDocsDrawerOpen(false);
+      } else {
+        setMobileNavOpen(false);
+      }
+    };
+    mq.addEventListener?.("change", onViewportChange);
+    return () => mq.removeEventListener?.("change", onViewportChange);
+  }, []);
 
   const hasUnsavedChangesRef = useRef(hasUnsavedChanges);
   useEffect(() => {
@@ -143,12 +281,15 @@ export function App() {
     return () => window.removeEventListener("beforeunload", onBeforeUnload);
   }, [hasUnsavedChanges]);
 
-  // Abort any in-flight fetches on unmount (H23)
+  // Abort any in-flight fetches on unmount (H23, F-17)
   useEffect(() => {
     return () => {
       listAbortRef.current?.abort();
       historyAbortRef.current?.abort();
       diffAbortRef.current?.abort();
+      reloadAbortRef.current?.abort();
+      mutationAbortRef.current?.abort();
+      exportAbortRef.current?.abort();
     };
   }, []);
 
@@ -159,8 +300,75 @@ export function App() {
     setDraftLayout(null);
   }, []);
 
+  const handleEditMutation = useCallback(() => {
+    editGenRef.current += 1;
+  }, []);
+
+  const handleTitleDraftChange = useCallback((value: string) => {
+    editGenRef.current += 1;
+    setDraftTitle(value);
+  }, []);
+
+  const handleLanguageDraftChange = useCallback((lang: StudioDocument["language"]) => {
+    editGenRef.current += 1;
+    setDraftLanguage(lang);
+  }, []);
+
+  const handleLayoutDraftChange = useCallback((layout: PageLayoutConfig) => {
+    editGenRef.current += 1;
+    setDraftLayout(layout);
+  }, []);
+
+  const resetSessionState = useCallback(() => {
+    sessionEpochRef.current += 1;
+    editGenRef.current += 1;
+    listSeqRef.current += 1;
+    historySeqRef.current += 1;
+    reloadSeqRef.current += 1;
+    listAbortRef.current?.abort();
+    historyAbortRef.current?.abort();
+    diffAbortRef.current?.abort();
+    reloadAbortRef.current?.abort();
+    mutationAbortRef.current?.abort();
+    exportAbortRef.current?.abort();
+    activeDocIdRef.current = null;
+    activeRevisionRef.current = null;
+    setSessionActor(null);
+    setDocs([]);
+    setTotalDocs(0);
+    setDocOffset(0);
+    setActiveDoc(null);
+    setVersions([]);
+    setAuditEvents([]);
+    setVersionsTotal(undefined);
+    setVersionsHasMore(false);
+    setIsLoadingMoreVersions(false);
+    setAuditTotal(undefined);
+    setAuditHasMore(false);
+    setIsLoadingMoreAudit(false);
+    setSelection({ selectedText: "" });
+    setHistoryOpen(false);
+    setNewDocModalOpen(false);
+    setNewDocTitle("");
+    setNewDocError(null);
+    setSearchQuery("");
+    setLanguageFilter("");
+    setActiveSubPanel(null);
+    setConflictMessage(null);
+    setIsLoadingHistory(false);
+    setIsSaving(false);
+    setIsSeeding(false);
+    setIsCreatingDoc(false);
+    setIsImportingDocx(false);
+    setIsExporting(null);
+    setRestoringRevision(null);
+    clearDrafts();
+    setEditorSyncVersion((v) => v + 1);
+  }, [clearDrafts]);
+
   const confirmDiscardUnsavedChanges = useCallback((actionDescription: string): boolean => {
     if (!hasUnsavedChangesRef.current) return true;
+    if (typeof window.confirm !== "function") return true;
     return window.confirm(`You have unsaved changes on the current document. Discard them and ${actionDescription}?`);
   }, []);
 
@@ -178,7 +386,13 @@ export function App() {
   }, [authMode, prototypeRole]);
 
   useEffect(() => {
-    activeDocIdRef.current = activeDoc?.documentId ?? null;
+    const prevId = activeDocIdRef.current;
+    const nextId = activeDoc?.documentId ?? null;
+    activeDocIdRef.current = nextId;
+    activeRevisionRef.current = activeDoc?.revision ?? null;
+    if (prevId !== nextId) {
+      setSelection({ selectedText: "" });
+    }
   }, [activeDoc]);
 
   // Detect backend auth mode & restore existing cookie session if running under jwt-pg (M14 offline retry)
@@ -231,20 +445,24 @@ export function App() {
 
   const handleUnauthorized = useCallback(() => {
     if (authMode === "jwt-pg") {
-      setSessionActor(null);
-      setDocs([]);
-      setTotalDocs(0);
-      setDocOffset(0);
-      setActiveDoc(null);
-      clearDrafts();
+      resetSessionState();
       setErrorBanner("Session expired or revoked. Please sign in again.");
       setStatusMessage("Authentication required");
     }
-  }, [authMode, clearDrafts]);
+  }, [authMode, resetSessionState]);
 
   const loadDocuments = useCallback(
     async (opts?: { forceSyncActive?: boolean }) => {
       if (bootState !== "ready" || !isAuthenticated) return;
+      if (!canReadDocs) {
+        listAbortRef.current?.abort();
+        setDocs([]);
+        setTotalDocs(0);
+        setActiveDoc(null);
+        setIsLoadingDocs(false);
+        setStatusMessage(`Governance role (${effectiveRole}) active: document content access is restricted.`);
+        return;
+      }
       listAbortRef.current?.abort();
       const controller = new AbortController();
       listAbortRef.current = controller;
@@ -280,23 +498,23 @@ export function App() {
 
         const currentId = activeDocIdRef.current;
         if (!currentId && list[0]) {
+          activeDocIdRef.current = list[0].documentId;
           setActiveDoc(list[0]);
         } else if (currentId) {
           const refreshed = list.find((d) => d.documentId === currentId);
           if (refreshed) {
             if (opts?.forceSyncActive || !hasUnsavedChangesRef.current) {
               setActiveDoc(refreshed);
-            } else {
-              setActiveDoc((prev) => {
-                if (prev && refreshed.revision !== prev.revision) {
-                  setConflictMessage(
-                    `Server revision advanced to rev ${refreshed.revision} while you have unsaved edits on rev ${prev.revision}.`,
-                  );
-                }
-                return prev;
-              });
+            } else if (
+              activeRevisionRef.current !== null &&
+              refreshed.revision !== activeRevisionRef.current
+            ) {
+              setConflictMessage(
+                `Server revision advanced to rev ${refreshed.revision} while you have unsaved edits on rev ${activeRevisionRef.current}.`,
+              );
             }
           } else if (!searchQuery.trim() && !languageFilter && docOffset === 0 && !hasUnsavedChangesRef.current) {
+            activeDocIdRef.current = list[0]?.documentId ?? null;
             setActiveDoc(list[0] ?? null);
           }
         }
@@ -311,7 +529,7 @@ export function App() {
         }
       }
     },
-    [apiHeaders, bootState, isAuthenticated, handleUnauthorized, searchQuery, languageFilter, docOffset],
+    [apiHeaders, bootState, isAuthenticated, canReadDocs, effectiveRole, handleUnauthorized, searchQuery, languageFilter, docOffset],
   );
 
   useEffect(() => {
@@ -355,8 +573,11 @@ export function App() {
   }
 
   async function handleLogout(revokeAll = false) {
+    if (isLoggingOut) return;
     if (!confirmDiscardUnsavedChanges(revokeAll ? "revoke all active sessions" : "sign out")) return;
     setErrorBanner(null);
+    setIsLoggingOut(true);
+    const epoch = sessionEpochRef.current;
     try {
       const res = await fetch(revokeAll ? "/api/auth/revoke-sessions" : "/api/auth/logout", {
         method: "POST",
@@ -374,36 +595,43 @@ export function App() {
         );
         return;
       }
-      setSessionActor(null);
-      setDocs([]);
-      setTotalDocs(0);
-      setDocOffset(0);
-      setActiveDoc(null);
-      clearDrafts();
-      setConflictMessage(null);
-      setStatusMessage(revokeAll ? "All sessions revoked." : "Signed out.");
+      if (epoch === sessionEpochRef.current) {
+        resetSessionState();
+        setStatusMessage(revokeAll ? "All sessions revoked." : "Signed out.");
+      }
     } catch {
       setErrorBanner(
         revokeAll
           ? "Network error while revoking sessions — existing sessions may still be active."
           : "Network error during sign out. Please retry.",
       );
+    } finally {
+      setIsLoggingOut(false);
     }
   }
 
   async function reloadActiveDocument() {
     if (!activeDoc) return;
+    const targetDocId = activeDoc.documentId;
+    const epoch = sessionEpochRef.current;
+    reloadAbortRef.current?.abort();
+    const controller = new AbortController();
+    reloadAbortRef.current = controller;
+    const seq = ++reloadSeqRef.current;
     setErrorBanner(null);
     try {
-      const res = await fetch(`/api/documents/${encodeURIComponent(activeDoc.documentId)}`, {
+      const res = await fetch(`/api/documents/${encodeURIComponent(targetDocId)}`, {
         credentials: "include",
         headers: apiHeaders,
+        signal: controller.signal,
       });
+      if (epoch !== sessionEpochRef.current || seq !== reloadSeqRef.current || activeDocIdRef.current !== targetDocId) return;
       if (res.status === 401) {
         handleUnauthorized();
         return;
       }
       const data = await safeReadJson(res);
+      if (epoch !== sessionEpochRef.current || seq !== reloadSeqRef.current || activeDocIdRef.current !== targetDocId) return;
       if (!res.ok) {
         setErrorBanner(formatApiErrorMessage(res, data, "Failed to reload latest document."));
         return;
@@ -411,11 +639,15 @@ export function App() {
       const latest = data.document as StudioDocument;
       setActiveDoc(latest);
       clearDrafts();
+      setEditorSyncVersion((v) => v + 1);
       setConflictMessage(null);
       setDocs((prev) => prev.map((d) => (d.documentId === latest.documentId ? latest : d)));
       setStatusMessage(`Reloaded latest revision ${latest.revision}.`);
-    } catch {
-      setErrorBanner("Network error reloading latest revision.");
+    } catch (err) {
+      if (err instanceof DOMException && err.name === "AbortError") return;
+      if (seq === reloadSeqRef.current) {
+        setErrorBanner("Network error reloading latest revision.");
+      }
     }
   }
 
@@ -423,6 +655,9 @@ export function App() {
     e.preventDefault();
     if (readOnly || isCreatingDoc || !newDocTitle.trim()) return;
     if (!confirmDiscardUnsavedChanges("create a new document")) return;
+    const epoch = sessionEpochRef.current;
+    const controller = new AbortController();
+    mutationAbortRef.current = controller;
     setNewDocError(null);
     setErrorBanner(null);
     setIsCreatingDoc(true);
@@ -431,6 +666,7 @@ export function App() {
         method: "POST",
         credentials: "include",
         headers: { "Content-Type": "application/json", ...apiHeaders },
+        signal: controller.signal,
         body: JSON.stringify({
           title: newDocTitle.trim().normalize("NFC"),
           language: newDocLanguage,
@@ -441,30 +677,41 @@ export function App() {
           },
         }),
       });
+      if (epoch !== sessionEpochRef.current) return;
       if (res.status === 401) {
         setNewDocModalOpen(false);
         handleUnauthorized();
         return;
       }
       const data = await safeReadJson(res);
+      if (epoch !== sessionEpochRef.current) return;
       if (!res.ok) {
         setNewDocError(formatApiErrorMessage(res, data, "Failed to create document."));
         return;
       }
       const created = data.document as StudioDocument;
+      activeDocIdRef.current = created.documentId;
       setActiveDoc(created);
       clearDrafts();
+      setEditorSyncVersion((v) => v + 1);
+      setSelection({ selectedText: "" });
       setConflictMessage(null);
       setNewDocModalOpen(false);
       setNewDocTitle("");
       setNewDocError(null);
       setDocOffset(0);
       await loadDocuments();
+      if (epoch !== sessionEpochRef.current) return;
       setStatusMessage(`Created '${created.title}' (${created.layout.size} ${created.layout.orientation}).`);
-    } catch {
-      setNewDocError("Network error creating new document.");
+    } catch (err) {
+      if (err instanceof DOMException && err.name === "AbortError") return;
+      if (epoch === sessionEpochRef.current) {
+        setNewDocError("Network error creating new document.");
+      }
     } finally {
-      setIsCreatingDoc(false);
+      if (epoch === sessionEpochRef.current) {
+        setIsCreatingDoc(false);
+      }
     }
   }
 
@@ -481,23 +728,30 @@ export function App() {
       setErrorBanner("DOCX file exceeds 10 MB safety limit.");
       return;
     }
+    const epoch = sessionEpochRef.current;
+    const controller = new AbortController();
+    mutationAbortRef.current = controller;
     setErrorBanner(null);
     setConflictMessage(null);
     setIsImportingDocx(true);
     try {
       const buf = await file.arrayBuffer();
+      if (epoch !== sessionEpochRef.current) return;
       const contentBase64 = arrayBufferToBase64(buf);
       const res = await fetch("/api/documents/import/docx", {
         method: "POST",
         credentials: "include",
         headers: { "Content-Type": "application/json", ...apiHeaders },
+        signal: controller.signal,
         body: JSON.stringify({ filename: file.name, contentBase64 }),
       });
+      if (epoch !== sessionEpochRef.current) return;
       if (res.status === 401) {
         handleUnauthorized();
         return;
       }
       const data = await safeReadJson(res);
+      if (epoch !== sessionEpochRef.current) return;
       if (!res.ok) {
         setErrorBanner(formatApiErrorMessage(res, data, "DOCX import failed."));
         setStatusMessage("DOCX import rejected.");
@@ -505,25 +759,37 @@ export function App() {
       }
       const created = data.document as StudioDocument;
       const diagnostics = data.diagnostics as { originalSha256?: string; warnings?: string[] } | undefined;
+      activeDocIdRef.current = created.documentId;
       setActiveDoc(created);
       clearDrafts();
+      setEditorSyncVersion((v) => v + 1);
+      setSelection({ selectedText: "" });
       setDocOffset(0);
       await loadDocuments();
+      if (epoch !== sessionEpochRef.current) return;
       const shaPrefix = diagnostics?.originalSha256?.slice(0, 10) ?? "verified";
       const warnCount = diagnostics?.warnings?.length ?? 0;
       setStatusMessage(
         `Imported DOCX '${file.name}' (SHA-256 ${shaPrefix}${warnCount > 0 ? `, ${warnCount} warning(s)` : ""}).`,
       );
-    } catch {
-      setErrorBanner("Network or read error importing DOCX file.");
+    } catch (err) {
+      if (err instanceof DOMException && err.name === "AbortError") return;
+      if (epoch === sessionEpochRef.current) {
+        setErrorBanner("Network or read error importing DOCX file.");
+      }
     } finally {
-      setIsImportingDocx(false);
+      if (epoch === sessionEpochRef.current) {
+        setIsImportingDocx(false);
+      }
     }
   }
 
-  async function handleSeedBilingual() {
+  const handleSeedBilingual = useCallback(async () => {
     if (readOnly || isSeeding) return;
     if (!confirmDiscardUnsavedChanges("load a new bilingual sample document")) return;
+    const epoch = sessionEpochRef.current;
+    const controller = new AbortController();
+    mutationAbortRef.current = controller;
     setErrorBanner(null);
     setConflictMessage(null);
     setIsSeeding(true);
@@ -532,33 +798,55 @@ export function App() {
         method: "POST",
         credentials: "include",
         headers: apiHeaders,
+        signal: controller.signal,
       });
+      if (epoch !== sessionEpochRef.current) return;
       if (res.status === 401) {
         handleUnauthorized();
         return;
       }
       const data = await safeReadJson(res);
+      if (epoch !== sessionEpochRef.current) return;
       if (res.ok) {
         const created = data.document as StudioDocument;
+        activeDocIdRef.current = created.documentId;
         setActiveDoc(created);
         clearDrafts();
+        setEditorSyncVersion((v) => v + 1);
+        setSelection({ selectedText: "" });
         setDocOffset(0);
         await loadDocuments();
+        if (epoch !== sessionEpochRef.current) return;
         setStatusMessage("Loaded bilingual English/Khmer management report fixture.");
       } else {
         const msg = formatApiErrorMessage(res, data, "Failed to create fixture");
         setErrorBanner(msg);
         setStatusMessage(msg);
       }
-    } catch {
-      setErrorBanner("Network error creating bilingual fixture.");
+    } catch (err) {
+      if (err instanceof DOMException && err.name === "AbortError") return;
+      if (epoch === sessionEpochRef.current) {
+        setErrorBanner("Network error creating bilingual fixture.");
+      }
     } finally {
-      setIsSeeding(false);
+      if (epoch === sessionEpochRef.current) {
+        setIsSeeding(false);
+      }
     }
-  }
+  }, [readOnly, isSeeding, confirmDiscardUnsavedChanges, apiHeaders, handleUnauthorized, clearDrafts, loadDocuments]);
 
   const handleSave = useCallback(async () => {
     if (!activeDoc || !hasUnsavedChanges || readOnly || isSaving) return;
+    const trimmedTitle = (draftTitle ?? activeDoc.title).trim().normalize("NFC");
+    if (!trimmedTitle) {
+      setErrorBanner("Document title cannot be empty.");
+      return;
+    }
+    const targetDocId = activeDoc.documentId;
+    const epoch = sessionEpochRef.current;
+    const saveStartGen = editGenRef.current;
+    const controller = new AbortController();
+    mutationAbortRef.current = controller;
     setErrorBanner(null);
     setIsSaving(true);
     try {
@@ -568,24 +856,27 @@ export function App() {
         ? fromTiptapJson(currentJson as unknown as TiptapNode, activeDoc.blocks)
         : activeDoc.blocks;
 
-      const res = await fetch(`/api/documents/${encodeURIComponent(activeDoc.documentId)}`, {
+      const res = await fetch(`/api/documents/${encodeURIComponent(targetDocId)}`, {
         method: "PUT",
         credentials: "include",
         headers: { "Content-Type": "application/json", ...apiHeaders },
+        signal: controller.signal,
         body: JSON.stringify({
           expectedRevision: activeDoc.revision,
-          title: (draftTitle ?? activeDoc.title).trim().normalize("NFC"),
+          title: trimmedTitle,
           language: draftLanguage ?? activeDoc.language,
           layout: draftLayout ?? activeDoc.layout,
           blocks: blocksToSave,
           summary: "Manual editor save",
         }),
       });
+      if (epoch !== sessionEpochRef.current || activeDocIdRef.current !== targetDocId) return;
       if (res.status === 401) {
         handleUnauthorized();
         return;
       }
       const data = await safeReadJson(res);
+      if (epoch !== sessionEpochRef.current || activeDocIdRef.current !== targetDocId) return;
       if (res.status === 409) {
         const msg = String(
           data.error ??
@@ -598,19 +889,28 @@ export function App() {
       if (res.ok) {
         const saved = data.document as StudioDocument;
         setActiveDoc(saved);
-        clearDrafts();
+        if (editGenRef.current === saveStartGen) {
+          clearDrafts();
+          setEditorSyncVersion((v) => v + 1);
+        }
         setConflictMessage(null);
         await loadDocuments();
+        if (epoch !== sessionEpochRef.current) return;
         setStatusMessage(`Saved revision ${saved.revision}.`);
       } else {
         const msg = formatApiErrorMessage(res, data, "Save failed");
         setErrorBanner(msg);
         setStatusMessage(msg);
       }
-    } catch {
-      setErrorBanner("Network error saving document.");
+    } catch (err) {
+      if (err instanceof DOMException && err.name === "AbortError") return;
+      if (epoch === sessionEpochRef.current && activeDocIdRef.current === targetDocId) {
+        setErrorBanner("Network error saving document.");
+      }
     } finally {
-      setIsSaving(false);
+      if (epoch === sessionEpochRef.current) {
+        setIsSaving(false);
+      }
     }
   }, [
     activeDoc,
@@ -627,10 +927,11 @@ export function App() {
     loadDocuments,
   ]);
 
-  // Keyboard shortcut: Ctrl+S / Cmd+S to save current document
+  // Keyboard shortcut: Ctrl+S / Cmd+S to save current document (disabled when a modal dialog is active)
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
       if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "s") {
+        if (document.querySelector('[aria-modal="true"]')) return;
         e.preventDefault();
         void handleSave();
       }
@@ -639,96 +940,230 @@ export function App() {
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [handleSave]);
 
-  async function handleExport(kind: "docx" | "pdf") {
-    if (!activeDoc || !canExport || isExporting) return;
-    setErrorBanner(null);
-    setIsExporting(kind);
+  const handleExport = useCallback(
+    async (kind: "docx" | "pdf") => {
+      if (!activeDoc || !canExport || isExporting) return;
+      if (
+        hasUnsavedChangesRef.current &&
+        typeof window.confirm === "function" &&
+        !window.confirm(
+          "You have unsaved local changes. Export the last saved server revision without those unsaved changes?",
+        )
+      ) {
+        return;
+      }
+      const targetDoc = activeDoc;
+      const epoch = sessionEpochRef.current;
+      const controller = new AbortController();
+      exportAbortRef.current = controller;
+      setErrorBanner(null);
+      setIsExporting(kind);
+      setStatusMessage(kind === "docx" ? "Exporting DOCX snapshot..." : "Rendering PDF snapshot (HarfBuzz)...");
+      try {
+        const res = await fetch(`/api/documents/${encodeURIComponent(targetDoc.documentId)}/export/${kind}`, {
+          method: "POST",
+          credentials: "include",
+          headers: apiHeaders,
+          signal: controller.signal,
+        });
+        if (epoch !== sessionEpochRef.current) return;
+        if (res.status === 401) {
+          handleUnauthorized();
+          return;
+        }
+        if (!res.ok) {
+          const data = await safeReadJson(res);
+          if (epoch !== sessionEpochRef.current) return;
+          const msg = formatApiErrorMessage(res, data, `${kind.toUpperCase()} export failed`);
+          setErrorBanner(msg);
+          setStatusMessage(msg);
+          return;
+        }
+        const blob = await res.blob();
+        if (epoch !== sessionEpochRef.current) return;
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = `${targetDoc.documentId}-rev${targetDoc.revision}.${kind}`;
+        a.click();
+        // Defer object URL revocation so Safari & slow download managers finish streaming cleanly (M14)
+        window.setTimeout(() => URL.revokeObjectURL(url), 60_000);
+        setStatusMessage(`Exported ${kind.toUpperCase()} snapshot (rev ${targetDoc.revision}).`);
+      } catch (err) {
+        if (err instanceof DOMException && err.name === "AbortError") return;
+        if (epoch === sessionEpochRef.current) {
+          setErrorBanner(`Network error during ${kind.toUpperCase()} export.`);
+        }
+      } finally {
+        if (epoch === sessionEpochRef.current) {
+          setIsExporting(null);
+        }
+      }
+    },
+    [activeDoc, canExport, isExporting, apiHeaders, handleUnauthorized],
+  );
+
+  const openHistory = useCallback(
+    async (section: HistorySectionTab = "all") => {
+      if (!activeDoc) return;
+      drawerTriggerElRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+      const targetDocId = activeDoc.documentId;
+      const epoch = sessionEpochRef.current;
+      historyAbortRef.current?.abort();
+      const controller = new AbortController();
+      historyAbortRef.current = controller;
+      const seq = ++historySeqRef.current;
+
+      setErrorBanner(null);
+      setHistorySection(section);
+      setHistoryOpen(true);
+      setIsLoadingHistory(true);
+      setVersionsTotal(undefined);
+      setVersionsHasMore(false);
+      setAuditTotal(undefined);
+      setAuditHasMore(false);
+      try {
+        const [vRes, aRes] = await Promise.all([
+          fetch(`/api/documents/${encodeURIComponent(targetDocId)}/versions?limit=100&offset=0&order=desc`, {
+            credentials: "include",
+            headers: apiHeaders,
+            signal: controller.signal,
+          }),
+          canReadAudit
+            ? fetch(`/api/documents/${encodeURIComponent(targetDocId)}/audit?limit=100&offset=0`, {
+                credentials: "include",
+                headers: apiHeaders,
+                signal: controller.signal,
+              })
+            : Promise.resolve(null),
+        ]);
+        if (epoch !== sessionEpochRef.current || seq !== historySeqRef.current) return;
+        if (vRes.status === 401 || aRes?.status === 401) {
+          setHistoryOpen(false);
+          handleUnauthorized();
+          return;
+        }
+        if (!vRes.ok) {
+          const errData = await safeReadJson(vRes);
+          setErrorBanner(formatApiErrorMessage(vRes, errData, "Failed to load version history."));
+          setHistoryOpen(false);
+          return;
+        }
+        const vData = await safeReadJson(vRes);
+        if (epoch !== sessionEpochRef.current || seq !== historySeqRef.current) return;
+        const vList = (vData.versions ?? []) as DocumentVersion[];
+        const vTotal = typeof vData.total === "number" ? vData.total : vList.length;
+        const vMore = typeof vData.hasMore === "boolean" ? vData.hasMore : vList.length < vTotal;
+        setVersions(vList);
+        setVersionsTotal(vTotal);
+        setVersionsHasMore(vMore);
+
+        if (aRes && aRes.ok) {
+          const aData = await safeReadJson(aRes);
+          if (epoch !== sessionEpochRef.current || seq !== historySeqRef.current) return;
+          const aList = (aData.events ?? []) as AuditEvent[];
+          const aTotal = typeof aData.total === "number" ? aData.total : aList.length;
+          const aMore = typeof aData.hasMore === "boolean" ? aData.hasMore : aList.length < aTotal;
+          setAuditEvents(aList);
+          setAuditTotal(aTotal);
+          setAuditHasMore(aMore);
+        } else {
+          if (aRes && aRes.status !== 403) {
+            const errData = await safeReadJson(aRes);
+            setErrorBanner(formatApiErrorMessage(aRes, errData, "Failed to load audit log."));
+          }
+          setAuditEvents([]);
+          setAuditTotal(0);
+          setAuditHasMore(false);
+        }
+      } catch (err) {
+        if (err instanceof DOMException && err.name === "AbortError") return;
+        if (epoch === sessionEpochRef.current && seq === historySeqRef.current) {
+          setErrorBanner("Network error loading version & audit history.");
+          setHistoryOpen(false);
+        }
+      } finally {
+        if (epoch === sessionEpochRef.current && seq === historySeqRef.current) {
+          setIsLoadingHistory(false);
+        }
+      }
+    },
+    [activeDoc, apiHeaders, canReadAudit, handleUnauthorized],
+  );
+
+  const handleLoadMoreVersions = useCallback(async () => {
+    if (!activeDoc || isLoadingMoreVersions || !versionsHasMore) return;
+    const epoch = sessionEpochRef.current;
+    const targetDocId = activeDoc.documentId;
+    setIsLoadingMoreVersions(true);
     try {
-      const res = await fetch(`/api/documents/${encodeURIComponent(activeDoc.documentId)}/export/${kind}`, {
-        method: "POST",
-        credentials: "include",
-        headers: apiHeaders,
-      });
+      const offset = versions.length;
+      const res = await fetch(
+        `/api/documents/${encodeURIComponent(targetDocId)}/versions?limit=100&offset=${offset}&order=desc`,
+        { credentials: "include", headers: apiHeaders },
+      );
+      if (epoch !== sessionEpochRef.current || activeDocIdRef.current !== targetDocId) return;
       if (res.status === 401) {
         handleUnauthorized();
         return;
       }
-      if (!res.ok) {
-        const data = await safeReadJson(res);
-        const msg = formatApiErrorMessage(res, data, `${kind.toUpperCase()} export failed`);
-        setErrorBanner(msg);
-        setStatusMessage(msg);
-        return;
-      }
-      const blob = await res.blob();
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = `${activeDoc.documentId}-rev${activeDoc.revision}.${kind}`;
-      a.click();
-      // Defer object URL revocation so Safari & slow download managers finish streaming cleanly (M14)
-      window.setTimeout(() => URL.revokeObjectURL(url), 60_000);
-      setStatusMessage(`Exported ${kind.toUpperCase()} snapshot (rev ${activeDoc.revision}).`);
-    } catch {
-      setErrorBanner(`Network error during ${kind.toUpperCase()} export.`);
+      if (!res.ok) return;
+      const vData = await safeReadJson(res);
+      if (epoch !== sessionEpochRef.current || activeDocIdRef.current !== targetDocId) return;
+      const nextPage = (vData.versions ?? []) as DocumentVersion[];
+      const seen = new Set(versions.map((v) => v.versionId));
+      const merged = [...versions, ...nextPage.filter((v) => !seen.has(v.versionId))];
+      const total = typeof vData.total === "number" ? vData.total : versionsTotal ?? merged.length;
+      const hasMore =
+        typeof vData.hasMore === "boolean"
+          ? vData.hasMore
+          : nextPage.length > 0 && merged.length < total;
+      setVersions(merged);
+      setVersionsTotal(total);
+      setVersionsHasMore(hasMore);
     } finally {
-      setIsExporting(null);
+      if (epoch === sessionEpochRef.current) {
+        setIsLoadingMoreVersions(false);
+      }
     }
-  }
+  }, [activeDoc, apiHeaders, handleUnauthorized, isLoadingMoreVersions, versions, versionsHasMore, versionsTotal]);
 
-  async function openHistory() {
-    if (!activeDoc) return;
-    historyAbortRef.current?.abort();
-    const controller = new AbortController();
-    historyAbortRef.current = controller;
-    const seq = ++historySeqRef.current;
-
-    setErrorBanner(null);
-    setHistoryOpen(true);
-    setIsLoadingHistory(true);
+  const handleLoadMoreAudit = useCallback(async () => {
+    if (!activeDoc || !canReadAudit || isLoadingMoreAudit || !auditHasMore) return;
+    const epoch = sessionEpochRef.current;
+    const targetDocId = activeDoc.documentId;
+    setIsLoadingMoreAudit(true);
     try {
-      const [vRes, aRes] = await Promise.all([
-        fetch(`/api/documents/${encodeURIComponent(activeDoc.documentId)}/versions`, {
-          credentials: "include",
-          headers: apiHeaders,
-          signal: controller.signal,
-        }),
-        fetch(`/api/documents/${encodeURIComponent(activeDoc.documentId)}/audit`, {
-          credentials: "include",
-          headers: apiHeaders,
-          signal: controller.signal,
-        }),
-      ]);
-      if (seq !== historySeqRef.current) return;
-      if (vRes.status === 401 || aRes.status === 401) {
-        setHistoryOpen(false);
+      const offset = auditEvents.length;
+      const res = await fetch(
+        `/api/documents/${encodeURIComponent(targetDocId)}/audit?limit=100&offset=${offset}`,
+        { credentials: "include", headers: apiHeaders },
+      );
+      if (epoch !== sessionEpochRef.current || activeDocIdRef.current !== targetDocId) return;
+      if (res.status === 401) {
         handleUnauthorized();
         return;
       }
-      if (!vRes.ok || !aRes.ok) {
-        const badRes = !vRes.ok ? vRes : aRes;
-        const errData = await safeReadJson(badRes);
-        setErrorBanner(formatApiErrorMessage(badRes, errData, "Failed to load version & audit history."));
-        setHistoryOpen(false);
-        return;
-      }
-      const vData = await safeReadJson(vRes);
-      const aData = await safeReadJson(aRes);
-      if (seq !== historySeqRef.current) return;
-      setVersions((vData.versions ?? []) as DocumentVersion[]);
-      setAuditEvents((aData.events ?? []) as AuditEvent[]);
-    } catch (err) {
-      if (err instanceof DOMException && err.name === "AbortError") return;
-      if (seq === historySeqRef.current) {
-        setErrorBanner("Network error loading version & audit history.");
-        setHistoryOpen(false);
-      }
+      if (!res.ok) return;
+      const aData = await safeReadJson(res);
+      if (epoch !== sessionEpochRef.current || activeDocIdRef.current !== targetDocId) return;
+      const nextPage = (aData.events ?? []) as AuditEvent[];
+      const seen = new Set(auditEvents.map((e) => e.auditId));
+      const merged = [...auditEvents, ...nextPage.filter((e) => !seen.has(e.auditId))];
+      const total = typeof aData.total === "number" ? aData.total : auditTotal ?? merged.length;
+      const hasMore =
+        typeof aData.hasMore === "boolean"
+          ? aData.hasMore
+          : nextPage.length > 0 && merged.length < total;
+      setAuditEvents(merged);
+      setAuditTotal(total);
+      setAuditHasMore(hasMore);
     } finally {
-      if (seq === historySeqRef.current) {
-        setIsLoadingHistory(false);
+      if (epoch === sessionEpochRef.current) {
+        setIsLoadingMoreAudit(false);
       }
     }
-  }
+  }, [activeDoc, apiHeaders, auditEvents, auditHasMore, auditTotal, canReadAudit, handleUnauthorized, isLoadingMoreAudit]);
 
   const handleCompareRevision = useCallback(
     async (fromRev: number, toRev: number): Promise<RevisionDiffPayload | null> => {
@@ -764,63 +1199,104 @@ export function App() {
   const handleRestore = useCallback(
     async (revision: number) => {
       if (!activeDoc || readOnly || restoringRevision !== null) return;
-      if (!confirmDiscardUnsavedChanges(`restore revision ${revision}`)) return;
+      const targetDocId = activeDoc.documentId;
+      const epoch = sessionEpochRef.current;
+      const controller = new AbortController();
+      mutationAbortRef.current = controller;
       setErrorBanner(null);
       setRestoringRevision(revision);
       try {
         const res = await fetch(
-          `/api/documents/${encodeURIComponent(activeDoc.documentId)}/versions/${revision}/restore`,
+          `/api/documents/${encodeURIComponent(targetDocId)}/versions/${revision}/restore`,
           {
             method: "POST",
             credentials: "include",
-            headers: apiHeaders,
+            headers: { "Content-Type": "application/json", ...apiHeaders },
+            signal: controller.signal,
+            body: JSON.stringify({ expectedRevision: activeDoc.revision }),
           },
         );
+        if (epoch !== sessionEpochRef.current || activeDocIdRef.current !== targetDocId) return;
         if (res.status === 401) {
           setHistoryOpen(false);
           handleUnauthorized();
           return;
         }
         const data = await safeReadJson(res);
+        if (epoch !== sessionEpochRef.current || activeDocIdRef.current !== targetDocId) return;
+        if (res.status === 409) {
+          const msg = String(
+            data.error ??
+              `Revision conflict: expected rev ${activeDoc.revision}, but the document was modified elsewhere.`,
+          );
+          setConflictMessage(msg);
+          setHistoryOpen(false);
+          setStatusMessage("Restore blocked by revision conflict (409).");
+          return;
+        }
         if (res.ok) {
           const restored = data.document as StudioDocument;
           setActiveDoc(restored);
           clearDrafts();
+          setEditorSyncVersion((v) => v + 1);
           setConflictMessage(null);
           setHistoryOpen(false);
           await loadDocuments();
+          if (epoch !== sessionEpochRef.current) return;
           setStatusMessage(`Restored revision ${revision} as new revision ${restored.revision}.`);
         } else {
           const msg = formatApiErrorMessage(res, data, "Restore failed");
           setErrorBanner(msg);
           setStatusMessage(msg);
         }
-      } catch {
-        setErrorBanner("Network error restoring document revision.");
+      } catch (err) {
+        if (err instanceof DOMException && err.name === "AbortError") return;
+        if (epoch === sessionEpochRef.current && activeDocIdRef.current === targetDocId) {
+          setErrorBanner("Network error restoring document revision.");
+        }
       } finally {
-        setRestoringRevision(null);
+        if (epoch === sessionEpochRef.current) {
+          setRestoringRevision(null);
+        }
       }
     },
-    [activeDoc, readOnly, restoringRevision, confirmDiscardUnsavedChanges, apiHeaders, handleUnauthorized, clearDrafts, loadDocuments],
+    [activeDoc, readOnly, restoringRevision, apiHeaders, handleUnauthorized, clearDrafts, loadDocuments],
   );
 
   function handleSelectDocument(nextDoc: StudioDocument) {
     if (activeDoc?.documentId === nextDoc.documentId) return;
     if (!confirmDiscardUnsavedChanges("switch documents")) return;
+    reloadAbortRef.current?.abort();
+    reloadSeqRef.current += 1;
+    activeDocIdRef.current = nextDoc.documentId;
     setActiveDoc(nextDoc);
+    setSelection({ selectedText: "" });
     clearDrafts();
     setConflictMessage(null);
   }
 
   function handlePrototypeRoleChange(nextRole: WorkspaceRole) {
     if (!confirmDiscardUnsavedChanges(`switch role to ${nextRole}`)) return;
+    clearDrafts();
+    setEditorSyncVersion((v) => v + 1);
+    setConflictMessage(null);
     setPrototypeRole(nextRole);
   }
 
-  const handleAiDocumentUpdated = useCallback(async () => {
-    clearDrafts();
-    await loadDocuments({ forceSyncActive: true });
-  }, [clearDrafts, loadDocuments]);
+  const handleAiDocumentUpdated = useCallback(
+    async (updatedDoc?: StudioDocument) => {
+      clearDrafts();
+      setEditorSyncVersion((v) => v + 1);
+      setConflictMessage(null);
+      if (updatedDoc) {
+        activeDocIdRef.current = updatedDoc.documentId;
+        setActiveDoc(updatedDoc);
+        setDocs((prev) => prev.map((d) => (d.documentId === updatedDoc.documentId ? updatedDoc : d)));
+      }
+      await loadDocuments({ forceSyncActive: !updatedDoc });
+    },
+    [clearDrafts, loadDocuments],
+  );
 
   const handleCloseHistory = useCallback(() => {
     historyAbortRef.current?.abort();
@@ -854,87 +1330,452 @@ export function App() {
   const hasPrevPage = docOffset > 0;
   const hasNextPage = docOffset + PAGE_SIZE < totalDocs;
 
+  const studioLabelMap: Record<string, string> = {
+    spreadsheets: "Spreadsheets",
+    presentations: "Presentations",
+    analytics: "Intelligence BI",
+  };
+
+  const navGroups = useMemo<NavFixedHeaderGroup[]>(() => {
+    const readOnlyTooltip = !canReadDocs
+      ? `Governance role (${effectiveRole}): document reading and writing are disabled.`
+      : effectiveRole === "reviewer"
+        ? "Read-only role (Reviewer): creating, importing, editing, and saving documents are disabled."
+        : effectiveRole === "viewer"
+          ? "Read-only role (Viewer): creating, importing, editing, saving, and exporting are disabled."
+          : "Read-only role active: document mutations are disabled.";
+    const noDocTooltip = "Select or create a document first.";
+    const exportTooltip = !activeDoc
+      ? noDocTooltip
+      : !canExport
+        ? "Role lacks export permission (export:export); Reviewer or Editor role required."
+        : isExporting !== null
+          ? "Another export is already in progress."
+          : undefined;
+    const saveTooltip = readOnly
+      ? readOnlyTooltip
+      : !hasUnsavedChanges
+        ? "No unsaved changes to save."
+        : isSaving
+          ? "Saving changes..."
+          : "Save current changes (Ctrl+S / Cmd+S)";
+
+    return [
+      {
+        id: "files",
+        label: "Files & Docs",
+        shortTag: "FD",
+        subHeaders: [
+          {
+            id: "all_docs",
+            label: docsDrawerOpen ? "Hide Document List" : "All Documents",
+            badge: String(totalDocs),
+            active: docsDrawerOpen,
+            title: docsDrawerOpen ? "Collapse workspace documents drawer" : "Show workspace documents drawer",
+            onSelect: () => {
+              setActiveStudio("documents");
+              setDocsDrawerOpen((v) => !v);
+              setMobileNavOpen(false);
+            },
+          },
+          {
+            id: "new_blank",
+            label: "+ New Blank",
+            disabled: readOnly,
+            title: readOnly ? readOnlyTooltip : "Create a new blank English, Khmer, or bilingual document",
+            onSelect: () => {
+              setActiveStudio("documents");
+              setNewDocError(null);
+              setNewDocModalOpen(true);
+              setMobileNavOpen(false);
+            },
+          },
+          {
+            id: "seed_bilingual",
+            label: isSeeding ? "Creating..." : "Bilingual Sample",
+            disabled: readOnly || isSeeding,
+            title: readOnly ? readOnlyTooltip : "Load the bilingual EN/KM management report fixture",
+            onSelect: () => {
+              setActiveStudio("documents");
+              setMobileNavOpen(false);
+              void handleSeedBilingual();
+            },
+          },
+          {
+            id: "import_docx",
+            label: isImportingDocx ? "Importing..." : "Import DOCX",
+            disabled: readOnly || isImportingDocx,
+            title: readOnly ? readOnlyTooltip : "Import a .docx file into Document Studio",
+            onSelect: () => {
+              setActiveStudio("documents");
+              setMobileNavOpen(false);
+              fileInputRef.current?.click();
+            },
+          },
+          {
+            id: "save_doc",
+            label: isSaving ? "Saving..." : `Save${hasUnsavedChanges ? " *" : ""}`,
+            disabled: readOnly || !hasUnsavedChanges || isSaving || !(draftTitle ?? activeDoc?.title ?? "").trim(),
+            title: !(draftTitle ?? activeDoc?.title ?? "").trim() && activeDoc ? "Document title cannot be empty." : saveTooltip,
+            onSelect: () => {
+              setMobileNavOpen(false);
+              void handleSave();
+            },
+          },
+          {
+            id: "export_docx",
+            label: isExporting === "docx" ? "Exporting..." : "Export DOCX",
+            disabled: !activeDoc || !canExport || isExporting !== null,
+            title: exportTooltip ?? "Export editable DOCX snapshot",
+            onSelect: () => {
+              setMobileNavOpen(false);
+              void handleExport("docx");
+            },
+          },
+          {
+            id: "export_pdf",
+            label: isExporting === "pdf" ? "Rendering..." : "Export PDF",
+            disabled: !activeDoc || !canExport || isExporting !== null,
+            title: exportTooltip ?? "Render paginated PDF snapshot (HarfBuzz)",
+            onSelect: () => {
+              setMobileNavOpen(false);
+              void handleExport("pdf");
+            },
+          },
+        ],
+      },
+      {
+        id: "layout",
+        label: "Page & Style",
+        shortTag: "PS",
+        subHeaders: [
+          {
+            id: "page_size",
+            label: `Page Size (${effectiveActiveDoc?.layout.size ?? "A4"})`,
+            active: activeSubPanel === "page_size",
+            disabled: !activeDoc,
+            title: !activeDoc ? noDocTooltip : "Configure paper size and margins",
+            onSelect: () => {
+              setActiveStudio("documents");
+              toggleSubPanel("page_size");
+              setMobileNavOpen(false);
+            },
+          },
+          {
+            id: "orientation",
+            label: `Orientation (${effectiveActiveDoc?.layout.orientation ?? "portrait"})`,
+            disabled: readOnly || !effectiveActiveDoc,
+            title: readOnly
+              ? readOnlyTooltip
+              : !effectiveActiveDoc
+                ? noDocTooltip
+                : "Toggle portrait / landscape orientation",
+            onSelect: () => {
+              if (!effectiveActiveDoc) return;
+              setActiveStudio("documents");
+              handleLayoutDraftChange({
+                ...effectiveActiveDoc.layout,
+                orientation: effectiveActiveDoc.layout.orientation === "portrait" ? "landscape" : "portrait",
+              });
+              setMobileNavOpen(false);
+            },
+          },
+          {
+            id: "khmer_fonts",
+            label: "Khmer Fonts & Headers",
+            active: activeSubPanel === "page_fonts",
+            disabled: !activeDoc,
+            title: !activeDoc ? noDocTooltip : "Configure document language, headers, footers, and Khmer fonts",
+            onSelect: () => {
+              setActiveStudio("documents");
+              toggleSubPanel("page_fonts");
+              setMobileNavOpen(false);
+            },
+          },
+          {
+            id: "linked_metrics",
+            label: "Linked Metrics",
+            active: activeSubPanel === "linked_metrics",
+            onSelect: () => {
+              toggleSubPanel("linked_metrics");
+              setMobileNavOpen(false);
+            },
+          },
+        ],
+      },
+      {
+        id: "data",
+        label: "Data & Analytics",
+        shortTag: "DA",
+        subHeaders: [
+          {
+            id: "stage_profile",
+            label: "Stage & Profile",
+            badge: "API",
+            active: activeSubPanel === "data_prep",
+            onSelect: () => {
+              toggleSubPanel("data_prep");
+              setMobileNavOpen(false);
+            },
+          },
+          {
+            id: "certified_metrics",
+            label: "Certified Metrics",
+            badge: "V1",
+            active: activeSubPanel === "certified_metrics",
+            onSelect: () => {
+              toggleSubPanel("certified_metrics");
+              setMobileNavOpen(false);
+            },
+          },
+          {
+            id: "duckdb_spill",
+            label: "DuckDB 1M Spill",
+            badge: "TF-04",
+            active: activeSubPanel === "duckdb_spill",
+            onSelect: () => {
+              toggleSubPanel("duckdb_spill");
+              setMobileNavOpen(false);
+            },
+          },
+        ],
+      },
+      {
+        id: "workflows",
+        label: "Workflows",
+        shortTag: "WF",
+        subHeaders: [
+          {
+            id: "linked_objects",
+            label: "Linked Objects",
+            active: activeSubPanel === "workflow_links",
+            onSelect: () => {
+              toggleSubPanel("workflow_links");
+              setMobileNavOpen(false);
+            },
+          },
+          {
+            id: "reporting_packages",
+            label: "Reporting Packages",
+            badge: "XI-00",
+            active: activeSubPanel === "workflow_packages",
+            onSelect: () => {
+              toggleSubPanel("workflow_packages");
+              setMobileNavOpen(false);
+            },
+          },
+          {
+            id: "outbox_status",
+            label: "Publication Outbox",
+            active: activeSubPanel === "workflow_outbox",
+            onSelect: () => {
+              toggleSubPanel("workflow_outbox");
+              setMobileNavOpen(false);
+            },
+          },
+        ],
+      },
+      {
+        id: "versions",
+        label: "Versions & Audit",
+        shortTag: "VA",
+        subHeaders: [
+          {
+            id: "version_history",
+            label: "Version History",
+            disabled: !activeDoc,
+            active: historyOpen && (historySection === "versions" || historySection === "all"),
+            title: !activeDoc ? noDocTooltip : "Inspect immutable document revisions",
+            onSelect: () => {
+              setMobileNavOpen(false);
+              void openHistory("versions");
+            },
+          },
+          {
+            id: "revision_diff",
+            label: "Revision Diff",
+            disabled: !activeDoc,
+            active: historyOpen && historySection === "diff",
+            title: !activeDoc ? noDocTooltip : "Compare block-level EN/KM changes between revisions",
+            onSelect: () => {
+              setMobileNavOpen(false);
+              void openHistory("diff");
+            },
+          },
+          {
+            id: "audit_trail",
+            label: "Audit Trail",
+            disabled: !activeDoc || !canReadAudit,
+            active: historyOpen && historySection === "audit",
+            title: !activeDoc
+              ? noDocTooltip
+              : !canReadAudit
+                ? "Audit trail requires Reviewer, Editor, Auditor, or Owner permission (audit:read)."
+                : "Review append-only security and edit audit events",
+            onSelect: () => {
+              setMobileNavOpen(false);
+              void openHistory("audit");
+            },
+          },
+          {
+            id: "backup_restore",
+            label: "Backup & Restore",
+            active: activeSubPanel === "backup_restore",
+            onSelect: () => {
+              toggleSubPanel("backup_restore");
+              setMobileNavOpen(false);
+            },
+          },
+        ],
+      },
+      {
+        id: "admin",
+        label: "Admin & Governance",
+        shortTag: "AG",
+        subHeaders: [
+          {
+            id: "role_rbac",
+            label: `Role & RBAC (${effectiveRole})`,
+            active: activeSubPanel === "admin_rbac",
+            onSelect: () => {
+              toggleSubPanel("admin_rbac");
+              setMobileNavOpen(false);
+            },
+          },
+          {
+            id: "ai_voice_policy",
+            label: "AI & Voice Policy",
+            badge: "423",
+            active: activeSubPanel === "admin_policies",
+            onSelect: () => {
+              toggleSubPanel("admin_policies");
+              setMobileNavOpen(false);
+            },
+          },
+          {
+            id: "quotas_jobs",
+            label: "Quotas & Jobs",
+            badge: "PA-00",
+            active: activeSubPanel === "admin_quotas",
+            onSelect: () => {
+              toggleSubPanel("admin_quotas");
+              setMobileNavOpen(false);
+            },
+          },
+          {
+            id: "session_health",
+            label: "Session & Health",
+            active: activeSubPanel === "admin_health",
+            onSelect: () => {
+              toggleSubPanel("admin_health");
+              setMobileNavOpen(false);
+            },
+          },
+        ],
+      },
+    ];
+  }, [
+    docsDrawerOpen,
+    totalDocs,
+    canReadDocs,
+    readOnly,
+    effectiveRole,
+    isSeeding,
+    isImportingDocx,
+    isSaving,
+    hasUnsavedChanges,
+    activeDoc,
+    canExport,
+    canReadAudit,
+    isExporting,
+    effectiveActiveDoc,
+    activeSubPanel,
+    historyOpen,
+    historySection,
+    handleSeedBilingual,
+    handleSave,
+    handleExport,
+    toggleSubPanel,
+    openHistory,
+  ]);
+
+  const titleReadOnlyTooltip = !canReadDocs
+    ? `Governance role (${effectiveRole}): document content access is disabled.`
+    : effectiveRole === "reviewer"
+      ? "Read-only role (Reviewer): title editing and saving are disabled."
+      : effectiveRole === "viewer"
+        ? "Read-only role (Viewer): title editing and saving are disabled."
+        : "Read-only role active: title editing and saving are disabled.";
+
   return (
     <div className="app-shell">
+      {/* Zone 1: Master Top Header — Preserves the 4 Master Studio Headers in place */}
       <header className="topbar">
         <div className="brand">
           <h1 className="brand-title">AI Office Suite</h1>
           <span className="badge">
-            {authMode === "jwt-pg" ? "Document Studio · JWT + PG RLS" : "Document Studio · D1 Prototype"}
+            {authMode === "jwt-pg" ? "JWT + PG RLS" : "Stage 1–3 Prototype"}
           </span>
         </div>
 
         <nav className="studio-tabs" aria-label="Workspace Studios">
-          <button type="button" className="studio-tab active" aria-current="page">
+          <button
+            type="button"
+            className={`studio-tab ${activeStudio === "documents" ? "active" : ""}`}
+            aria-current={activeStudio === "documents" ? "page" : undefined}
+            onClick={() => setActiveStudio("documents")}
+          >
             Document Studio
           </button>
-          {PLANNED_FUTURE_STUDIOS.map((studio) => (
-            <button
-              key={studio.studioId}
-              type="button"
-              className="studio-tab planned"
-              disabled
-              title="Planned for a future phase — gated pending founder approval"
-            >
-              {studio.studioId.charAt(0).toUpperCase() + studio.studioId.slice(1)} (Planned)
-            </button>
-          ))}
+          {PLANNED_FUTURE_STUDIOS.map((studio) => {
+            const tabId = studio.studioId as ActiveStudioId;
+            const isActive = activeStudio === tabId;
+            const descId = `studio-planned-desc-${studio.studioId}`;
+            return (
+              <div key={studio.studioId} className="studio-tab-wrap">
+                <button
+                  type="button"
+                  className={`studio-tab studio-tab-gated ${isActive ? "active" : ""}`}
+                  aria-current={isActive ? "page" : undefined}
+                  aria-describedby={descId}
+                  aria-description="Planned — Local Stage 1–3 engine verified; interactive studio UI planned for S2/S3"
+                  title="Local Stage 1–3 engine verified; interactive studio UI planned for S2/S3"
+                  onClick={() => setActiveStudio(tabId)}
+                >
+                  <span>{studioLabelMap[studio.studioId] ?? studio.studioId}</span>
+                  <span className="studio-tab-tag" aria-hidden="true">
+                    Planned
+                  </span>
+                </button>
+                <span id={descId} className="visually-hidden">
+                  Planned — Local Stage 1–3 engine verified; interactive studio UI planned for S2/S3
+                </span>
+              </div>
+            );
+          })}
         </nav>
 
         <div className="topbar-controls">
-          {bootState === "ready" && isAuthenticated && (
-            <button
-              type="button"
-              className="btn mobile-drawer-toggle"
-              aria-expanded={sidebarOpen}
-              onClick={() => setSidebarOpen((v) => !v)}
-            >
-              {sidebarOpen ? "Hide Docs" : "Documents"}
-            </button>
-          )}
-          {authMode === "jwt-pg" ? (
-            sessionActor ? (
-              <>
-                <span className="badge badge-ok" title={`Tenant ${sessionActor.tenantId}`}>
-                  Role: {sessionActor.role}
-                </span>
-                <button type="button" className="btn" onClick={() => void handleLogout(false)}>
-                  Sign Out
-                </button>
-                <button
-                  type="button"
-                  className="btn"
-                  title="Increment token_version to revoke all active sessions"
-                  onClick={() => void handleLogout(true)}
-                >
-                  Revoke All
-                </button>
-              </>
-            ) : (
-              <span className="badge badge-warn">Not Signed In</span>
-            )
-          ) : (
-            <label className="role-selector-label">
-              Role:&nbsp;
-              <select
-                className="btn"
-                value={prototypeRole}
-                onChange={(e) => handlePrototypeRoleChange(e.target.value as WorkspaceRole)}
-              >
-                <option value="editor">Editor</option>
-                <option value="owner">Owner</option>
-                <option value="reviewer">Reviewer (Read-Only + Export)</option>
-                <option value="viewer">Viewer (Read-Only)</option>
-              </select>
-            </label>
-          )}
           <button
             type="button"
-            className="btn"
-            aria-expanded={panelOpen}
-            onClick={() => setPanelOpen((v) => !v)}
+            className="btn mobile-nav-toggle"
+            aria-expanded={mobileNavOpen}
+            aria-controls="workspace-left-rail"
+            onClick={() => setMobileNavOpen((v) => !v)}
           >
-            {panelOpen ? "Hide AI Panel" : "Show AI Panel"}
+            {mobileNavOpen ? "Close Menu" : "Sections"}
+          </button>
+          <button
+            type="button"
+            className={`badge topbar-role-pill ${readOnly ? "is-readonly" : ""}`}
+            title="Open Role & RBAC controls in Governance"
+            onClick={() => {
+              setOpenFixedHeader("admin");
+              toggleSubPanel("admin_rbac");
+              setMobileNavOpen(false);
+            }}
+          >
+            Role: {effectiveRole}
           </button>
         </div>
       </header>
@@ -1046,82 +1887,31 @@ export function App() {
           </form>
         </main>
       ) : (
-        <>
-          <div className="toolbar" role="toolbar" aria-label="Workspace Actions">
-            <button
-              type="button"
-              className="btn primary"
-              disabled={readOnly}
-              onClick={() => {
-                setNewDocError(null);
-                setNewDocModalOpen(true);
-              }}
-            >
-              + New Document
-            </button>
-            <button
-              type="button"
-              className="btn"
-              disabled={readOnly || isSeeding}
-              onClick={() => void handleSeedBilingual()}
-            >
-              {isSeeding ? "Creating..." : "+ Bilingual EN/KM Sample"}
-            </button>
-            <button
-              type="button"
-              className="btn"
-              disabled={readOnly || isImportingDocx}
-              onClick={() => fileInputRef.current?.click()}
-            >
-              {isImportingDocx ? "Importing DOCX..." : "Import DOCX"}
-            </button>
-            <input
-              ref={fileInputRef}
-              type="file"
-              accept=".docx"
-              aria-label="Import DOCX file"
-              className="visually-hidden"
-              onChange={(e) => void handleDocxFileSelected(e)}
-            />
-            <button
-              type="button"
-              className="btn"
-              disabled={readOnly || !hasUnsavedChanges || isSaving}
-              title="Save current changes (Ctrl+S / Cmd+S)"
-              onClick={() => void handleSave()}
-            >
-              {isSaving ? "Saving..." : `Save${hasUnsavedChanges ? " *" : ""}`}
-            </button>
-            <button type="button" className="btn" disabled={!activeDoc} onClick={() => void openHistory()}>
-              Versions &amp; Audit
-            </button>
-            <button
-              type="button"
-              className="btn"
-              disabled={!activeDoc || !canExport || isExporting !== null}
-              title={!canExport ? "Viewers cannot export files; Reviewer or Editor role required." : undefined}
-              onClick={() => void handleExport("docx")}
-            >
-              {isExporting === "docx" ? "Exporting DOCX..." : "Export DOCX"}
-            </button>
-            <button
-              type="button"
-              className="btn"
-              disabled={!activeDoc || !canExport || isExporting !== null}
-              title={!canExport ? "Viewers cannot export files; Reviewer or Editor role required." : undefined}
-              onClick={() => void handleExport("pdf")}
-            >
-              {isExporting === "pdf" ? "Rendering PDF..." : "Export PDF"}
-            </button>
-          </div>
+        <div className={`workspace-shell ${docsDrawerOpen && activeStudio === "documents" ? "docs-drawer-open" : ""}`}>
+          {/* Hidden DOCX file input triggered via Files & Docs -> Import DOCX */}
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept=".docx"
+            aria-label="Import DOCX file"
+            className="visually-hidden"
+            onChange={(e) => void handleDocxFileSelected(e)}
+          />
 
-          <div
-            className={`workspace-body ${panelOpen ? "" : "panel-collapsed"} ${sidebarOpen ? "" : "sidebar-collapsed"}`}
-          >
-            {sidebarOpen && (
-              <aside className="sidebar" aria-label="Workspace Documents">
-                <div className="panel-header-row">
-                  <strong className="sidebar-title">Documents ({totalDocs})</strong>
+          {/* Zone 2: Left Fixed-Header Rail with Animated Vertical Downward Sub-Header Dropdowns */}
+          <LeftNavRail
+            groups={navGroups}
+            openHeaderId={openFixedHeader}
+            onToggleHeader={setOpenFixedHeader}
+            mobileOpen={mobileNavOpen}
+          />
+
+          {/* Optional Left Document Explorer (toggled via Files & Docs -> All Documents) */}
+          {docsDrawerOpen && activeStudio === "documents" && (
+            <aside className="sidebar" aria-label="Workspace Documents">
+              <div className="panel-header-row">
+                <strong className="sidebar-title">Documents ({totalDocs})</strong>
+                <div className="row-actions-tight">
                   <button
                     type="button"
                     className="btn btn-compact"
@@ -1130,173 +1920,235 @@ export function App() {
                   >
                     {isLoadingDocs ? "..." : "Refresh"}
                   </button>
-                </div>
-                <div className="sidebar-filters">
-                  <input
-                    type="search"
-                    className="input-field input-compact"
-                    placeholder="Search title..."
-                    aria-label="Search documents by title"
-                    value={searchQuery}
-                    onChange={(e) => {
-                      setSearchQuery(e.target.value);
-                      setDocOffset(0);
-                    }}
-                  />
-                  <select
-                    className="input-field input-compact"
-                    aria-label="Filter documents by language"
-                    value={languageFilter}
-                    onChange={(e) => {
-                      setLanguageFilter(e.target.value as "" | "en" | "km" | "bilingual");
-                      setDocOffset(0);
-                    }}
+                  <button
+                    type="button"
+                    className="btn btn-compact"
+                    aria-label="Collapse documents drawer"
+                    onClick={() => setDocsDrawerOpen(false)}
                   >
-                    <option value="">All Languages</option>
-                    <option value="bilingual">Bilingual (EN/KM)</option>
-                    <option value="en">English</option>
-                    <option value="km">ខ្មែរ (Khmer)</option>
-                  </select>
+                    ✕
+                  </button>
                 </div>
-                {isLoadingDocs && docs.length === 0 && (
-                  <div className="muted-text" role="status">
-                    Loading documents...
-                  </div>
-                )}
-                {!isLoadingDocs && docs.length === 0 && (
-                  <div className="muted-text">
-                    {searchQuery || languageFilter
-                      ? "No matching documents found."
-                      : 'No documents yet. Click "+ New Document" or "+ Bilingual EN/KM Sample".'}
-                  </div>
-                )}
-                {docs.map((d) => {
-                  const isSelected = activeDoc?.documentId === d.documentId;
-                  return (
-                    <button
-                      key={d.documentId}
-                      type="button"
-                      aria-current={isSelected ? "true" : undefined}
-                      className={`doc-item ${isSelected ? "selected" : ""}`}
-                      onClick={() => handleSelectDocument(d)}
-                    >
-                      <div className="strong-text">{d.title}</div>
-                      <div className="meta-caption">
-                        Rev {d.revision} · {d.language} · {d.layout.size}
-                      </div>
-                    </button>
-                  );
-                })}
-                {totalDocs > PAGE_SIZE && (
-                  <div className="pagination-bar" role="navigation" aria-label="Document pagination">
-                    <span className="meta-caption">
-                      {pageStart}–{pageEnd} of {totalDocs}
-                    </span>
-                    <div className="row-actions-tight">
-                      <button
-                        type="button"
-                        className="btn btn-compact"
-                        disabled={!hasPrevPage || isLoadingDocs}
-                        onClick={() => setDocOffset((prev) => Math.max(0, prev - PAGE_SIZE))}
-                      >
-                        Prev
-                      </button>
-                      <button
-                        type="button"
-                        className="btn btn-compact"
-                        disabled={!hasNextPage || isLoadingDocs}
-                        onClick={() => setDocOffset((prev) => prev + PAGE_SIZE)}
-                      >
-                        Next
-                      </button>
-                    </div>
-                  </div>
-                )}
-              </aside>
-            )}
-
-            <main className="canvas-area">
-              {effectiveActiveDoc && activeDoc ? (
-                <>
-                  <div className="doc-meta-bar" aria-label="Document Settings">
-                    <input
-                      type="text"
-                      className="input-field"
-                      disabled={readOnly}
-                      aria-label="Document title"
-                      value={effectiveActiveDoc.title}
-                      onChange={(e) => setDraftTitle(e.target.value)}
-                    />
-                    <select
-                      className="btn"
-                      disabled={readOnly}
-                      aria-label="Document language"
-                      value={effectiveActiveDoc.language}
-                      onChange={(e) => setDraftLanguage(e.target.value as StudioDocument["language"])}
-                    >
-                      <option value="bilingual">Bilingual</option>
-                      <option value="en">English</option>
-                      <option value="km">ខ្មែរ</option>
-                    </select>
-                    <select
-                      className="btn"
-                      disabled={readOnly}
-                      aria-label="Page size"
-                      value={effectiveActiveDoc.layout.size}
-                      onChange={(e) =>
-                        setDraftLayout({
-                          ...effectiveActiveDoc.layout,
-                          size: e.target.value as "A4" | "Letter",
-                        })
-                      }
-                    >
-                      <option value="A4">A4</option>
-                      <option value="Letter">Letter</option>
-                    </select>
-                    <select
-                      className="btn"
-                      disabled={readOnly}
-                      aria-label="Page orientation"
-                      value={effectiveActiveDoc.layout.orientation}
-                      onChange={(e) =>
-                        setDraftLayout({
-                          ...effectiveActiveDoc.layout,
-                          orientation: e.target.value as "portrait" | "landscape",
-                        })
-                      }
-                    >
-                      <option value="portrait">Portrait</option>
-                      <option value="landscape">Landscape</option>
-                    </select>
-                  </div>
-                  <ErrorBoundary scopeLabel="Document Editor">
-                    <DocumentEditor
-                      ref={editorRef}
-                      document={effectiveActiveDoc}
-                      tiptapContent={tiptapContent}
-                      readOnly={readOnly}
-                      onDirtyChange={setEditorDirty}
-                      onSelectionChange={setSelection}
-                    />
-                  </ErrorBoundary>
-                </>
-              ) : (
-                <div className="preview-card welcome-card">
-                  <strong>Welcome to AI Office Suite</strong>
-                  <span>
-                    Create a new document, import a <code>.docx</code> file, or load the bilingual English &amp; Khmer
-                    fixture to test Tiptap editing, controlled AI operations, mock voice commands (<code>isMock: true</code>),
-                    revision diffs, and HarfBuzz PDF export.
-                  </span>
+              </div>
+              <div className="sidebar-filters">
+                <input
+                  type="search"
+                  maxLength={120}
+                  className="input-field input-compact"
+                  placeholder="Search title..."
+                  aria-label="Search documents by title"
+                  value={searchQuery}
+                  onChange={(e) => {
+                    setSearchQuery(e.target.value);
+                    setDocOffset(0);
+                  }}
+                />
+                <select
+                  className="input-field input-compact"
+                  aria-label="Filter documents by language"
+                  value={languageFilter}
+                  onChange={(e) => {
+                    setLanguageFilter(e.target.value as "" | "en" | "km" | "bilingual");
+                    setDocOffset(0);
+                  }}
+                >
+                  <option value="">All Languages</option>
+                  <option value="bilingual">Bilingual (EN/KM)</option>
+                  <option value="en">English</option>
+                  <option value="km">ខ្មែរ (Khmer)</option>
+                </select>
+              </div>
+              {isLoadingDocs && docs.length === 0 && (
+                <div className="muted-text" role="status">
+                  Loading documents...
                 </div>
               )}
-            </main>
+              {!isLoadingDocs && docs.length === 0 && (
+                <div className="muted-text">
+                  {searchQuery || languageFilter
+                    ? "No matching documents found."
+                    : 'No documents yet. Open "Files & Docs" on the left to create or seed a sample.'}
+                </div>
+              )}
+              {docs.map((d) => {
+                const isSelected = activeDoc?.documentId === d.documentId;
+                return (
+                  <button
+                    key={d.documentId}
+                    type="button"
+                    aria-current={isSelected ? "true" : undefined}
+                    className={`doc-item ${isSelected ? "selected" : ""}`}
+                    onClick={() => handleSelectDocument(d)}
+                  >
+                    <div className="strong-text">{d.title}</div>
+                    <div className="meta-caption">
+                      Rev {d.revision} · {d.language} · {d.layout.size}
+                    </div>
+                  </button>
+                );
+              })}
+              {totalDocs > PAGE_SIZE && (
+                <div className="pagination-bar" role="navigation" aria-label="Document pagination">
+                  <span className="meta-caption">
+                    {pageStart}–{pageEnd} of {totalDocs}
+                  </span>
+                  <div className="row-actions-tight">
+                    <button
+                      type="button"
+                      className="btn btn-compact"
+                      disabled={!hasPrevPage || isLoadingDocs}
+                      onClick={() => setDocOffset((prev) => Math.max(0, prev - PAGE_SIZE))}
+                    >
+                      Prev
+                    </button>
+                    <button
+                      type="button"
+                      className="btn btn-compact"
+                      disabled={!hasNextPage || isLoadingDocs}
+                      onClick={() => setDocOffset((prev) => prev + PAGE_SIZE)}
+                    >
+                      Next
+                    </button>
+                  </div>
+                </div>
+              )}
+            </aside>
+          )}
 
-            {panelOpen && activeDoc && (
+          {/* Zone 3: Center Workspace (Studio Canvas + Contextual Sub-Panels + Integrated AI & Voice Dock) */}
+          <main className="center-workspace" aria-label="Center Workspace">
+            <div ref={scrollStageRef} className="workspace-scroll-stage">
+              <WorkspaceSubPanel
+                panelId={activeSubPanel}
+                onClose={() => setActiveSubPanel(null)}
+                authMode={authMode}
+                sessionActor={sessionActor}
+                prototypeRole={prototypeRole}
+                readOnly={readOnly}
+                activeDoc={effectiveActiveDoc}
+                apiHeaders={apiHeaders}
+                onRoleChange={handlePrototypeRoleChange}
+                onLogout={handleLogout}
+                onLayoutChange={handleLayoutDraftChange}
+                onLanguageChange={handleLanguageDraftChange}
+                onUnauthorized={handleUnauthorized}
+              />
+
+              {activeStudio === "documents" ? (
+                effectiveActiveDoc && activeDoc ? (
+                  <>
+                    <div className="doc-meta-bar" aria-label="Document Settings">
+                      <input
+                        type="text"
+                        maxLength={200}
+                        className="input-field"
+                        disabled={readOnly}
+                        aria-label="Document title"
+                        title={readOnly ? titleReadOnlyTooltip : "Edit document title"}
+                        value={effectiveActiveDoc.title}
+                        onChange={(e) => handleTitleDraftChange(e.target.value)}
+                      />
+                      <span className="meta-caption">
+                        Rev {effectiveActiveDoc.revision} · {effectiveActiveDoc.language} ·{" "}
+                        {effectiveActiveDoc.layout.size} {effectiveActiveDoc.layout.orientation}
+                      </span>
+                      {readOnly && <span className="badge badge-readonly">Read-Only ({effectiveRole})</span>}
+                      {isExporting && (
+                        <span className="badge badge-warn" role="status">
+                          {isExporting === "docx" ? "Exporting DOCX..." : "Rendering PDF..."}
+                        </span>
+                      )}
+                      <button
+                        type="button"
+                        className="btn primary btn-compact"
+                        disabled={readOnly || !hasUnsavedChanges || isSaving || !effectiveActiveDoc.title.trim()}
+                        title={
+                          readOnly
+                            ? titleReadOnlyTooltip
+                            : !effectiveActiveDoc.title.trim()
+                              ? "Document title cannot be empty."
+                              : !hasUnsavedChanges
+                                ? "No unsaved changes to save."
+                                : isSaving
+                                  ? "Saving changes..."
+                                  : "Save current changes (Ctrl+S / Cmd+S)"
+                        }
+                        onClick={() => void handleSave()}
+                      >
+                        {isSaving ? "Saving..." : `Save${hasUnsavedChanges ? " *" : ""}`}
+                      </button>
+                    </div>
+                    <ErrorBoundary scopeLabel="Document Editor">
+                      <DocumentEditor
+                        key={activeDoc.documentId}
+                        ref={editorRef}
+                        document={effectiveActiveDoc}
+                        tiptapContent={tiptapContent}
+                        readOnly={readOnly}
+                        effectiveRole={effectiveRole}
+                        syncVersion={editorSyncVersion}
+                        onDirtyChange={setEditorDirty}
+                        onEditMutation={handleEditMutation}
+                        onSelectionChange={handleSelectionChange}
+                      />
+                    </ErrorBoundary>
+                  </>
+                ) : (
+                  <div className="preview-card welcome-card">
+                    <strong>Welcome to AI Office Suite</strong>
+                    <span>
+                      Click <strong>Files &amp; Docs</strong> in the left fixed-header rail to create a blank document,
+                      import a <code>.docx</code> file, or load the bilingual English &amp; Khmer report.
+                    </span>
+                  </div>
+                )
+              ) : (
+                <div className="preview-card studio-engine-card">
+                  <div className="panel-header-row">
+                    <strong>
+                      {activeStudio === "spreadsheets" && "Spreadsheet Studio (SS-00 Local Engine Verified · S2 UI Gated)"}
+                      {activeStudio === "presentations" && "Presentation Studio (PS-00 Local Engine Verified · S3 UI Gated)"}
+                      {activeStudio === "analytics" && "Intelligence Studio BI (BI-00 Local Engine Verified · S3 UI Gated)"}
+                    </strong>
+                    <span className="badge badge-warn">Engine Verified · UI Gated</span>
+                  </div>
+                  <p className="muted-text">
+                    {activeStudio === "spreadsheets" &&
+                      "Deterministic 19-function prototype evaluator, protected formula guards, exceljs XLSX round-trip, and OWASP CSV safety are verified in tests/d1-spreadsheet-feasibility.test.ts. Production grid selection (Univer vs Handsontable+HyperFormula) awaits TF-03 / APPROVAL-04."}
+                    {activeStudio === "presentations" &&
+                      "Canonical StudioPresentation model, pptxgenjs native OOXML export, speaker-note disclosure controls (RC-T03), keyboard delivery order (RC-T04), and HarfBuzz PDF rendering are verified in tests/g1-ps00-presentation-feasibility.test.ts. Interactive slide editor is scheduled for Milestone S3."}
+                    {activeStudio === "analytics" &&
+                      "Shared ChartSpec, Apache ECharts SSR visuals, DataScopePolicy row/column isolation, and FIN-POL-V1 cross-studio reconciliation ($150k Net Sales / $40k Operating Profit / 26.67% Margin) are verified in tests/g1-bi00-intelligence-feasibility.test.ts. Interactive BI canvas is scheduled for Milestone S3."}
+                  </p>
+                  <div className="row-actions">
+                    <button
+                      type="button"
+                      className="btn primary"
+                      onClick={() => setActiveStudio("documents")}
+                    >
+                      Return to Document Studio
+                    </button>
+                    <button
+                      type="button"
+                      className="btn"
+                      onClick={() => setActiveSubPanel("certified_metrics")}
+                    >
+                      Inspect Certified FIN-POL-V1 Metrics
+                    </button>
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {/* Integrated AI & Voice Assistant Dock inside the Center Workspace */}
+            {activeDoc && activeStudio === "documents" && (
               <AiVoicePanel
+                variant="dock"
+                defaultCompact={true}
                 documentId={activeDoc.documentId}
                 revision={activeDoc.revision}
                 readOnly={readOnly}
+                hasUnsavedChanges={hasUnsavedChanges}
                 selectionBlockId={selection.blockId}
                 selectedText={selection.selectedText}
                 selectionGraphemeCount={selection.graphemeCount}
@@ -1308,8 +2160,8 @@ export function App() {
                 apiHeaders={apiHeaders}
               />
             )}
-          </div>
-        </>
+          </main>
+        </div>
       )}
 
       <footer className="statusbar">
@@ -1339,24 +2191,27 @@ export function App() {
       )}
 
       {historyOpen && (
-        <Suspense
-          fallback={
-            <div className="drawer-backdrop" role="dialog" aria-modal="true" aria-label="Loading history drawer">
-              <div className="drawer-panel">
-                <div className="preview-card" role="status">
-                  Loading version &amp; audit drawer...
-                </div>
-              </div>
-            </div>
-          }
-        >
+        <Suspense fallback={<DrawerLoadingFallback onClose={handleCloseHistory} />}>
           <LazyVersionAuditDrawer
             versions={versions}
             auditEvents={auditEvents}
             currentRevision={activeDoc?.revision}
+            initialSection={historySection}
             readOnly={readOnly}
+            canReadAudit={canReadAudit}
+            hasUnsavedChanges={hasUnsavedChanges}
+            effectiveRole={effectiveRole}
             isLoading={isLoadingHistory}
             restoringRevision={restoringRevision}
+            versionsTotal={versionsTotal}
+            versionsHasMore={versionsHasMore}
+            isLoadingMoreVersions={isLoadingMoreVersions}
+            onLoadMoreVersions={() => void handleLoadMoreVersions()}
+            auditTotal={auditTotal}
+            auditHasMore={auditHasMore}
+            isLoadingMoreAudit={isLoadingMoreAudit}
+            onLoadMoreAudit={() => void handleLoadMoreAudit()}
+            restoreFocusElRef={drawerTriggerElRef}
             onRestore={handleRestore}
             onCompareRevision={handleCompareRevision}
             onClose={handleCloseHistory}

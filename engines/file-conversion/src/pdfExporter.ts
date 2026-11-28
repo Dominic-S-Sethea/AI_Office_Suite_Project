@@ -34,7 +34,7 @@ function findInSystemPath(binaryNames: string[]): string | null {
 }
 
 export function detectChromiumBinary(): string | null {
-  for (const envKey of ["CHROMIUM_PATH", "CHROME_PATH", "PUPPETEER_EXECUTABLE_PATH"] as const) {
+  for (const envKey of ["CHROMIUM_PATH", "CHROMIUM_EXECUTABLE_PATH", "CHROME_PATH", "PUPPETEER_EXECUTABLE_PATH"] as const) {
     const envPath = process.env[envKey]?.trim();
     if (envPath && existsSync(envPath)) return envPath;
   }
@@ -44,6 +44,8 @@ export function detectChromiumBinary(): string | null {
       ? [
           "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe",
           "C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe",
+          "C:\\Program Files (x86)\\Microsoft\\EdgeCore\\Optimized\\msedge.exe",
+          "C:\\Program Files\\Microsoft\\EdgeCore\\Optimized\\msedge.exe",
           "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
           "C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe",
         ]
@@ -100,20 +102,31 @@ const SAFE_CSS_NAMED_COLORS = new Set([
 export const PDF_RENDER_CSP_META =
   `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; font-src data:; img-src data:;" />`;
 
-export const HARDENED_CHROMIUM_BASE_ARGS: readonly string[] = [
-  "--headless=new",
-  "--disable-gpu",
-  "--disable-dev-shm-usage",
-  "--no-sandbox",
-  "--no-first-run",
-  "--disable-extensions",
-  "--disable-background-networking",
-  "--disable-sync",
-  "--disable-default-apps",
-  "--disable-component-update",
-  "--metrics-recording-only",
-  "--proxy-server=http://127.0.0.1:0",
-];
+export function buildHardenedChromiumArgs(env: NodeJS.ProcessEnv = process.env): string[] {
+  const args = [
+    "--headless=new",
+    "--disable-gpu",
+    "--disable-dev-shm-usage",
+    "--no-first-run",
+    "--disable-extensions",
+    "--disable-background-networking",
+    "--disable-sync",
+    "--disable-default-apps",
+    "--disable-component-update",
+    "--metrics-recording-only",
+    "--proxy-server=http://127.0.0.1:0",
+    "--proxy-bypass-list=<-loopback>",
+    "--host-resolver-rules=MAP * ~NOTFOUND",
+  ];
+  if (env.CHROMIUM_NO_SANDBOX === "true") {
+    args.splice(3, 0, "--no-sandbox");
+  }
+  return args;
+}
+
+export const HARDENED_CHROMIUM_BASE_ARGS: readonly string[] = buildHardenedChromiumArgs({
+  CHROMIUM_NO_SANDBOX: "false",
+});
 
 /**
  * Builds a minimal, secret-free environment for untrusted-content child processes (Chromium, etc.)
@@ -136,6 +149,15 @@ export function buildSanitizedSubprocessEnv(tmpDir: string): NodeJS.ProcessEnv {
     if (process.env.LOCALAPPDATA) env.LOCALAPPDATA = tmpDir;
   }
   return env;
+}
+
+export function cleanupTempDirBestEffort(dirPath: string): void {
+  try {
+    rmSync(dirPath, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+  } catch {
+    // Sandboxed Chromium child helpers on Windows may briefly hold locks on user-data-dir files;
+    // ignore transient cleanup errors so a valid PDF/PNG export is never discarded.
+  }
 }
 
 export function sanitizeCssColor(raw: unknown): string | null {
@@ -166,11 +188,16 @@ export function sanitizeCssFontFamily(raw: unknown): string | null {
   return cleaned;
 }
 
+const MAX_SAFE_IMAGE_DATA_URI_LENGTH = 8 * 1024 * 1024;
+
 export function sanitizeSafeImageDataUri(raw: unknown): string | null {
   if (typeof raw !== "string") return null;
   const trimmed = raw.trim();
-  // Strictly permit raster base64 data URIs only; reject http(s), file, javascript, and svg+xml
-  if (!/^data:image\/(png|jpeg|jpg|webp|gif);base64,[A-Za-z0-9+/=\s]+$/i.test(trimmed)) {
+  if (!trimmed || trimmed.length > MAX_SAFE_IMAGE_DATA_URI_LENGTH) {
+    return null;
+  }
+  // Strictly permit single-line raster base64 data URIs only; reject whitespace, http(s), file, javascript, and svg+xml
+  if (!/^data:image\/(png|jpeg|jpg|webp|gif);base64,[A-Za-z0-9+/=]+$/i.test(trimmed)) {
     return null;
   }
   return trimmed;
@@ -231,7 +258,17 @@ function renderBlockHtml(block: DocumentBlock): string {
         .map((row, idx) => {
           const cellTag = block.hasHeaderRow && idx === 0 ? "th" : "td";
           const cells = row
-            .map((cell) => `<${cellTag}>${renderRunsHtml(cell.runs) || "&nbsp;"}</${cellTag}>`)
+            .map((cell) => {
+              const colspan =
+                typeof cell.colspan === "number" && Number.isFinite(cell.colspan) && cell.colspan > 1
+                  ? ` colspan="${Math.min(20, Math.max(2, Math.trunc(cell.colspan)))}"`
+                  : "";
+              const rowspan =
+                typeof cell.rowspan === "number" && Number.isFinite(cell.rowspan) && cell.rowspan > 1
+                  ? ` rowspan="${Math.min(20, Math.max(2, Math.trunc(cell.rowspan)))}"`
+                  : "";
+              return `<${cellTag}${colspan}${rowspan}>${renderRunsHtml(cell.runs) || "&nbsp;"}</${cellTag}>`;
+            })
             .join("");
           return `<tr>${cells}</tr>`;
         })
@@ -377,6 +414,15 @@ export function countPdfPages(pdfBuffer: Buffer): number {
   return matches ? matches.length : 1;
 }
 
+function formatChromiumSpawnFailure(err: unknown, fallback: string): string {
+  if (!err || typeof err !== "object") return fallback;
+  const e = err as { code?: unknown; stderr?: unknown; message?: unknown };
+  const stderr = typeof e.stderr === "string" ? e.stderr : Buffer.isBuffer(e.stderr) ? e.stderr.toString("utf8") : "";
+  const raw = (stderr || (typeof e.message === "string" ? e.message : "")).replace(/\s+/g, " ").trim();
+  const codePrefix = e.code !== undefined ? `[${String(e.code)}] ` : "";
+  return raw ? `${fallback} ${codePrefix}${raw.slice(0, 240)}` : `${fallback}${codePrefix ? ` ${codePrefix.trim()}` : ""}`;
+}
+
 export async function exportToPdfBuffer(doc: StudioDocument): Promise<PdfExportResult> {
   const browserPath = detectChromiumBinary();
   if (!browserPath) {
@@ -396,17 +442,25 @@ export async function exportToPdfBuffer(doc: StudioDocument): Promise<PdfExportR
     writeFileSync(htmlPath, buildPrintableHtml(doc), "utf8");
     const fileUrl = pathToFileURL(htmlPath).href;
 
-    await execFileAsync(
-      browserPath,
-      [
-        ...HARDENED_CHROMIUM_BASE_ARGS,
-        `--user-data-dir=${userDataDir}`,
-        "--no-pdf-header-footer",
-        `--print-to-pdf=${pdfPath}`,
-        fileUrl,
-      ],
-      { timeout: 25_000, windowsHide: true, env: buildSanitizedSubprocessEnv(tmpDir) },
-    );
+    try {
+      await execFileAsync(
+        browserPath,
+        [
+          ...buildHardenedChromiumArgs(),
+          `--user-data-dir=${userDataDir}`,
+          "--no-pdf-header-footer",
+          `--print-to-pdf=${pdfPath}`,
+          fileUrl,
+        ],
+        { timeout: 25_000, windowsHide: true, env: buildSanitizedSubprocessEnv(tmpDir) },
+      );
+    } catch (err) {
+      throw new PdfExportError(
+        500,
+        "PDF_RENDER_PROCESS_FAILED",
+        formatChromiumSpawnFailure(err, "Headless Chromium PDF export failed."),
+      );
+    }
 
     if (!existsSync(pdfPath)) {
       throw new PdfExportError(500, "PDF_GENERATION_FAILED", "Headless browser exited without creating PDF output.");
@@ -425,7 +479,7 @@ export async function exportToPdfBuffer(doc: StudioDocument): Promise<PdfExportR
       warnings: [],
     };
   } finally {
-    rmSync(tmpDir, { recursive: true, force: true });
+    cleanupTempDirBestEffort(tmpDir);
   }
 }
 
@@ -449,17 +503,25 @@ export async function renderDocumentScreenshot(
   try {
     writeFileSync(htmlPath, buildPrintableHtml(doc), "utf8");
     const fileUrl = pathToFileURL(htmlPath).href;
-    await execFileAsync(
-      browserPath,
-      [
-        ...HARDENED_CHROMIUM_BASE_ARGS,
-        `--user-data-dir=${userDataDir}`,
-        "--window-size=960,1360",
-        `--screenshot=${path.resolve(outputPngPath)}`,
-        fileUrl,
-      ],
-      { timeout: 25_000, windowsHide: true, env: buildSanitizedSubprocessEnv(tmpDir) },
-    );
+    try {
+      await execFileAsync(
+        browserPath,
+        [
+          ...buildHardenedChromiumArgs(),
+          `--user-data-dir=${userDataDir}`,
+          "--window-size=960,1360",
+          `--screenshot=${path.resolve(outputPngPath)}`,
+          fileUrl,
+        ],
+        { timeout: 25_000, windowsHide: true, env: buildSanitizedSubprocessEnv(tmpDir) },
+      );
+    } catch (err) {
+      throw new PdfExportError(
+        500,
+        "SCREENSHOT_PROCESS_FAILED",
+        formatChromiumSpawnFailure(err, "Headless Chromium screenshot failed."),
+      );
+    }
 
     if (!existsSync(outputPngPath)) {
       throw new PdfExportError(500, "SCREENSHOT_FAILED", "Headless browser did not generate screenshot PNG.");
@@ -467,6 +529,6 @@ export async function renderDocumentScreenshot(
     const buf = readFileSync(outputPngPath);
     return { pngPath: outputPngPath, byteLength: buf.byteLength, browserPath };
   } finally {
-    rmSync(tmpDir, { recursive: true, force: true });
+    cleanupTempDirBestEffort(tmpDir);
   }
 }

@@ -13,8 +13,11 @@ import type {
 } from "@ai-office-suite/shared-contracts";
 import {
   exportLogicalBackupSnapshot,
+  initializePaGovernanceSchema,
   initializePostgreSqlSchema,
   NodePgDatabaseAdapter,
+  PA_RLS_TABLES,
+  provisionAppRuntimeLoginRole,
   restoreLogicalBackupSnapshot,
   rollbackMigrationBatch,
   runLocalDataMigration,
@@ -31,6 +34,9 @@ import {
 import { createApiApp } from "../apps/api/src/app.ts";
 
 const LIVE_PG_URL = process.env.TEST_POSTGRES_URL?.trim();
+if (process.env.REQUIRE_LIVE_PG === "true" && !LIVE_PG_URL) {
+  throw new Error("REQUIRE_LIVE_PG=true requires TEST_POSTGRES_URL for d2-live-postgres16-rls.test.ts.");
+}
 const describeLivePg = LIVE_PG_URL ? describe : describe.skip;
 
 const TENANT_ALPHA = "11111111-1111-4111-8111-111111111111";
@@ -78,6 +84,16 @@ describeLivePg("Phase 1 — Real PostgreSQL 16 Verification (RLS, Pooled Isolati
     // Clean slate in target database before schema initialization
     await db.exec(`
       DROP TABLE IF EXISTS
+        pa_invoice_records,
+        pa_usage_ledger,
+        pa_tenant_subscriptions,
+        pa_job_queue,
+        pa_quota_reservations,
+        pa_feature_overrides,
+        pa_invitations,
+        pa_file_objects,
+        pa_retention_policies,
+        pa_plans,
         xi_outbox_events,
         xi_package_approvals,
         xi_reporting_packages,
@@ -91,6 +107,8 @@ describeLivePg("Phase 1 — Real PostgreSQL 16 Verification (RLS, Pooled Isolati
         idempotency_keys,
         document_versions,
         documents,
+        api_rate_limits,
+        revoked_session_tokens,
         memberships,
         workspaces,
         users,
@@ -99,6 +117,7 @@ describeLivePg("Phase 1 — Real PostgreSQL 16 Verification (RLS, Pooled Isolati
       CASCADE;
     `);
     await initializePostgreSqlSchema(db);
+    await initializePaGovernanceSchema(db);
     await initializeIntegrationSchema(db);
 
     const ownerHash = await hashPassword("OwnerPass!2026");
@@ -194,6 +213,8 @@ describeLivePg("Phase 1 — Real PostgreSQL 16 Verification (RLS, Pooled Isolati
     });
 
     const expectedRlsTables = [
+      "organizations",
+      "memberships",
       "workspaces",
       "documents",
       "document_versions",
@@ -207,7 +228,9 @@ describeLivePg("Phase 1 — Real PostgreSQL 16 Verification (RLS, Pooled Isolati
       "xi_reporting_packages",
       "xi_package_approvals",
       "xi_outbox_events",
+      ...PA_RLS_TABLES,
     ];
+    expect(expectedRlsTables).toHaveLength(24);
     const rlsRes = await db.query<{
       relname: string;
       relrowsecurity: boolean;
@@ -230,6 +253,118 @@ describeLivePg("Phase 1 — Real PostgreSQL 16 Verification (RLS, Pooled Isolati
     const readyJson = (await readyRes.json()) as { status: string; checks: { coreForceRlsEnabled: boolean } };
     expect(readyJson.status).toBe("ready");
     expect(readyJson.checks.coreForceRlsEnabled).toBe(true);
+  });
+
+  it("runs end-to-end HTTP /api/ready and document CRUD as non-superuser aios_app with requireNonSuperuserDb", async () => {
+    await provisionAppRuntimeLoginRole(db, {
+      roleName: "aios_app",
+      password: "LiveAppRoleStrong#2026!",
+    });
+    const appUrl = new URL(LIVE_PG_URL!);
+    appUrl.username = "aios_app";
+    appUrl.password = "LiveAppRoleStrong#2026!";
+    const appDb = new NodePgDatabaseAdapter(appUrl.toString());
+    const appInstance = createApiApp({
+      authMode: "jwt-pg",
+      db: appDb,
+      requireNonSuperuserDb: true,
+      rateLimit: { enabled: false },
+    });
+    const appSrv = await new Promise<Server>((resolve) => {
+      const s = appInstance.listen(0, "127.0.0.1", () => resolve(s));
+    });
+    try {
+      const appBaseUrl = `http://127.0.0.1:${(appSrv.address() as AddressInfo).port}`;
+      const ready = await fetch(`${appBaseUrl}/api/ready`);
+      expect(ready.status).toBe(200);
+      const readyBody = (await ready.json()) as {
+        status: string;
+        checks: { currentConnectionLeastPrivilege: boolean; coreForceRlsEnabled: boolean };
+      };
+      expect(readyBody.status).toBe("ready");
+      expect(readyBody.checks.currentConnectionLeastPrivilege).toBe(true);
+
+      const tokAlpha = await fetch(`${appBaseUrl}/api/auth/token`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          email: "editor@alpha.pg16.test",
+          password: "StrongPass!2026",
+          tenantId: TENANT_ALPHA,
+          workspaceId: WS_ALPHA,
+        }),
+      });
+      expect(tokAlpha.status).toBe(200);
+      const { token: alphaJwt } = (await tokAlpha.json()) as { token: string };
+
+      const created = await fetch(`${appBaseUrl}/api/documents`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${alphaJwt}` },
+        body: JSON.stringify({ title: "Non-Superuser App CRUD", language: "en" }),
+      });
+      expect(created.status).toBe(201);
+      const { document } = (await created.json()) as { document: StudioDocument };
+
+      const tokBeta = await fetch(`${appBaseUrl}/api/auth/token`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          email: "owner@beta.pg16.test",
+          password: "BetaOwner!2026",
+          tenantId: TENANT_BETA,
+          workspaceId: WS_BETA,
+        }),
+      });
+      expect(tokBeta.status).toBe(200);
+      const { token: betaJwt } = (await tokBeta.json()) as { token: string };
+
+      const crossRead = await fetch(`${appBaseUrl}/api/documents/${document.documentId}`, {
+        headers: { Authorization: `Bearer ${betaJwt}` },
+      });
+      expect([403, 404]).toContain(crossRead.status);
+
+      // Direct table read/write on api_rate_limits by non-superuser aios_app must fail (SECURITY DEFINER only)
+      await expect(appDb.query("SELECT * FROM api_rate_limits")).rejects.toThrow(/permission denied/i);
+
+      // Two independent API replicas connected as non-superuser aios_app share rate-limit state via PostgreSQL 16
+      const replica1 = createApiApp({
+        authMode: "jwt-pg",
+        db: appDb,
+        requireNonSuperuserDb: true,
+        rateLimit: { enabled: true, store: "postgres", apiMaxPerWindow: 2, windowMs: 60_000 },
+      });
+      const replica2 = createApiApp({
+        authMode: "jwt-pg",
+        db: appDb,
+        requireNonSuperuserDb: true,
+        rateLimit: { enabled: true, store: "postgres", apiMaxPerWindow: 2, windowMs: 60_000 },
+      });
+      const srv1 = await new Promise<Server>((resolve) => {
+        const s = replica1.listen(0, "127.0.0.1", () => resolve(s));
+      });
+      const srv2 = await new Promise<Server>((resolve) => {
+        const s = replica2.listen(0, "127.0.0.1", () => resolve(s));
+      });
+      try {
+        const url1 = `http://127.0.0.1:${(srv1.address() as AddressInfo).port}`;
+        const url2 = `http://127.0.0.1:${(srv2.address() as AddressInfo).port}`;
+
+        const r1 = await fetch(`${url1}/api/documents`, { headers: { Authorization: `Bearer ${alphaJwt}` } });
+        const r2 = await fetch(`${url2}/api/documents`, { headers: { Authorization: `Bearer ${alphaJwt}` } });
+        const r3 = await fetch(`${url1}/api/documents`, { headers: { Authorization: `Bearer ${alphaJwt}` } });
+        expect(r1.status).toBe(200);
+        expect(r1.headers.get("x-ratelimit-store")).toBe("postgres");
+        expect(r2.status).toBe(200);
+        expect(r3.status).toBe(429);
+        expect(r3.headers.get("retry-after")).toBeTruthy();
+      } finally {
+        await new Promise<void>((resolve) => srv1.close(() => resolve()));
+        await new Promise<void>((resolve) => srv2.close(() => resolve()));
+      }
+    } finally {
+      await new Promise<void>((resolve) => appSrv.close(() => resolve()));
+      await appDb.close();
+    }
   });
 
   it("enforces FORCE RLS across reads, joins, cross-tenant writes, pooled transactions, and revokes audit/version tampering", async () => {

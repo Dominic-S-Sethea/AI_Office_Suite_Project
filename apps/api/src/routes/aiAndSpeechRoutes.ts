@@ -1,6 +1,6 @@
 import type { Express, Request } from "express";
 import type { ActorContext } from "@ai-office-suite/shared-contracts";
-import { assertCanPerform } from "@ai-office-suite/authorization";
+import { assertPolicyAllowed } from "@ai-office-suite/authorization";
 import { getSpeechAdapter } from "@ai-office-suite/speech-engine";
 import {
   aiApplyRequestSchema,
@@ -8,6 +8,7 @@ import {
   speechTranscribeRequestSchema,
 } from "@ai-office-suite/validation";
 import type { DocumentGateway } from "../documentGateway.ts";
+import { isValidDocumentIdParam } from "./documentRoutes.ts";
 
 export interface AiAndSpeechRoutesDeps {
   gateway: DocumentGateway;
@@ -19,6 +20,10 @@ export function registerAiAndSpeechRoutes(app: Express, deps: AiAndSpeechRoutesD
 
   app.post("/api/documents/:id/ai/plan", async (req, res, next) => {
     try {
+      if (!isValidDocumentIdParam(req.params.id)) {
+        res.status(400).json({ error: "Invalid document id parameter", code: "INVALID_DOCUMENT_ID" });
+        return;
+      }
       const actor = getActor(req);
       const parsed = aiPlanRequestSchema.safeParse(req.body);
       if (!parsed.success) {
@@ -34,6 +39,10 @@ export function registerAiAndSpeechRoutes(app: Express, deps: AiAndSpeechRoutesD
 
   app.post("/api/documents/:id/ai/apply", async (req, res, next) => {
     try {
+      if (!isValidDocumentIdParam(req.params.id)) {
+        res.status(400).json({ error: "Invalid document id parameter", code: "INVALID_DOCUMENT_ID" });
+        return;
+      }
       const actor = getActor(req);
       const parsed = aiApplyRequestSchema.safeParse(req.body);
       if (!parsed.success) {
@@ -59,7 +68,15 @@ export function registerAiAndSpeechRoutes(app: Express, deps: AiAndSpeechRoutesD
   app.post("/api/speech/transcribe", async (req, res, next) => {
     try {
       const actor = getActor(req);
-      assertCanPerform(actor, "speech", "transcribe");
+      assertPolicyAllowed({
+        actor,
+        resourceTenantId: actor.tenantId,
+        resourceWorkspaceId: actor.workspaceId,
+        resource: "speech",
+        action: "transcribe",
+        source: "voice_command",
+        ...(actor.workspaceVisibility ? { workspaceVisibility: actor.workspaceVisibility } : {}),
+      });
       const parsed = speechTranscribeRequestSchema.safeParse(req.body);
       if (!parsed.success) {
         res.status(400).json({ error: "Invalid speech request", code: "VALIDATION_ERROR", issues: parsed.error.issues });

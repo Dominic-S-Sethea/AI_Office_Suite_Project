@@ -4,10 +4,13 @@ import type {
   RoundingMode,
 } from "@ai-office-suite/shared-contracts";
 import {
+  currencyScaleFor,
   ExactDecimalError,
   parseExactDecimalToMinorUnits,
   roundExactQuotient,
 } from "@ai-office-suite/validation";
+
+export { currencyScaleFor };
 
 export class AnalyticsError extends Error {
   readonly statusCode: number;
@@ -148,10 +151,34 @@ export function convertCurrencyMinorUnits(
   targetCurrency: string,
   rateSpec?: ExchangeRateSpecification,
   roundingMode: RoundingMode = "HALF_UP",
+  sourceScale: number = currencyScaleFor(sourceCurrency),
 ): bigint {
+  if (!Number.isInteger(targetScale) || targetScale < 0 || targetScale > 12) {
+    throw new AnalyticsError(422, "INVALID_PRECISION_SCALE", `Unsupported targetScale '${targetScale}'.`);
+  }
+  if (!Number.isInteger(sourceScale) || sourceScale < 0 || sourceScale > 12) {
+    throw new AnalyticsError(422, "INVALID_PRECISION_SCALE", `Unsupported sourceScale '${sourceScale}'.`);
+  }
+
   const fromNorm = sourceCurrency.trim().toUpperCase();
   const toNorm = targetCurrency.trim().toUpperCase();
-  if (fromNorm === toNorm) return amountMinor;
+  const scaleDiff = targetScale - sourceScale;
+
+  if (fromNorm === toNorm) {
+    if (scaleDiff === 0) return amountMinor;
+    if (scaleDiff > 0) {
+      const scaledSame = amountMinor * pow10BigInt(scaleDiff);
+      if (scaledSame > MAX_ABS_MINOR || scaledSame < -MAX_ABS_MINOR) {
+        throw new AnalyticsError(
+          422,
+          "NUMERIC_OVERFLOW",
+          "Currency rescaling result exceeds configured financial overflow guard.",
+        );
+      }
+      return scaledSame;
+    }
+    return roundQuotientExact(amountMinor, pow10BigInt(-scaleDiff), roundingMode);
+  }
 
   if (
     !rateSpec ||
@@ -173,9 +200,10 @@ export function convertCurrencyMinorUnits(
     throw new AnalyticsError(422, "INVALID_EXCHANGE_RATE", "Exchange rate must be strictly positive.");
   }
 
-  // amountMinor is already in 10^targetScale minor units assuming monetary scale match, scale by rate/10^rateScale
-  void targetScale;
-  const converted = roundQuotientExact(amountMinor * scaledRate, pow10BigInt(rateScale), roundingMode);
+  // Convert source minor units (10^sourceScale) by rate (scaledRate / 10^rateScale) to target minor units (10^targetScale).
+  const numerator = scaleDiff >= 0 ? amountMinor * scaledRate * pow10BigInt(scaleDiff) : amountMinor * scaledRate;
+  const denominator = scaleDiff >= 0 ? pow10BigInt(rateScale) : pow10BigInt(rateScale + -scaleDiff);
+  const converted = roundQuotientExact(numerator, denominator, roundingMode);
   if (converted > MAX_ABS_MINOR || converted < -MAX_ABS_MINOR) {
     throw new AnalyticsError(
       422,
@@ -236,5 +264,144 @@ export function evaluatePrecisionApproaches(): PrecisionBenchmarkComparison {
       "DuckDB DECIMAL(18,2)/DECIMAL(18,2) yields double-precision float ~333.3333333333333; governed metrics use BigInt minor-unit division.",
     exactRatioHalfUp: halfUp.status === "available" ? halfUp.decimalString : "unavailable",
     exactRatioHalfEven: halfEven.status === "available" ? halfEven.decimalString : "unavailable",
+  };
+}
+
+export type MissingValuePolicy = "exclude_nulls" | "error_on_null";
+export type PercentileMethod = "linear_r7" | "nearest_rank";
+
+export interface DescriptiveStatisticsOptions {
+  missingPolicy?: MissingValuePolicy;
+  percentileMethod?: PercentileMethod;
+}
+
+export interface DescriptiveStatisticsResult {
+  count: number;
+  missingCount: number;
+  missingPolicy: MissingValuePolicy;
+  percentileMethod: PercentileMethod;
+  sum: number;
+  mean: number | null;
+  median: number | null;
+  min: number | null;
+  max: number | null;
+  sampleVariance: number | null;
+  sampleStdDev: number | null;
+  populationStdDev: number | null;
+  p25: number | null;
+  p75: number | null;
+  iqr: number | null;
+  outliers: number[];
+}
+
+function computePercentile(sorted: readonly number[], q: number, method: PercentileMethod): number {
+  const n = sorted.length;
+  if (n === 1) return sorted[0]!;
+  if (method === "nearest_rank") {
+    const rank = Math.max(1, Math.min(n, Math.ceil(q * n)));
+    return sorted[rank - 1]!;
+  }
+  // R-7 linear interpolation (NumPy / Excel PERCENTILE.INC standard): h = (n - 1) * q
+  const pos = (n - 1) * q;
+  const lo = Math.floor(pos);
+  const hi = Math.ceil(pos);
+  if (lo === hi) return sorted[lo]!;
+  const frac = pos - lo;
+  return sorted[lo]! + frac * (sorted[hi]! - sorted[lo]!);
+}
+
+/**
+ * Deterministic descriptive statistics with explicit missing-value handling and declared percentile method
+ * (RC-T01 / RC-T02 / ANA-02). Never silently coerces null, undefined, or blank strings to zero.
+ */
+export function computeDescriptiveStatistics(
+  values: readonly (number | string | null | undefined)[],
+  options: DescriptiveStatisticsOptions = {},
+): DescriptiveStatisticsResult {
+  const missingPolicy: MissingValuePolicy = options.missingPolicy ?? "exclude_nulls";
+  const percentileMethod: PercentileMethod = options.percentileMethod ?? "linear_r7";
+
+  const valid: number[] = [];
+  let missingCount = 0;
+
+  for (const raw of values) {
+    if (raw === null || raw === undefined || (typeof raw === "string" && raw.trim() === "")) {
+      missingCount += 1;
+      if (missingPolicy === "error_on_null") {
+        throw new AnalyticsError(
+          422,
+          "MISSING_NUMERIC_VALUE",
+          "Missing or blank value encountered under 'error_on_null' missing-value policy.",
+        );
+      }
+      continue;
+    }
+    const num = typeof raw === "number" ? raw : Number(raw.trim());
+    if (!Number.isFinite(num)) {
+      throw new AnalyticsError(
+        422,
+        "INVALID_NUMERIC_VALUE",
+        `Non-numeric or non-finite value '${String(raw)}' cannot be coerced to zero.`,
+      );
+    }
+    valid.push(num);
+  }
+
+  const count = valid.length;
+  if (count === 0) {
+    return {
+      count: 0,
+      missingCount,
+      missingPolicy,
+      percentileMethod,
+      sum: 0,
+      mean: null,
+      median: null,
+      min: null,
+      max: null,
+      sampleVariance: null,
+      sampleStdDev: null,
+      populationStdDev: null,
+      p25: null,
+      p75: null,
+      iqr: null,
+      outliers: [],
+    };
+  }
+
+  const sorted = [...valid].sort((a, b) => a - b);
+  const sum = sorted.reduce((acc, v) => acc + v, 0);
+  const mean = sum / count;
+  const median = computePercentile(sorted, 0.5, percentileMethod);
+  const p25 = computePercentile(sorted, 0.25, percentileMethod);
+  const p75 = computePercentile(sorted, 0.75, percentileMethod);
+  const iqr = p75 - p25;
+
+  const sqDiffSum = sorted.reduce((acc, v) => acc + (v - mean) ** 2, 0);
+  const sampleVariance = count > 1 ? sqDiffSum / (count - 1) : null;
+  const sampleStdDev = sampleVariance !== null ? Math.sqrt(sampleVariance) : null;
+  const populationStdDev = Math.sqrt(sqDiffSum / count);
+
+  const lowerFence = p25 - 1.5 * iqr;
+  const upperFence = p75 + 1.5 * iqr;
+  const outliers = sorted.filter((v) => v < lowerFence || v > upperFence);
+
+  return {
+    count,
+    missingCount,
+    missingPolicy,
+    percentileMethod,
+    sum,
+    mean,
+    median,
+    min: sorted[0]!,
+    max: sorted[count - 1]!,
+    sampleVariance,
+    sampleStdDev,
+    populationStdDev,
+    p25,
+    p75,
+    iqr,
+    outliers,
   };
 }

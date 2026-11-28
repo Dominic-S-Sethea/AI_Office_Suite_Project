@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { execFile } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import type { Server } from "node:http";
 import type { AddressInfo } from "node:net";
@@ -17,6 +17,7 @@ import {
   withTenantTransaction,
 } from "@ai-office-suite/database";
 import { getJwtSecret, hashPassword, signSessionToken, verifySessionToken } from "@ai-office-suite/identity";
+import { resolveLocalSpeechPython } from "@ai-office-suite/speech-engine";
 import {
   inspectAndExtractOoxmlZip,
   scanForUnsafeAnalyticalInput,
@@ -368,17 +369,35 @@ describe("Wave 2 — Security & Auth Remediation (H1-H5, M11-M13)", () => {
     wavBuf.writeUInt32LE(2, 40);
     writeFileSync(badWav, wavBuf);
 
-    const pyCheck = await execFileAsync("python3", [
-      "-c",
-      `import sys; sys.path.insert(0, 'scripts'); import faster_whisper_worker as w
+    const pyCandidates = [resolveLocalSpeechPython(), "python3", "python", "py"].filter(
+      (cmd): cmd is string => Boolean(cmd),
+    );
+    const pythonCmd = pyCandidates.find((cmd) => {
+      try {
+        execFileSync(cmd, ["--version"], { stdio: "ignore", timeout: 5_000, windowsHide: true });
+        return true;
+      } catch {
+        return false;
+      }
+    });
+    if (!pythonCmd) {
+      if (process.env.CI === "true") {
+        throw new Error("CI=true requires Python to verify faster_whisper_worker.py WAV sample-rate bounds.");
+      }
+      console.warn("DISCLOSURE: Skipping faster_whisper_worker Python WAV check — no Python binary found on host.");
+    } else {
+      const pyCheck = await execFileAsync(pythonCmd, [
+        "-c",
+        `import sys; sys.path.insert(0, 'scripts'); import faster_whisper_worker as w
 try:
   w.load_pcm_wav_16k(sys.argv[1])
   print('UNEXPECTED_OK')
 except ValueError as e:
   print('REJECTED:' + str(e))`,
-      badWav,
-    ]);
-    expect(pyCheck.stdout).toContain("REJECTED:Unsupported WAV sample rate");
+        badWav,
+      ]);
+      expect(pyCheck.stdout).toContain("REJECTED:Unsupported WAV sample rate");
+    }
 
     // M13: Nginx security headers present
     const nginxConf = readFileSync(path.resolve("docker/nginx.conf"), "utf8");

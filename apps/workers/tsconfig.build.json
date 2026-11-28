@@ -1,0 +1,17 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "noEmit": true
+  },
+  "include": [
+    "src/**/*.ts",
+    "../../packages/*/src/**/*.ts",
+    "../../platform/audit/src/**/*.ts",
+    "../../platform/authorization/src/**/*.ts",
+    "../../engines/document/src/**/*.ts",
+    "../../engines/file-conversion/src/**/*.ts",
+    "../../engines/calculation/src/**/*.ts",
+    "../../engines/presentation/src/**/*.ts",
+    "../../engines/data-processing/src/**/*.ts"
+  ]
+}

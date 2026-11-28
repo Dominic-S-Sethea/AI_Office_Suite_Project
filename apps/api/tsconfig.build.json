@@ -7,10 +7,14 @@
     "src/**/*.ts",
     "../../packages/*/src/**/*.ts",
     "../../platform/*/src/**/*.ts",
+    "../../engines/calculation/src/**/*.ts",
     "../../engines/data-processing/src/**/*.ts",
     "../../engines/document/src/**/*.ts",
     "../../engines/file-conversion/src/**/*.ts",
+    "../../engines/integration/src/pgPersistence.ts",
+    "../../engines/presentation/src/**/*.ts",
     "../../engines/speech/src/**/*.ts",
-    "../../modules/*/src/**/*.ts"
+    "../../modules/*/src/**/*.ts",
+    "../../apps/workers/src/**/*.ts"
   ]
 }

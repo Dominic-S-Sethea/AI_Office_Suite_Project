@@ -1,4 +1,5 @@
 import pl from "nodejs-polars";
+import { currencyScaleFor, parseExactDecimalToMinorUnits } from "@ai-office-suite/validation";
 import type {
   CustomerMasterRow,
   EngineComparisonRow,
@@ -10,7 +11,11 @@ export function runPolarsComparison(
   salesRows: EngineComparisonRow[],
   customerRows: CustomerMasterRow[],
 ): EngineParityResult {
-  const salesDf = pl.DataFrame(salesRows);
+  const normalizedSalesRows = salesRows.map((r) => ({
+    ...r,
+    currency: String(r.currency ?? "USD").trim().toUpperCase(),
+  }));
+  const salesDf = pl.DataFrame(normalizedSalesRows);
   const custDf = pl.DataFrame(customerRows);
 
   // Detect duplicate customer keys
@@ -44,15 +49,19 @@ export function runPolarsComparison(
     .agg(pl.col("amount").sum().alias("total_amt"));
   const currencyTotals: Record<string, number> = {};
   for (const row of groupedDf.toRecords() as Array<Record<string, unknown>>) {
-    currencyTotals[String(row.currency)] = Math.round(Number(row.total_amt) * 100) / 100;
+    const code = String(row.currency ?? "USD").trim().toUpperCase();
+    currencyTotals[code] = Math.round(Number(row.total_amt) * 100) / 100;
   }
 
   const minorTotalsMap = new Map<string, bigint>();
   for (const row of dedupDf.toRecords() as Array<Record<string, unknown>>) {
     const code = String(row.currency ?? "USD").trim().toUpperCase();
-    const scale = code === "KHR" || code === "JPY" || code === "KRW" || code === "VND" ? 0 : 2;
-    const mult = scale === 0 ? 1 : 100;
-    const minor = BigInt(Math.round(Number(row.amount ?? 0) * mult));
+    const scale = currencyScaleFor(code);
+    const rawAmt = row.amount;
+    const minor =
+      rawAmt === null || rawAmt === undefined
+        ? 0n
+        : parseExactDecimalToMinorUnits(typeof rawAmt === "number" || typeof rawAmt === "string" ? rawAmt : String(rawAmt), scale);
     minorTotalsMap.set(code, (minorTotalsMap.get(code) ?? 0n) + minor);
   }
   const currencyMinorTotals: Record<string, string> = {};
@@ -74,6 +83,10 @@ export function runPolarsComparison(
 }
 
 export function benchmarkPolarsStress(rowCount: number): EngineStressResult {
+  const safeRowCount = Math.trunc(rowCount);
+  if (!Number.isSafeInteger(safeRowCount) || safeRowCount < 1 || safeRowCount > 5_000_000) {
+    throw new RangeError(`benchmarkPolarsStress rowCount must be an integer in [1, 5000000], got ${rowCount}`);
+  }
   const orgs: string[] = [];
   const invs: string[] = [];
   const lines: string[] = [];
@@ -81,7 +94,7 @@ export function benchmarkPolarsStress(rowCount: number): EngineStressResult {
   const currencies: string[] = [];
   const amounts: number[] = [];
 
-  for (let i = 0; i < rowCount; i++) {
+  for (let i = 0; i < safeRowCount; i++) {
     orgs.push("org_1");
     invs.push(`INV-${i % 50000}`);
     lines.push(String((i % 3) + 1));
@@ -120,9 +133,15 @@ export function benchmarkPolarsStress(rowCount: number): EngineStressResult {
   runOnce();
   const rssBefore = process.memoryUsage().rss;
   const samples: number[] = [];
+  let summaryRows: Array<{ currency: string; totalAmt: number }> = [];
   for (let i = 0; i < 3; i++) {
     const t0 = performance.now();
-    runOnce();
+    const recs = runOnce() as Array<{ currency: string; total_amt: number }>;
+    if (i === 2) {
+      summaryRows = recs
+        .map((r) => ({ currency: String(r.currency), totalAmt: Number(r.total_amt) }))
+        .sort((a, b) => a.currency.localeCompare(b.currency));
+    }
     samples.push(performance.now() - t0);
   }
   const rssAfter = process.memoryUsage().rss;
@@ -134,5 +153,6 @@ export function benchmarkPolarsStress(rowCount: number): EngineStressResult {
     p50Ms: Math.round(samples[1]! * 100) / 100,
     p95Ms: Math.round(samples[2]! * 100) / 100,
     rssDeltaMb: Math.round(((rssAfter - rssBefore) / (1024 * 1024)) * 100) / 100,
+    summaryRows,
   };
 }

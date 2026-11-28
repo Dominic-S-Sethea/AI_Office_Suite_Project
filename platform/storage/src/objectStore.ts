@@ -4,6 +4,8 @@ import {
   mkdirSync,
   readFileSync,
   readdirSync,
+  realpathSync,
+  renameSync,
   rmSync,
   statSync,
   writeFileSync,
@@ -59,6 +61,8 @@ export class PrivateObjectStorageError extends Error {
   }
 }
 
+export const DEFAULT_ORPHAN_SWEEP_MIN_AGE_MS = 15 * 60 * 1000;
+
 export interface PrivateObjectStoreAdapter {
   putObject(params: PrivateObjectPutParams): Promise<PrivateObjectPutResult>;
   getObjectBytes(params: {
@@ -68,6 +72,18 @@ export interface PrivateObjectStoreAdapter {
     quarantineState?: FileQuarantineState;
     allowQuarantinedAdmin?: boolean;
   }): Promise<{ bytes: Uint8Array; sha256: string }>;
+  getAuthorizedObjectBytes(params: {
+    token: string;
+    expectedTenantId: string;
+    expectedWorkspaceId: string;
+    expectedObjectId?: string;
+    quarantineState: FileQuarantineState;
+    deletedAt?: string | null;
+    membershipActive?: boolean;
+    allowQuarantinedAdmin?: boolean;
+    consumeOnce?: boolean;
+    nowMs?: number;
+  }): Promise<{ bytes: Uint8Array; sha256: string; payload: SignedObjectTokenPayload }>;
   deleteBlob(storageKey: string): Promise<boolean>;
   issueSignedDownloadToken(params: {
     tenantId: string;
@@ -83,12 +99,33 @@ export interface PrivateObjectStoreAdapter {
     expectedTenantId: string;
     expectedWorkspaceId: string;
     expectedObjectId?: string;
+    consumeOnce?: boolean;
     nowMs?: number;
   }): SignedObjectTokenPayload;
-  sweepOrphanedBlobs(referencedStorageKeys: ReadonlySet<string>): Promise<{ removedKeys: string[]; retainedCount: number }>;
+  sweepOrphanedBlobs(
+    referencedStorageKeys: ReadonlySet<string>,
+    options?: { minAgeMs?: number; nowMs?: number },
+  ): Promise<{ removedKeys: string[]; retainedCount: number; skippedRecentKeys: string[] }>;
   exportSnapshot(): Promise<ObjectStoreSnapshot>;
   restoreSnapshot(snapshot: ObjectStoreSnapshot): Promise<{ restoredCount: number; verifiedSha256Count: number }>;
 }
+
+const VALID_PRIVATE_OBJECT_KEY =
+  /^tenants\/[a-zA-Z0-9_-]{1,128}\/workspaces\/[a-zA-Z0-9_-]{1,128}\/(?:objects\/[a-zA-Z0-9_-]{1,128}\/[a-zA-Z0-9._-]{1,180}|staging(?:\/[a-zA-Z0-9._-]{1,180})+)$/;
+
+function isValidPrivateStorageKey(storageKey: string): boolean {
+  if (
+    storageKey.includes("\0") ||
+    storageKey.includes("..") ||
+    storageKey.startsWith("/") ||
+    storageKey.includes("\\") ||
+    !VALID_PRIVATE_OBJECT_KEY.test(storageKey)
+  ) {
+    return false;
+  }
+  return storageKey.split("/").every((seg) => seg !== "" && seg !== "." && seg !== "..");
+}
+const MAX_CONSUMED_NONCES = 50_000;
 
 const SAFE_SEGMENT = /^[a-zA-Z0-9_-]{1,128}$/;
 
@@ -112,6 +149,7 @@ function assertSafeSegment(value: string, label: string): string {
 export class LocalPrivateObjectStore implements PrivateObjectStoreAdapter {
   private readonly rootDir: string;
   private readonly signingSecret: string;
+  private readonly consumedNonces = new Map<string, number>();
 
   constructor(rootDir: string, signingSecret?: string) {
     this.rootDir = path.resolve(rootDir);
@@ -127,6 +165,23 @@ export class LocalPrivateObjectStore implements PrivateObjectStoreAdapter {
         "PATH_TRAVERSAL_BLOCKED",
         `Storage key escapes private object store root: '${targetPath}'.`,
       );
+    }
+    const realRoot = realpathSync(this.rootDir);
+    let checkPath = resolved;
+    while (!existsSync(checkPath)) {
+      const parent = path.dirname(checkPath);
+      if (parent === checkPath) break;
+      checkPath = parent;
+    }
+    if (existsSync(checkPath)) {
+      const realExisting = realpathSync(checkPath);
+      if (realExisting !== realRoot && !realExisting.startsWith(realRoot + path.sep)) {
+        throw new PrivateObjectStorageError(
+          403,
+          "PATH_TRAVERSAL_BLOCKED",
+          `Storage key resolves via symlink outside private object store root: '${targetPath}'.`,
+        );
+      }
     }
     return resolved;
   }
@@ -226,7 +281,7 @@ export class LocalPrivateObjectStore implements PrivateObjectStoreAdapter {
   }
 
   async deleteBlob(storageKey: string): Promise<boolean> {
-    if (storageKey.includes("..") || storageKey.startsWith("/") || storageKey.includes("\\")) {
+    if (!isValidPrivateStorageKey(storageKey)) {
       throw new PrivateObjectStorageError(403, "PATH_TRAVERSAL_BLOCKED", "Unsafe storage key for deletion.");
     }
     const filePath = this.assertContained(path.join(this.rootDir, storageKey));
@@ -266,6 +321,7 @@ export class LocalPrivateObjectStore implements PrivateObjectStoreAdapter {
     expectedTenantId: string;
     expectedWorkspaceId: string;
     expectedObjectId?: string;
+    consumeOnce?: boolean;
     nowMs?: number;
   }): SignedObjectTokenPayload {
     const parts = params.token.split(".");
@@ -288,7 +344,7 @@ export class LocalPrivateObjectStore implements PrivateObjectStoreAdapter {
     }
 
     const now = params.nowMs ?? Date.now();
-    if (typeof payload.exp !== "number" || now > payload.exp) {
+    if (typeof payload.exp !== "number" || !Number.isFinite(payload.exp) || now > payload.exp) {
       throw new PrivateObjectStorageError(401, "SIGNED_TOKEN_EXPIRED", "Signed object download token has expired.");
     }
     if (
@@ -304,7 +360,77 @@ export class LocalPrivateObjectStore implements PrivateObjectStoreAdapter {
     }
 
     this.assertTenantKeyPrefix(payload.storageKey, payload.tenantId, payload.workspaceId);
+
+    if (params.consumeOnce) {
+      for (const [nonce, exp] of this.consumedNonces.entries()) {
+        if (exp <= now) this.consumedNonces.delete(nonce);
+      }
+      if (!payload.nonce || this.consumedNonces.has(payload.nonce)) {
+        throw new PrivateObjectStorageError(
+          401,
+          "SIGNED_TOKEN_REPLAYED",
+          "Signed object download token has already been used.",
+        );
+      }
+      while (this.consumedNonces.size >= MAX_CONSUMED_NONCES) {
+        const oldestKey = this.consumedNonces.keys().next().value;
+        if (!oldestKey) break;
+        this.consumedNonces.delete(oldestKey);
+      }
+      this.consumedNonces.set(payload.nonce, payload.exp);
+    }
+
     return payload;
+  }
+
+  /**
+   * Authorizes a signed download request against live membership, deletion tombstone,
+   * and quarantine state so revocations and quarantines take effect immediately even mid-TTL (F-21).
+   */
+  async getAuthorizedObjectBytes(params: {
+    token: string;
+    expectedTenantId: string;
+    expectedWorkspaceId: string;
+    expectedObjectId?: string;
+    quarantineState: FileQuarantineState;
+    deletedAt?: string | null;
+    membershipActive?: boolean;
+    allowQuarantinedAdmin?: boolean;
+    consumeOnce?: boolean;
+    nowMs?: number;
+  }): Promise<{ bytes: Uint8Array; sha256: string; payload: SignedObjectTokenPayload }> {
+    const payload = this.verifySignedDownloadToken({
+      token: params.token,
+      expectedTenantId: params.expectedTenantId,
+      expectedWorkspaceId: params.expectedWorkspaceId,
+      ...(params.expectedObjectId !== undefined ? { expectedObjectId: params.expectedObjectId } : {}),
+      ...(params.consumeOnce !== undefined ? { consumeOnce: params.consumeOnce } : {}),
+      ...(params.nowMs !== undefined ? { nowMs: params.nowMs } : {}),
+    });
+    if (params.membershipActive === false) {
+      throw new PrivateObjectStorageError(
+        403,
+        "MEMBERSHIP_REVOKED",
+        "Download denied because caller membership is no longer active.",
+      );
+    }
+    if (params.deletedAt) {
+      throw new PrivateObjectStorageError(
+        404,
+        "OBJECT_DELETED",
+        "Download denied because the target file version has been deleted.",
+      );
+    }
+    const data = await this.getObjectBytes({
+      tenantId: payload.tenantId,
+      workspaceId: payload.workspaceId,
+      storageKey: payload.storageKey,
+      quarantineState: params.quarantineState,
+      ...(params.allowQuarantinedAdmin !== undefined
+        ? { allowQuarantinedAdmin: params.allowQuarantinedAdmin }
+        : {}),
+    });
+    return { ...data, payload };
   }
 
   private walkFiles(dir: string, relBase = ""): string[] {
@@ -325,19 +451,30 @@ export class LocalPrivateObjectStore implements PrivateObjectStoreAdapter {
 
   async sweepOrphanedBlobs(
     referencedStorageKeys: ReadonlySet<string>,
-  ): Promise<{ removedKeys: string[]; retainedCount: number }> {
+    options: { minAgeMs?: number; nowMs?: number } = {},
+  ): Promise<{ removedKeys: string[]; retainedCount: number; skippedRecentKeys: string[] }> {
+    const minAgeMs = Math.max(0, options.minAgeMs ?? DEFAULT_ORPHAN_SWEEP_MIN_AGE_MS);
+    const nowMs = options.nowMs ?? Date.now();
     const allKeys = this.walkFiles(this.rootDir);
     const removedKeys: string[] = [];
+    const skippedRecentKeys: string[] = [];
     let retainedCount = 0;
     for (const key of allKeys) {
       if (!referencedStorageKeys.has(key)) {
+        const full = this.assertContained(path.join(this.rootDir, key));
+        const ageMs = nowMs - statSync(full).mtimeMs;
+        if (ageMs < minAgeMs) {
+          skippedRecentKeys.push(key);
+          retainedCount += 1;
+          continue;
+        }
         await this.deleteBlob(key);
         removedKeys.push(key);
       } else {
         retainedCount += 1;
       }
     }
-    return { removedKeys, retainedCount };
+    return { removedKeys, retainedCount, skippedRecentKeys };
   }
 
   async exportSnapshot(): Promise<ObjectStoreSnapshot> {
@@ -362,13 +499,19 @@ export class LocalPrivateObjectStore implements PrivateObjectStoreAdapter {
   async restoreSnapshot(
     snapshot: ObjectStoreSnapshot,
   ): Promise<{ restoredCount: number; verifiedSha256Count: number }> {
-    let restoredCount = 0;
-    let verifiedSha256Count = 0;
+    const validated: Array<{ storageKey: string; destPath: string; bytes: Buffer }> = [];
     for (const entry of snapshot.entries) {
-      if (entry.storageKey.includes("..") || entry.storageKey.startsWith("/") || entry.storageKey.includes("\\")) {
+      if (!isValidPrivateStorageKey(entry.storageKey)) {
         throw new PrivateObjectStorageError(403, "PATH_TRAVERSAL_BLOCKED", "Unsafe storage key in snapshot.");
       }
       const bytes = Buffer.from(entry.contentBase64, "base64");
+      if (typeof entry.byteSize === "number" && bytes.byteLength !== entry.byteSize) {
+        throw new PrivateObjectStorageError(
+          500,
+          "SNAPSHOT_INTEGRITY_MISMATCH",
+          `Restored blob '${entry.storageKey}' byte size mismatch.`,
+        );
+      }
       const actualSha = createHash("sha256").update(bytes).digest("hex");
       if (actualSha !== entry.sha256) {
         throw new PrivateObjectStorageError(
@@ -377,11 +520,38 @@ export class LocalPrivateObjectStore implements PrivateObjectStoreAdapter {
           `Restored blob '${entry.storageKey}' SHA-256 mismatch.`,
         );
       }
-      const full = this.assertContained(path.join(this.rootDir, entry.storageKey));
-      mkdirSync(path.dirname(full), { recursive: true });
-      writeFileSync(full, bytes);
-      restoredCount += 1;
-      verifiedSha256Count += 1;
+      const keyShaMatch = entry.storageKey.match(/-([0-9a-f]{64})\.bin$/i);
+      if (keyShaMatch && keyShaMatch[1]!.toLowerCase() !== actualSha) {
+        throw new PrivateObjectStorageError(
+          500,
+          "SNAPSHOT_INTEGRITY_MISMATCH",
+          `Restored blob '${entry.storageKey}' filename SHA-256 mismatch.`,
+        );
+      }
+      const destPath = this.assertContained(path.join(this.rootDir, entry.storageKey));
+      validated.push({ storageKey: entry.storageKey, destPath, bytes });
+    }
+
+    const stagingRoot = path.join(this.rootDir, `.restore-tmp-${randomBytes(8).toString("hex")}`);
+    mkdirSync(stagingRoot, { recursive: true });
+    let restoredCount = 0;
+    let verifiedSha256Count = 0;
+    try {
+      const stagedFiles: Array<{ tmpPath: string; destPath: string }> = [];
+      for (let i = 0; i < validated.length; i++) {
+        const item = validated[i]!;
+        const tmpPath = path.join(stagingRoot, `blob-${i}.bin`);
+        writeFileSync(tmpPath, item.bytes, { mode: 0o600 });
+        stagedFiles.push({ tmpPath, destPath: item.destPath });
+      }
+      for (const file of stagedFiles) {
+        mkdirSync(path.dirname(file.destPath), { recursive: true });
+        renameSync(file.tmpPath, file.destPath);
+        restoredCount += 1;
+        verifiedSha256Count += 1;
+      }
+    } finally {
+      rmSync(stagingRoot, { recursive: true, force: true });
     }
     return { restoredCount, verifiedSha256Count };
   }

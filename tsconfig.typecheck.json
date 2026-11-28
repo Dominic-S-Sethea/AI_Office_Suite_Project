@@ -18,6 +18,7 @@
       "@ai-office-suite/presentation-engine": ["./engines/presentation/src/index.ts"],
       "@ai-office-suite/intelligence-engine": ["./engines/intelligence/src/index.ts"],
       "@ai-office-suite/integration-engine": ["./engines/integration/src/index.ts"],
+      "@ai-office-suite/integration-engine/pg-persistence": ["./engines/integration/src/pgPersistence.ts"],
       "@ai-office-suite/document-engine": ["./engines/document/src/index.ts"],
       "@ai-office-suite/document-engine/tiptap-codec": ["./engines/document/src/tiptapCodec.ts"],
       "@ai-office-suite/calculation-engine": ["./engines/calculation/src/index.ts"],
@@ -25,7 +26,8 @@
       "@ai-office-suite/file-conversion": ["./engines/file-conversion/src/index.ts"],
       "@ai-office-suite/speech-engine": ["./engines/speech/src/index.ts"],
       "@ai-office-suite/documents-module": ["./modules/documents/src/index.ts"],
-      "@ai-office-suite/ai-module": ["./modules/ai/src/index.ts"]
+      "@ai-office-suite/ai-module": ["./modules/ai/src/index.ts"],
+      "@ai-office-suite/workers": ["./apps/workers/src/index.ts"]
     }
   },
   "include": [
@@ -34,6 +36,7 @@
     "engines/*/src/**/*.ts",
     "modules/*/src/**/*.ts",
     "apps/api/src/**/*.ts",
+    "apps/workers/src/**/*.ts",
     "apps/web/src/**/*.ts",
     "apps/web/src/**/*.tsx",
     "tests/**/*.ts",

@@ -318,6 +318,10 @@ describe("Phase 6 — Stress, Concurrency & Soak Benchmarks", () => {
       const benchRows = DEEP_STRESS ? 100_000 : 10_000;
       const duck = await benchmarkDuckDbStress(benchRows);
       const polars = benchmarkPolarsStress(benchRows);
+      expect(duck.rowCount).toBe(benchRows);
+      expect(polars.rowCount).toBe(benchRows);
+      expect(duck.summaryRows?.length).toBe(2);
+      expect(polars.summaryRows).toEqual(duck.summaryRows);
 
       console.log(
         "STRESS_WORKLOAD_B:",
@@ -362,6 +366,13 @@ describe("Phase 6 — Stress, Concurrency & Soak Benchmarks", () => {
     );
     const stormMs = Math.round((performance.now() - t0) * 100) / 100;
     expect(outcomes.every((o) => o.status === "rejected")).toBe(true);
+    for (const o of outcomes) {
+      if (o.status === "rejected") {
+        expect(o.reason).toBeInstanceOf(Error);
+        expect(o.reason).not.toBeInstanceOf(TypeError);
+        expect(o.reason).not.toBeInstanceOf(ReferenceError);
+      }
+    }
 
     // BI cache-eviction thrash & immediate revocation enforcement
     const bi = new IntelligenceStudioEngine();

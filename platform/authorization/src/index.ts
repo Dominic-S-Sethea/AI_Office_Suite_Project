@@ -32,6 +32,17 @@ const ORG_SCOPED_RESOURCES: ReadonlySet<PolicyResourceType> = new Set([
   "audit",
 ]);
 
+const ORG_WIDE_AUDIT_ROLES: ReadonlySet<WorkspaceRole> = new Set([
+  "owner",
+  "administrator",
+  "auditor",
+  "billing_admin",
+]);
+
+export function isOrgWideAuditRole(role: WorkspaceRole): boolean {
+  return ORG_WIDE_AUDIT_ROLES.has(role);
+}
+
 const METERED_ACTIONS: ReadonlySet<`${PolicyResourceType}:${PolicyAction}`> = new Set([
   "ai_assistant:read",
   "ai_assistant:apply_ai",
@@ -194,7 +205,6 @@ const ROLE_PERMISSIONS: Record<WorkspaceRole, ReadonlySet<`${ResourceType}:${Per
     "knowledge:read",
     "knowledge:write",
     "audit:read",
-    "metrics:read",
     "speech:transcribe",
     "workspace:read",
     "workspace:manage",
@@ -222,14 +232,12 @@ const ROLE_PERMISSIONS: Record<WorkspaceRole, ReadonlySet<`${ResourceType}:${Per
     "usage:read",
     "entitlement:read",
     "audit:read",
-    "metrics:read",
   ]),
   auditor: new Set([
     "organization:read",
     "workspace:read",
     "membership:read",
     "audit:read",
-    "metrics:read",
     "usage:read",
     "entitlement:read",
     "policy:read",
@@ -320,6 +328,57 @@ export function isWorkspaceRole(value: string): value is WorkspaceRole {
   );
 }
 
+const MANAGEABLE_TARGET_ROLES: Record<WorkspaceRole, ReadonlySet<WorkspaceRole>> = {
+  owner: new Set([
+    "owner",
+    "administrator",
+    "workspace_manager",
+    "billing_admin",
+    "auditor",
+    "editor",
+    "reviewer",
+    "viewer",
+  ]),
+  administrator: new Set([
+    "administrator",
+    "workspace_manager",
+    "billing_admin",
+    "auditor",
+    "editor",
+    "reviewer",
+    "viewer",
+  ]),
+  workspace_manager: new Set(["editor", "reviewer", "viewer"]),
+  billing_admin: new Set([]),
+  auditor: new Set([]),
+  editor: new Set([]),
+  reviewer: new Set([]),
+  viewer: new Set([]),
+};
+
+/**
+ * Enforces strict role-management hierarchy so lower-privileged admins/managers
+ * cannot invite, promote, or offboard roles at or above restricted privilege tiers (F-09).
+ */
+export function canManageTargetRole(actorRole: WorkspaceRole, targetRole: WorkspaceRole): boolean {
+  const manageable = MANAGEABLE_TARGET_ROLES[actorRole];
+  return manageable ? manageable.has(targetRole) : false;
+}
+
+export function assertCanManageTargetRole(
+  actor: ActorContext,
+  targetRole: WorkspaceRole,
+  operation = "manage",
+): void {
+  if (!canManageTargetRole(actor.role, targetRole)) {
+    throw new AuthorizationError(
+      403,
+      "ROLE_HIERARCHY_DENIED",
+      `Role '${actor.role}' is not authorized to ${operation} role '${targetRole}'.`,
+    );
+  }
+}
+
 export function canPerform(
   actor: ActorContext,
   resource: ResourceType,
@@ -389,9 +448,13 @@ export function evaluatePolicyDecision(request: PolicyDecisionRequest): PolicyDe
     };
   }
 
+  const isOrgScopedBypass =
+    ORG_SCOPED_RESOURCES.has(request.resource) &&
+    (request.resource !== "audit" || ORG_WIDE_AUDIT_ROLES.has(request.actor.role));
+
   if (
     request.resourceWorkspaceId &&
-    !ORG_SCOPED_RESOURCES.has(request.resource) &&
+    !isOrgScopedBypass &&
     request.actor.workspaceId !== request.resourceWorkspaceId
   ) {
     return {
@@ -459,7 +522,12 @@ export function evaluatePolicyDecision(request: PolicyDecisionRequest): PolicyDe
     const maxAgeSec = request.mfaMaxAgeSeconds ?? 900;
     const nowMs = Date.parse(evaluatedAt);
     const verifiedMs = request.actor.mfaVerifiedAt ? Date.parse(request.actor.mfaVerifiedAt) : Number.NaN;
-    if (!Number.isFinite(verifiedMs) || nowMs - verifiedMs > maxAgeSec * 1000 || verifiedMs > nowMs + 60_000) {
+    if (
+      !Number.isFinite(nowMs) ||
+      !Number.isFinite(verifiedMs) ||
+      nowMs - verifiedMs > maxAgeSec * 1000 ||
+      verifiedMs > nowMs + 60_000
+    ) {
       return {
         allowed: false,
         denialCategory: "mfa_step_up_required",

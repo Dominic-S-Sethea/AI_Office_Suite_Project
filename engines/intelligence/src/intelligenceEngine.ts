@@ -93,6 +93,9 @@ export interface EvaluatedReportResponse {
   report: StudioReport;
   interactionSeq: number;
   effectiveDepartments: string[];
+  periodStart: string;
+  periodEndExclusive: string;
+  departmentSummaryRows: string[][];
   policyScope: string;
   cacheHit: boolean;
   visualResults: Record<string, EvaluatedVisualResult>;
@@ -113,6 +116,35 @@ export interface BiOperationPlan {
 }
 
 const ALL_SECTION_12_DEPARTMENTS = ["Sales", "Services", "Retail"] as const;
+export const MAX_BI_CACHE_ENTRIES = 500;
+export const MAX_BI_SEQ_ENTRIES = 2_000;
+
+const POLICY_ROLE_RANK: Record<ActorContext["role"], number> = {
+  owner: 6,
+  administrator: 5,
+  workspace_manager: 4,
+  editor: 3,
+  reviewer: 2,
+  viewer: 1,
+  billing_admin: 0,
+  auditor: 0,
+};
+
+function setBoundedLru<K, V>(map: Map<K, V>, key: K, value: V, maxSize: number): void {
+  if (map.has(key)) {
+    map.delete(key);
+  } else if (map.size >= maxSize) {
+    const oldest = map.keys().next().value;
+    if (oldest !== undefined) map.delete(oldest);
+  }
+  map.set(key, value);
+}
+
+function shiftIsoMonth(isoDate: string, monthsDelta: number): string {
+  const [yStr = "2026", mStr = "1", dStr = "1"] = isoDate.split("-");
+  const date = new Date(Date.UTC(Number(yStr), Number(mStr) - 1 + monthsDelta, Number(dStr)));
+  return date.toISOString().slice(0, 10);
+}
 
 export class IntelligenceStudioEngine {
   readonly analytics: BusinessAnalysisEngine;
@@ -157,8 +189,8 @@ export class IntelligenceStudioEngine {
       sha256: createHash("sha256").update(JSON.stringify(SECTION_12_BUDGET_ROWS)).digest("hex"),
       rows: SECTION_12_BUDGET_ROWS,
     });
-    this.datasetRowsByManifest.set(`${tenantId}::${datasetId}::1`, structuredClone(SECTION_12_FINANCE_ROWS));
-    this.budgetRowsByManifest.set(`${tenantId}::${budgetDatasetId}::1`, structuredClone(SECTION_12_BUDGET_ROWS));
+    this.datasetRowsByManifest.set(`${tenantId}::${workspaceId}::${datasetId}::1`, structuredClone(SECTION_12_FINANCE_ROWS));
+    this.budgetRowsByManifest.set(`${tenantId}::${workspaceId}::${budgetDatasetId}::1`, structuredClone(SECTION_12_BUDGET_ROWS));
     return { datasetId, budgetDatasetId };
   }
 
@@ -178,12 +210,17 @@ export class IntelligenceStudioEngine {
       sha256: createHash("sha256").update(JSON.stringify(rows)).digest("hex"),
       rows,
     });
-    this.datasetRowsByManifest.set(`${tenantId}::${datasetId}::${version}`, structuredClone(rows));
+    this.datasetRowsByManifest.set(`${tenantId}::${workspaceId}::${datasetId}::${version}`, structuredClone(rows));
   }
 
-  createManagementReport(actor: ActorContext, opts?: { title?: string }): StudioReport {
+  createManagementReport(
+    actor: ActorContext,
+    opts?: { title?: string; datasetManifestId?: string; datasetVersion?: number },
+  ): StudioReport {
+    this.assertNotRevoked(actor);
     assertCanPerform(actor, "document", "create");
-    const datasetId = `ds_s12_finance_${actor.tenantId}`;
+    const datasetId = opts?.datasetManifestId ?? `ds_s12_finance_${actor.tenantId}`;
+    const datasetVersion = opts?.datasetVersion ?? 1;
     const pages: ReportPage[] = [
       {
         pageId: "page_overview",
@@ -283,29 +320,44 @@ export class IntelligenceStudioEngine {
       semanticModelId: "management-model",
       semanticModelVersion: 1,
       datasetManifestId: datasetId,
-      datasetVersion: 1,
+      datasetVersion,
       sourceAsOfTimestamp: "2026-11-30T23:59:59.000Z",
       lastSuccessfulRefreshAt: now,
       lastComputedAt: now,
       pages,
     };
-    this.reports.set(report.reportId, structuredClone(report));
+    this.reports.set(this.reportKey(report.tenantId, report.workspaceId, report.reportId), structuredClone(report));
     return report;
   }
 
+  private reportKey(tenantId: string, workspaceId: string, reportId: string): string {
+    return `${tenantId}::${workspaceId}::${reportId}`;
+  }
+
+  private snapshotKey(tenantId: string, workspaceId: string, snapshotId: string): string {
+    return `${tenantId}::${workspaceId}::${snapshotId}`;
+  }
+
   saveReport(actor: ActorContext, report: StudioReport): StudioReport {
+    this.assertNotRevoked(actor);
     assertCanPerform(actor, "document", "write");
     assertTenantWorkspaceAccess(actor, report.tenantId, report.workspaceId);
     const next = structuredClone(report);
     next.revision += 1;
-    this.reports.set(next.reportId, next);
+    this.reports.set(this.reportKey(next.tenantId, next.workspaceId, next.reportId), next);
     return structuredClone(next);
   }
 
   getReport(actor: ActorContext, reportId: string): StudioReport {
     this.assertNotRevoked(actor);
-    const rep = this.reports.get(reportId);
+    assertCanPerform(actor, "dashboard", "read");
+    const rep = this.reports.get(this.reportKey(actor.tenantId, actor.workspaceId, reportId));
     if (!rep) {
+      for (const cand of this.reports.values()) {
+        if (cand.reportId === reportId) {
+          assertTenantWorkspaceAccess(actor, cand.tenantId, cand.workspaceId);
+        }
+      }
       throw new IntelligenceEngineError(404, "REPORT_NOT_FOUND", `Report '${reportId}' not found.`);
     }
     assertTenantWorkspaceAccess(actor, rep.tenantId, rep.workspaceId);
@@ -331,14 +383,40 @@ export class IntelligenceStudioEngine {
     }
   }
 
+  private assertActorPolicyMatch(actor: ActorContext, policy: DataScopePolicy): void {
+    if (policy.tenantId !== actor.tenantId) {
+      throw new IntelligenceEngineError(403, "POLICY_TENANT_MISMATCH", "DataScopePolicy tenant mismatch.");
+    }
+    const actorRank = POLICY_ROLE_RANK[actor.role] ?? 0;
+    const policyRank = POLICY_ROLE_RANK[policy.principalRole] ?? 0;
+    if (actorRank <= 0 || policyRank <= 0 || actorRank < policyRank) {
+      throw new IntelligenceEngineError(
+        403,
+        "POLICY_ROLE_MISMATCH",
+        `Principal role '${actor.role}' cannot assume policy for '${policy.principalRole}'.`,
+      );
+    }
+  }
+
   private resolveEffectiveDepartments(
     policy: DataScopePolicy,
     requestedDepartments?: string[],
+    availableRows?: AnalyticalFinanceRow[],
+    actorDepartmentScopes?: string[] | "ALL",
   ): string[] {
-    const allowedSet =
+    const derivedDepts =
+      availableRows && availableRows.length > 0
+        ? Array.from(new Set(availableRows.map((r) => r.department).filter((d) => d.trim().length > 0)))
+        : [...ALL_SECTION_12_DEPARTMENTS];
+    const baseDepts = derivedDepts.length > 0 ? derivedDepts : [...ALL_SECTION_12_DEPARTMENTS];
+    let allowedSet =
       policy.allowedDepartments === "ALL"
-        ? new Set<string>(ALL_SECTION_12_DEPARTMENTS)
+        ? new Set<string>(baseDepts)
         : new Set<string>(policy.allowedDepartments);
+    if (Array.isArray(actorDepartmentScopes)) {
+      const actorAllowed = new Set<string>(actorDepartmentScopes);
+      allowedSet = new Set(Array.from(allowedSet).filter((d) => actorAllowed.has(d)));
+    }
 
     if (!requestedDepartments || requestedDepartments.length === 0) {
       return Array.from(allowedSet);
@@ -367,35 +445,51 @@ export class IntelligenceStudioEngine {
     },
   ): Promise<EvaluatedReportResponse> {
     this.assertNotRevoked(actor);
-    if (policy.tenantId !== actor.tenantId) {
-      throw new IntelligenceEngineError(403, "POLICY_TENANT_MISMATCH", "DataScopePolicy tenant mismatch.");
-    }
+    assertCanPerform(actor, "dashboard", "read");
+    const report = this.getReport(actor, reportId);
+    this.assertActorPolicyMatch(actor, policy);
     if (opts?.abortSignal?.aborted) {
       throw new IntelligenceEngineError(499, "QUERY_CANCELLED", "Analytical dashboard query was cancelled.");
     }
 
-    const report = this.getReport(actor, reportId);
-
-    const seqKey = `${reportId}::${actor.userId}`;
+    const seqKey = `${report.tenantId}::${report.workspaceId}::${reportId}::${actor.userId}`;
     const seq = opts?.interactionSeq ?? 1;
     const prevSeq = this.latestSeqByReportActor.get(seqKey) ?? 0;
     if (seq < prevSeq) {
       throw new IntelligenceEngineError(409, "STALE_INTERACTION_DISCARDED", `Superseded interaction sequence ${seq} < ${prevSeq}.`);
     }
-    this.latestSeqByReportActor.set(seqKey, seq);
+    setBoundedLru(this.latestSeqByReportActor, seqKey, seq, MAX_BI_SEQ_ENTRIES);
 
-    const effectiveDepartments = this.resolveEffectiveDepartments(policy, opts?.requestedDepartments);
+    const baseRows =
+      this.datasetRowsByManifest.get(`${report.tenantId}::${report.workspaceId}::${report.datasetManifestId}::${report.datasetVersion}`) ?? [];
+    const budgetRows =
+      this.budgetRowsByManifest.get(`${report.tenantId}::${report.workspaceId}::ds_s12_budget_${report.tenantId}::1`) ?? [];
+
+    const effectiveDepartments = this.resolveEffectiveDepartments(
+      policy,
+      opts?.requestedDepartments,
+      baseRows,
+      actor.departmentScopes,
+    );
     const periodStart = opts?.periodStart ?? "2026-11-01";
     const periodEndExclusive = opts?.periodEndExclusive ?? "2026-12-01";
+    const trendStart = shiftIsoMonth(periodStart, -1);
+    const activeReportingMonth = periodStart.slice(0, 7);
     const lang = opts?.language ?? "en";
 
-    // Policy-keyed cache preventing cross-role & column-scope cache leaks (BI-T18)
+    // Policy-keyed cache preventing cross-role, cross-report & column-scope cache leaks (BI-T18)
+    const actorDeptScopeKey = Array.isArray(actor.departmentScopes)
+      ? actor.departmentScopes.slice().sort().join(",")
+      : "ALL";
     const cacheKey = [
       actor.tenantId,
       actor.workspaceId,
+      report.reportId,
+      report.revision,
       policy.policyId,
       policy.policyVersion,
       policy.principalRole,
+      actorDeptScopeKey,
       policy.allowedColumns.slice().sort().join(","),
       effectiveDepartments.slice().sort().join(","),
       report.datasetManifestId,
@@ -409,16 +503,12 @@ export class IntelligenceStudioEngine {
 
     const cached = this.policyResultCache.get(cacheKey);
     if (cached && !opts?.chartKindOverride) {
+      setBoundedLru(this.policyResultCache, cacheKey, cached, MAX_BI_CACHE_ENTRIES);
       return { ...structuredClone(cached), interactionSeq: seq, cacheHit: true };
     }
 
-    const baseRows =
-      this.datasetRowsByManifest.get(`${actor.tenantId}::${report.datasetManifestId}::${report.datasetVersion}`) ?? [];
-    const budgetRows =
-      this.budgetRowsByManifest.get(`${actor.tenantId}::ds_s12_budget_${actor.tenantId}::1`) ?? [];
-
     // Materialize a policy+filter scoped ephemeral view in BusinessAnalysisEngine so all FR-05 precision holds
-    const scopedDatasetId = `scoped_${policy.policyId}_${report.reportId}_${seq}`;
+    const scopedDatasetId = `scoped_${policy.policyId}_${report.reportId}_${seq}_${randomUUID().slice(0, 8)}`;
     const deptSet = new Set(effectiveDepartments);
     const scopedRows = baseRows.filter((r) => deptSet.has(r.department));
     const scopedBudgetRows = budgetRows.filter((b) => deptSet.has(b.department));
@@ -443,60 +533,78 @@ export class IntelligenceStudioEngine {
       rows: scopedBudgetRows,
     });
 
-    const runMetric = async (
-      metricId: string,
-      extra?: {
-        groupBy?: string[];
-        comparison?: "none" | "previous_month";
-        operation?: "calculate_metric" | "group_by_dimension" | "budget_vs_actual" | "distinct_count";
-        pStart?: string;
-        pEnd?: string;
-      },
-    ) =>
-      this.analytics.executeQuery(actor, {
-        queryId: `bi_q_${randomUUID().slice(0, 8)}`,
-        idempotencyKey: `bi_idem_${randomUUID()}`,
-        tenantId: actor.tenantId,
-        workspaceId: actor.workspaceId,
-        operation: extra?.operation ?? (extra?.groupBy ? "group_by_dimension" : "calculate_metric"),
-        dataset: { id: scopedDatasetId, version: report.datasetVersion },
-        budgetDataset: extra?.operation === "budget_vs_actual" ? { id: scopedBudgetId, version: 1 } : undefined,
-        metrics: [{ id: metricId }],
-        period: { start: extra?.pStart ?? periodStart, endExclusive: extra?.pEnd ?? periodEndExclusive },
-        comparison: extra?.comparison ?? "none",
-        groupBy: extra?.groupBy,
-        currency: "USD",
-        outputLanguage: lang,
-      });
+    try {
+      const runMetric = async (
+        metricId: string,
+        extra?: {
+          groupBy?: string[];
+          comparison?: "none" | "previous_month";
+          operation?: "calculate_metric" | "group_by_dimension" | "budget_vs_actual" | "distinct_count";
+          pStart?: string;
+          pEnd?: string;
+        },
+      ) =>
+        this.analytics.executeQuery(actor, {
+          queryId: `bi_q_${randomUUID().slice(0, 8)}`,
+          idempotencyKey: `bi_idem_${randomUUID()}`,
+          tenantId: actor.tenantId,
+          workspaceId: actor.workspaceId,
+          operation: extra?.operation ?? (extra?.groupBy ? "group_by_dimension" : "calculate_metric"),
+          dataset: { id: scopedDatasetId, version: report.datasetVersion },
+          budgetDataset: extra?.operation === "budget_vs_actual" ? { id: scopedBudgetId, version: 1 } : undefined,
+          metrics: [{ id: metricId }],
+          period: { start: extra?.pStart ?? periodStart, endExclusive: extra?.pEnd ?? periodEndExclusive },
+          comparison: extra?.comparison ?? "none",
+          groupBy: extra?.groupBy,
+          currency: "USD",
+          outputLanguage: lang,
+        });
 
-    if (effectiveDepartments.length === 0 || scopedRows.length === 0) {
-      const emptyVisuals: Record<string, EvaluatedVisualResult> = {};
-      for (const page of report.pages) {
-        for (const v of page.visuals) {
-          emptyVisuals[v.visualId] = { visualId: v.visualId, state: "empty", metricResults: {} };
+      if (effectiveDepartments.length === 0 || scopedRows.length === 0) {
+        const emptyVisuals: Record<string, EvaluatedVisualResult> = {};
+        for (const page of report.pages) {
+          for (const v of page.visuals) {
+            emptyVisuals[v.visualId] = { visualId: v.visualId, state: "empty", metricResults: {} };
+          }
         }
+        return {
+          report,
+          interactionSeq: seq,
+          effectiveDepartments,
+          periodStart,
+          periodEndExclusive,
+          departmentSummaryRows: [],
+          policyScope: `${policy.policyId}:v${policy.policyVersion}`,
+          cacheHit: false,
+          visualResults: emptyVisuals,
+        };
       }
-      return {
-        report,
-        interactionSeq: seq,
-        effectiveDepartments,
-        policyScope: `${policy.policyId}:v${policy.policyVersion}`,
-        cacheHit: false,
-        visualResults: emptyVisuals,
-      };
-    }
 
-    const [netSales, revGrowth, opProfit, opMargin, netSalesByDept, budgetVar, distinctCust, netSalesByMonth] =
-      await Promise.all([
+      const [
+        netSales,
+        revGrowth,
+        opProfit,
+        opMargin,
+        totalCosts,
+        netSalesByDept,
+        totalCostsByDept,
+        opProfitByDept,
+        budgetVar,
+        distinctCust,
+        netSalesByMonth,
+      ] = await Promise.all([
         runMetric("FIN-NET-SALES"),
         runMetric("FIN-REVENUE-GROWTH", { comparison: "previous_month" }),
         runMetric("FIN-OPERATING-PROFIT"),
         runMetric("FIN-OPERATING-MARGIN"),
+        runMetric("FIN-TOTAL-COSTS"),
         runMetric("FIN-NET-SALES", { groupBy: ["department"] }),
-        runMetric("FIN-BUDGET-VARIANCE", { operation: "budget_vs_actual", groupBy: ["department"] }),
-        runMetric("FIN-DISTINCT-CUSTOMERS", { operation: "distinct_count", groupBy: ["department"] }),
-        runMetric("FIN-NET-SALES", { groupBy: ["reportingMonth"], pStart: "2026-10-01", pEnd: periodEndExclusive }),
-      ]);
+        runMetric("FIN-TOTAL-COSTS", { groupBy: ["department"] }),
+        runMetric("FIN-OPERATING-PROFIT", { groupBy: ["department"] }),
+      runMetric("FIN-BUDGET-VARIANCE", { operation: "budget_vs_actual", groupBy: ["department"] }),
+      runMetric("FIN-DISTINCT-CUSTOMERS", { operation: "distinct_count", groupBy: ["department"] }),
+      runMetric("FIN-NET-SALES", { groupBy: ["reportingMonth"], pStart: trendStart, pEnd: periodEndExclusive }),
+    ]);
 
     const buildBinding = (metricId: string, provenanceId: string) => ({
       datasetId: report.datasetManifestId,
@@ -518,6 +626,32 @@ export class IntelligenceStudioEngine {
         fmt: b.value.displayValue,
       });
     }
+    const deptCostsFmtMap = new Map<string, string>();
+    for (const b of totalCostsByDept.breakdown ?? []) {
+      deptCostsFmtMap.set(b.dimensionValues.department!, b.value.displayValue);
+    }
+    const allowedCols = new Set(policy.allowedColumns);
+    const canSeeGrossSales = allowedCols.has("grossSales");
+    const canSeeCosts = allowedCols.has("cogs") || allowedCols.has("opex");
+
+    const deptProfitFmtMap = new Map<string, string>();
+    for (const b of opProfitByDept.breakdown ?? []) {
+      deptProfitFmtMap.set(b.dimensionValues.department!, b.value.displayValue);
+    }
+    const departmentSummaryRows: string[][] = [
+      ...deptNames.map((dept) => [
+        dept,
+        canSeeGrossSales ? (deptRevenueMap.get(dept)?.fmt ?? "$0.00") : "REDACTED",
+        canSeeCosts ? (deptCostsFmtMap.get(dept) ?? "$0.00") : "REDACTED",
+        canSeeGrossSales && canSeeCosts ? (deptProfitFmtMap.get(dept) ?? "$0.00") : "REDACTED",
+      ]),
+      [
+        `Combined Total (${deptNames.join("+")})`,
+        canSeeGrossSales ? netSales.value.displayValue : "REDACTED",
+        canSeeCosts ? totalCosts.value.displayValue : "REDACTED",
+        canSeeGrossSales && canSeeCosts ? opProfit.value.displayValue : "REDACTED",
+      ],
+    ];
 
     const revChartSpec: ChartSpec = {
       chartId: "chart_dept_revenue",
@@ -555,7 +689,9 @@ export class IntelligenceStudioEngine {
     };
 
     const revBudgetByDept = new Map<string, { val: number; fmt: string }>();
-    for (const b of scopedBudgetRows.filter((row) => row.budgetCategory === "revenue")) {
+    for (const b of scopedBudgetRows.filter(
+      (row) => row.budgetCategory === "revenue" && (!row.reportingMonth || row.reportingMonth === activeReportingMonth),
+    )) {
       const m = parseDecimalToMinorUnits(b.budgetAmount, 2);
       revBudgetByDept.set(b.department, {
         val: Number(m) / 100,
@@ -599,7 +735,7 @@ export class IntelligenceStudioEngine {
       linkedMetricRefs: [budgetVar.linkedMetricReference],
     };
 
-    const months = ["2026-10", "2026-11"];
+    const months = [trendStart.slice(0, 7), activeReportingMonth];
     const monthRevMap = new Map<string, { val: number; fmt: string }>();
     for (const b of netSalesByMonth.breakdown ?? []) {
       monthRevMap.set(b.dimensionValues.reportingMonth!, {
@@ -613,8 +749,8 @@ export class IntelligenceStudioEngine {
       kind: "line",
       titleEn: "Monthly net sales trend",
       titleKm: "និន្នាការចំណូលប្រចាំខែ",
-      altSummaryEn: `Monthly net sales grew ${revGrowth.value.displayValue} from Oct to Nov 2026.`,
-      altSummaryKm: `ចំណូលប្រចាំខែបានកើនឡើង ${revGrowth.value.displayValue} ពីតុលាដល់វិច្ឆិកា ២០២៦។`,
+      altSummaryEn: `Monthly net sales changed ${revGrowth.value.displayValue} from ${months[0]} to ${months[1]}.`,
+      altSummaryKm: `ចំណូលប្រចាំខែ (${months[0]} - ${months[1]}) ប្រែប្រួល ${revGrowth.value.displayValue}។`,
       unit: "currency",
       currency: "USD",
       yAxisStartsAtZero: true,
@@ -648,15 +784,22 @@ export class IntelligenceStudioEngine {
     const trendChartRendered = renderChartSpecToSvg(trendChartSpec, 640, 340, lang);
 
     const visualResults: Record<string, EvaluatedVisualResult> = {
-      vis_kpi_net_sales: {
-        visualId: "vis_kpi_net_sales",
-        state: opts?.simulateInvalidMetric ? "error" : "ready",
-        errorDetail: opts?.simulateInvalidMetric ? "Simulated invalid mandatory metric check." : undefined,
-        metricResults: {
-          "FIN-NET-SALES": netSales,
-          "FIN-REVENUE-GROWTH": revGrowth,
-        },
-      },
+      vis_kpi_net_sales: canSeeGrossSales
+        ? {
+            visualId: "vis_kpi_net_sales",
+            state: opts?.simulateInvalidMetric ? "error" : "ready",
+            errorDetail: opts?.simulateInvalidMetric ? "Simulated invalid mandatory metric check." : undefined,
+            metricResults: {
+              "FIN-NET-SALES": netSales,
+              "FIN-REVENUE-GROWTH": revGrowth,
+            },
+          }
+        : {
+            visualId: "vis_kpi_net_sales",
+            state: "suppressed",
+            errorDetail: "Column 'grossSales' restricted by DataScopePolicy.",
+            metricResults: {},
+          },
       vis_kpi_op_profit: {
         visualId: "vis_kpi_op_profit",
         state: "ready",
@@ -665,30 +808,51 @@ export class IntelligenceStudioEngine {
           "FIN-OPERATING-MARGIN": opMargin,
         },
       },
-      vis_chart_dept_revenue: {
-        visualId: "vis_chart_dept_revenue",
-        state: "ready",
-        metricResults: { "FIN-NET-SALES": netSalesByDept },
-        chartSpec: revChartSpec,
-        svg: revChartRendered.svg,
-        accessibleTableHtml: revChartRendered.accessibleTableHtml,
-      },
-      vis_chart_budget_vs_actual: {
-        visualId: "vis_chart_budget_vs_actual",
-        state: "ready",
-        metricResults: { "FIN-BUDGET-VARIANCE": budgetVar },
-        chartSpec: budgetChartSpec,
-        svg: budgetChartRendered.svg,
-        accessibleTableHtml: budgetChartRendered.accessibleTableHtml,
-      },
-      vis_line_monthly_rev: {
-        visualId: "vis_line_monthly_rev",
-        state: "ready",
-        metricResults: { "FIN-NET-SALES": netSalesByMonth },
-        chartSpec: trendChartSpec,
-        svg: trendChartRendered.svg,
-        accessibleTableHtml: trendChartRendered.accessibleTableHtml,
-      },
+      vis_chart_dept_revenue: canSeeGrossSales
+        ? {
+            visualId: "vis_chart_dept_revenue",
+            state: "ready",
+            metricResults: { "FIN-NET-SALES": netSalesByDept },
+            chartSpec: revChartSpec,
+            svg: revChartRendered.svg,
+            accessibleTableHtml: revChartRendered.accessibleTableHtml,
+          }
+        : {
+            visualId: "vis_chart_dept_revenue",
+            state: "suppressed",
+            errorDetail: "Column 'grossSales' restricted by DataScopePolicy.",
+            metricResults: {},
+          },
+      vis_chart_budget_vs_actual: canSeeGrossSales
+        ? {
+            visualId: "vis_chart_budget_vs_actual",
+            state: "ready",
+            metricResults: { "FIN-BUDGET-VARIANCE": budgetVar },
+            chartSpec: budgetChartSpec,
+            svg: budgetChartRendered.svg,
+            accessibleTableHtml: budgetChartRendered.accessibleTableHtml,
+          }
+        : {
+            visualId: "vis_chart_budget_vs_actual",
+            state: "suppressed",
+            errorDetail: "Column 'grossSales' restricted by DataScopePolicy.",
+            metricResults: {},
+          },
+      vis_line_monthly_rev: canSeeGrossSales
+        ? {
+            visualId: "vis_line_monthly_rev",
+            state: "ready",
+            metricResults: { "FIN-NET-SALES": netSalesByMonth },
+            chartSpec: trendChartSpec,
+            svg: trendChartRendered.svg,
+            accessibleTableHtml: trendChartRendered.accessibleTableHtml,
+          }
+        : {
+            visualId: "vis_line_monthly_rev",
+            state: "suppressed",
+            errorDetail: "Column 'grossSales' restricted by DataScopePolicy.",
+            metricResults: {},
+          },
       vis_table_dept_summary: {
         visualId: "vis_table_dept_summary",
         state: "ready",
@@ -700,40 +864,55 @@ export class IntelligenceStudioEngine {
       report: { ...report, lastComputedAt: new Date().toISOString() },
       interactionSeq: seq,
       effectiveDepartments,
+      periodStart,
+      periodEndExclusive,
+      departmentSummaryRows,
       policyScope: `${policy.policyId}:v${policy.policyVersion}`,
       cacheHit: false,
       visualResults,
     };
 
-    if (!opts?.chartKindOverride) {
-      if (this.policyResultCache.size >= 500) {
-        const oldest = this.policyResultCache.keys().next().value;
-        if (oldest !== undefined) this.policyResultCache.delete(oldest);
+      if (!opts?.chartKindOverride) {
+        setBoundedLru(this.policyResultCache, cacheKey, structuredClone(response), MAX_BI_CACHE_ENTRIES);
       }
-      this.policyResultCache.set(cacheKey, structuredClone(response));
+
+      this.audit?.append({
+        auditId: `aud_${randomUUID()}`,
+        tenantId: actor.tenantId,
+        workspaceId: actor.workspaceId,
+        actorId: actor.userId,
+        actorRole: actor.role,
+        source: "system",
+        action: "bi.evaluate",
+        outcome: "success",
+        summary: `Evaluated report '${report.reportId}' for scope [${effectiveDepartments.join(",")}] (${response.policyScope})`,
+        createdAt: response.report.lastComputedAt,
+      });
+
+      return response;
+    } finally {
+      this.analytics.unregisterDataset(actor.tenantId, actor.workspaceId, scopedDatasetId, report.datasetVersion);
+      this.analytics.unregisterDataset(actor.tenantId, actor.workspaceId, scopedBudgetId, 1);
     }
+  }
 
-    this.audit?.append({
-      auditId: `aud_${randomUUID()}`,
-      tenantId: actor.tenantId,
-      workspaceId: actor.workspaceId,
-      actorId: actor.userId,
-      actorRole: actor.role,
-      source: "system",
-      action: "bi.evaluate",
-      outcome: "success",
-      summary: `Evaluated report '${report.reportId}' for scope [${effectiveDepartments.join(",")}] (${response.policyScope})`,
-      createdAt: response.report.lastComputedAt,
-    });
-
-    return response;
+  getCacheStats(): {
+    policyResultCache: number;
+    latestSeqEntries: number;
+    analytics: ReturnType<BusinessAnalysisEngine["getCacheStats"]>;
+  } {
+    return {
+      policyResultCache: this.policyResultCache.size,
+      latestSeqEntries: this.latestSeqByReportActor.size,
+      analytics: this.analytics.getCacheStats(),
+    };
   }
 
   drillToPermittedDetail(
     actor: ActorContext,
     policy: DataScopePolicy,
     reportId: string,
-    filter: { departments?: string[]; page?: number; pageSize?: number },
+    filter: { departments?: string[]; page?: number; pageSize?: number; reportingMonth?: string; periodStart?: string },
   ): {
     rows: Array<Record<string, unknown>>;
     totalPermittedRows: number;
@@ -741,18 +920,23 @@ export class IntelligenceStudioEngine {
     returnFilterContext: { departments?: string[] };
   } {
     this.assertNotRevoked(actor);
-    if (policy.tenantId !== actor.tenantId) {
-      throw new IntelligenceEngineError(403, "POLICY_TENANT_MISMATCH", "DataScopePolicy tenant mismatch.");
-    }
+    assertCanPerform(actor, "dashboard", "read");
     const report = this.getReport(actor, reportId);
-    const effectiveDepartments = this.resolveEffectiveDepartments(policy, filter.departments);
+    this.assertActorPolicyMatch(actor, policy);
     const baseRows =
-      this.datasetRowsByManifest.get(`${actor.tenantId}::${report.datasetManifestId}::${report.datasetVersion}`) ?? [];
+      this.datasetRowsByManifest.get(`${report.tenantId}::${report.workspaceId}::${report.datasetManifestId}::${report.datasetVersion}`) ?? [];
+    const effectiveDepartments = this.resolveEffectiveDepartments(
+      policy,
+      filter.departments,
+      baseRows,
+      actor.departmentScopes,
+    );
     const allowedDeptSet = new Set(effectiveDepartments);
     const allowedColSet = new Set(policy.allowedColumns);
+    const targetMonth = filter.reportingMonth ?? filter.periodStart?.slice(0, 7) ?? report.sourceAsOfTimestamp.slice(0, 7);
 
     const permitted = baseRows
-      .filter((r) => r.reportingMonth === "2026-11" && allowedDeptSet.has(r.department))
+      .filter((r) => r.status === "posted" && r.reportingMonth === targetMonth && allowedDeptSet.has(r.department))
       .map((r) => {
         const sanitized: Record<string, unknown> = {};
         for (const [k, v] of Object.entries(r)) {
@@ -780,8 +964,10 @@ export class IntelligenceStudioEngine {
     targetManifestVersion: number,
     opts: { idempotencyKey: string; outcome?: "succeeded" | "failed" | "cancelled"; failureReason?: string },
   ): { report: StudioReport; job: RefreshJobRecord } {
+    this.assertNotRevoked(actor);
     assertCanPerform(actor, "document", "write");
-    const existingJob = this.refreshJobs.get(`${actor.tenantId}::${opts.idempotencyKey}`);
+    const jobKey = `${actor.tenantId}::${actor.workspaceId}::${opts.idempotencyKey}`;
+    const existingJob = this.refreshJobs.get(jobKey);
     const report = this.getReport(actor, reportId);
     if (existingJob) {
       return { report, job: structuredClone(existingJob) };
@@ -812,8 +998,8 @@ export class IntelligenceStudioEngine {
       report.staleWarning = `STALE_MANIFEST_RETAINED: Refresh ${outcome} (${job.error}); displaying last certified v${report.datasetVersion}.`;
     }
 
-    this.reports.set(report.reportId, structuredClone(report));
-    this.refreshJobs.set(`${actor.tenantId}::${opts.idempotencyKey}`, structuredClone(job));
+    this.reports.set(this.reportKey(report.tenantId, report.workspaceId, report.reportId), structuredClone(report));
+    this.refreshJobs.set(jobKey, structuredClone(job));
     return { report, job };
   }
 
@@ -824,15 +1010,35 @@ export class IntelligenceStudioEngine {
     idempotencyKey: string,
   ): PublishedBiSnapshot {
     this.assertNotRevoked(actor);
-    if (policy.tenantId !== actor.tenantId) {
-      throw new IntelligenceEngineError(403, "POLICY_TENANT_MISMATCH", "DataScopePolicy tenant mismatch.");
-    }
     assertTenantWorkspaceAccess(actor, evaluated.report.tenantId, evaluated.report.workspaceId);
+    this.assertActorPolicyMatch(actor, policy);
+    const expectedScope = `${policy.policyId}:v${policy.policyVersion}`;
+    if (evaluated.policyScope !== expectedScope) {
+      throw new IntelligenceEngineError(403, "POLICY_SCOPE_MISMATCH", `Evaluated response scope '${evaluated.policyScope}' does not match actor policy '${expectedScope}'.`);
+    }
+    if (policy.allowedDepartments !== "ALL") {
+      const policyAllowedDepts = new Set(policy.allowedDepartments);
+      if (evaluated.effectiveDepartments.some((d) => !policyAllowedDepts.has(d))) {
+        throw new IntelligenceEngineError(403, "POLICY_SCOPE_MISMATCH", "Evaluated response departments exceed policy scope.");
+      }
+    }
+    if (Array.isArray(actor.departmentScopes)) {
+      const actorAllowedDepts = new Set(actor.departmentScopes);
+      if (evaluated.effectiveDepartments.some((d) => !actorAllowedDepts.has(d))) {
+        throw new IntelligenceEngineError(403, "POLICY_SCOPE_MISMATCH", "Evaluated response departments exceed actor department scopes.");
+      }
+    }
     if (!policy.canPublish) {
       throw new IntelligenceEngineError(403, "PUBLISH_FORBIDDEN", "Actor policy lacks publication permission.");
     }
     const existing = Array.from(this.snapshots.values()).find(
-      (s) => s.tenantId === actor.tenantId && s.reportId === evaluated.report.reportId && s.filterContext.policyId === policy.policyId && s.snapshotSha256.length > 0 && (s as PublishedBiSnapshot & { _idemKey?: string })._idemKey === idempotencyKey,
+      (s) =>
+        s.tenantId === actor.tenantId &&
+        s.workspaceId === actor.workspaceId &&
+        s.reportId === evaluated.report.reportId &&
+        s.filterContext.policyId === policy.policyId &&
+        s.snapshotSha256.length > 0 &&
+        (s as PublishedBiSnapshot & { _idemKey?: string })._idemKey === idempotencyKey,
     );
     if (existing) {
       return structuredClone(existing);
@@ -864,8 +1070,8 @@ export class IntelligenceStudioEngine {
       semanticModelVersion: evaluated.report.semanticModelVersion,
       datasetManifestId: evaluated.report.datasetManifestId,
       datasetVersion: evaluated.report.datasetVersion,
-      periodStart: "2026-11-01",
-      periodEndExclusive: "2026-12-01",
+      periodStart: evaluated.periodStart,
+      periodEndExclusive: evaluated.periodEndExclusive,
       timezone: "Asia/Phnom_Penh",
       reportFilters: [{ dimension: "department", operator: "in", values: evaluated.effectiveDepartments }],
       pageFilters: [],
@@ -895,8 +1101,10 @@ export class IntelligenceStudioEngine {
       _idemKey: idempotencyKey,
     };
 
-    this.snapshots.set(snapshot.snapshotId, snapshot);
-    const storedReport = this.reports.get(evaluated.report.reportId);
+    this.snapshots.set(this.snapshotKey(snapshot.tenantId, snapshot.workspaceId, snapshot.snapshotId), snapshot);
+    const storedReport = this.reports.get(
+      this.reportKey(evaluated.report.tenantId, evaluated.report.workspaceId, evaluated.report.reportId),
+    );
     if (storedReport) {
       storedReport.status = "published";
       storedReport.publishedSnapshotHash = snapshotSha256;
@@ -905,13 +1113,35 @@ export class IntelligenceStudioEngine {
     return structuredClone(snapshot);
   }
 
-  getPublishedSnapshot(actor: ActorContext, snapshotId: string): PublishedBiSnapshot {
+  getPublishedSnapshot(actor: ActorContext, snapshotId: string, policy?: DataScopePolicy): PublishedBiSnapshot {
     this.assertNotRevoked(actor);
-    const snap = this.snapshots.get(snapshotId);
+    assertCanPerform(actor, "dashboard", "read");
+    const snap = this.snapshots.get(this.snapshotKey(actor.tenantId, actor.workspaceId, snapshotId));
     if (!snap) {
+      for (const cand of this.snapshots.values()) {
+        if (cand.snapshotId === snapshotId) {
+          assertTenantWorkspaceAccess(actor, cand.tenantId, cand.workspaceId);
+        }
+      }
       throw new IntelligenceEngineError(404, "SNAPSHOT_NOT_FOUND", `BI snapshot '${snapshotId}' not found.`);
     }
     assertTenantWorkspaceAccess(actor, snap.tenantId, snap.workspaceId);
+    const snapDepts = snap.filterContext.reportFilters.find((f) => f.dimension === "department")?.values ?? [];
+    if (Array.isArray(actor.departmentScopes)) {
+      const actorDeptSet = new Set(actor.departmentScopes);
+      if (snapDepts.some((d) => !actorDeptSet.has(d))) {
+        throw new IntelligenceEngineError(403, "POLICY_SCOPE_MISMATCH", "Published snapshot departments exceed actor department scopes.");
+      }
+    }
+    if (policy) {
+      this.assertActorPolicyMatch(actor, policy);
+      if (policy.allowedDepartments !== "ALL") {
+        const policyDeptSet = new Set(policy.allowedDepartments);
+        if (snapDepts.some((d) => !policyDeptSet.has(d))) {
+          throw new IntelligenceEngineError(403, "POLICY_SCOPE_MISMATCH", "Published snapshot departments exceed DataScopePolicy scope.");
+        }
+      }
+    }
     return structuredClone(snap);
   }
 
@@ -922,10 +1152,24 @@ export class IntelligenceStudioEngine {
     opts?: { requestUnderlyingDetail?: boolean },
   ): { csv: string; policyScope: string; datasetVersion: number; effectiveDepartments: string[] } {
     this.assertNotRevoked(actor);
-    if (policy.tenantId !== actor.tenantId) {
-      throw new IntelligenceEngineError(403, "POLICY_TENANT_MISMATCH", "DataScopePolicy tenant mismatch.");
-    }
     assertTenantWorkspaceAccess(actor, evaluated.report.tenantId, evaluated.report.workspaceId);
+    this.assertActorPolicyMatch(actor, policy);
+    const expectedScope = `${policy.policyId}:v${policy.policyVersion}`;
+    if (evaluated.policyScope !== expectedScope) {
+      throw new IntelligenceEngineError(403, "POLICY_SCOPE_MISMATCH", `Evaluated response scope '${evaluated.policyScope}' does not match actor policy '${expectedScope}'.`);
+    }
+    if (policy.allowedDepartments !== "ALL") {
+      const policyAllowedDepts = new Set(policy.allowedDepartments);
+      if (evaluated.effectiveDepartments.some((d) => !policyAllowedDepts.has(d))) {
+        throw new IntelligenceEngineError(403, "POLICY_SCOPE_MISMATCH", "Evaluated response departments exceed policy scope.");
+      }
+    }
+    if (Array.isArray(actor.departmentScopes)) {
+      const actorAllowedDepts = new Set(actor.departmentScopes);
+      if (evaluated.effectiveDepartments.some((d) => !actorAllowedDepts.has(d))) {
+        throw new IntelligenceEngineError(403, "POLICY_SCOPE_MISMATCH", "Evaluated response departments exceed actor department scopes.");
+      }
+    }
     assertCanPerform(actor, "export", "export");
     if (opts?.requestUnderlyingDetail && !policy.canExportUnderlyingDetail) {
       throw new IntelligenceEngineError(
@@ -976,25 +1220,29 @@ export class IntelligenceStudioEngine {
     language: "en" | "km" | "bilingual" = "bilingual",
   ): StudioPresentation {
     this.assertNotRevoked(actor);
+    assertCanPerform(actor, "dashboard", "read");
     assertTenantWorkspaceAccess(actor, evaluated.report.tenantId, evaluated.report.workspaceId);
-    const netSalesRef: LinkedMetricReference =
-      evaluated.visualResults.vis_kpi_net_sales!.metricResults["FIN-NET-SALES"]!.linkedMetricReference;
-    const opProfitRef: LinkedMetricReference =
-      evaluated.visualResults.vis_kpi_op_profit!.metricResults["FIN-OPERATING-PROFIT"]!.linkedMetricReference;
-    const opMarginRef: LinkedMetricReference =
-      evaluated.visualResults.vis_kpi_op_profit!.metricResults["FIN-OPERATING-MARGIN"]!.linkedMetricReference;
+    const revChartSpec = evaluated.visualResults.vis_chart_dept_revenue?.chartSpec;
+    const budgetChartSpec = evaluated.visualResults.vis_chart_budget_vs_actual?.chartSpec;
+    const netSalesRef = evaluated.visualResults.vis_kpi_net_sales?.metricResults["FIN-NET-SALES"]?.linkedMetricReference;
+    const opProfitRef = evaluated.visualResults.vis_kpi_op_profit?.metricResults["FIN-OPERATING-PROFIT"]?.linkedMetricReference;
+    const opMarginRef = evaluated.visualResults.vis_kpi_op_profit?.metricResults["FIN-OPERATING-MARGIN"]?.linkedMetricReference;
+    if (!netSalesRef || !opProfitRef || !opMarginRef || !revChartSpec || !budgetChartSpec) {
+      throw new IntelligenceEngineError(403, "COLUMN_ACCESS_DENIED", "Evaluated dashboard lacks permitted metrics or charts for presentation generation.");
+    }
 
     const deck = createGoldenManagementDeck({
       tenantId: actor.tenantId,
       workspaceId: actor.workspaceId,
       actorId: actor.userId,
       language,
-      scopeLabel: `Departments: ${evaluated.effectiveDepartments.join(" + ")} (v${evaluated.report.datasetVersion})`,
+      scopeLabel: `Departments: ${evaluated.effectiveDepartments.join(" + ")} (${evaluated.periodStart}..${evaluated.periodEndExclusive}, v${evaluated.report.datasetVersion})`,
       netSalesRef,
       opProfitRef,
       opMarginRef,
-      revenueChartSpec: evaluated.visualResults.vis_chart_dept_revenue!.chartSpec!,
-      budgetChartSpec: evaluated.visualResults.vis_chart_budget_vs_actual!.chartSpec!,
+      revenueChartSpec: revChartSpec,
+      budgetChartSpec,
+      departmentTableRows: evaluated.departmentSummaryRows,
     });
     return this.presentations.saveInitialDeck(actor, deck);
   }

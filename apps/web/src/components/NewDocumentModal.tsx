@@ -48,7 +48,17 @@ export function NewDocumentModal({
     window.addEventListener("keydown", onKeyDown);
     return () => {
       window.removeEventListener("keydown", onKeyDown);
-      previouslyFocused?.focus();
+      if (
+        previouslyFocused &&
+        document.contains(previouslyFocused) &&
+        previouslyFocused.tabIndex >= 0 &&
+        previouslyFocused.offsetParent !== null &&
+        !(previouslyFocused as HTMLButtonElement).disabled
+      ) {
+        previouslyFocused.focus();
+      } else {
+        document.querySelector<HTMLElement>(".fixed-header-btn, .topbar-role-pill, main button")?.focus();
+      }
     };
   }, [onClose]);
 

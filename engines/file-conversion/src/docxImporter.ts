@@ -22,14 +22,27 @@ export class DocxImportError extends Error {
   }
 }
 
-function decodeHtmlEntities(input: string): string {
-  return input
-    .replace(/&amp;/g, "&")
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">")
-    .replace(/&quot;/g, '"')
-    .replace(/&#39;/g, "'")
-    .replace(/&nbsp;/g, " ");
+const NAMED_HTML_ENTITIES: Record<string, string> = {
+  amp: "&",
+  lt: "<",
+  gt: ">",
+  quot: '"',
+  apos: "'",
+  nbsp: " ",
+};
+
+export function decodeHtmlEntities(input: string): string {
+  // Single-pass decoder prevents `&amp;lt;` -> `<` double-unescaping and decodes valid numeric code points
+  return input.replace(/&(?:#x([0-9a-fA-F]+)|#(\d+)|(amp|lt|gt|quot|apos|nbsp));/g, (full, hex, dec, named) => {
+    if (named) {
+      return NAMED_HTML_ENTITIES[named] ?? full;
+    }
+    const cp = hex ? Number.parseInt(hex, 16) : Number.parseInt(dec, 10);
+    if (!Number.isSafeInteger(cp) || cp < 0 || cp > 0x10ffff || (cp >= 0xd800 && cp <= 0xdfff)) {
+      return full;
+    }
+    return String.fromCodePoint(cp);
+  });
 }
 
 function stripTags(html: string): string {
@@ -77,17 +90,78 @@ function parseInlineRuns(htmlFragment: string): TextRun[] {
   return runs.length > 0 ? runs : [{ text: "" }];
 }
 
-function htmlToStudioBlocks(html: string): DocumentBlock[] {
-  const blocks: DocumentBlock[] = [];
-  const blockPattern = /<(h[1-3]|p|ul|ol|table)\b[^>]*>([\s\S]*?)<\/\1>/gi;
+function extractBalancedElements(
+  html: string,
+  tagFilter: Set<string>,
+): Array<{ tag: string; inner: string; attrs: string }> {
+  const results: Array<{ tag: string; inner: string; attrs: string }> = [];
+  const tagRe = /<\/?(h[1-6]|p|ul|ol|table|li|tr|td|th)\b([^>]*)>/gi;
+  const stack: Array<{ tag: string; attrs: string; innerStart: number }> = [];
   let match: RegExpExecArray | null;
 
-  while ((match = blockPattern.exec(html)) !== null) {
-    const tag = (match[1] ?? "p").toLowerCase();
-    const inner = match[2] ?? "";
+  while ((match = tagRe.exec(html)) !== null) {
+    const raw = match[0];
+    const tag = (match[1] ?? "").toLowerCase();
+    const attrs = match[2] ?? "";
+    const isClosing = raw.startsWith("</");
+    const isSelfClosing = raw.endsWith("/>");
 
-    if (tag === "h1" || tag === "h2" || tag === "h3") {
-      const level = (tag === "h1" ? 1 : tag === "h2" ? 2 : 3) as 1 | 2 | 3;
+    if (!isClosing && !isSelfClosing) {
+      if (stack.length === 0) {
+        if (tagFilter.has(tag)) {
+          stack.push({ tag, attrs, innerStart: match.index + raw.length });
+        }
+      } else {
+        stack.push({ tag, attrs, innerStart: match.index + raw.length });
+      }
+      continue;
+    }
+
+    if (isClosing && stack.length > 0) {
+      // Unwind back to matching open tag
+      let matchIdx = -1;
+      for (let i = stack.length - 1; i >= 0; i--) {
+        if (stack[i]!.tag === tag) {
+          matchIdx = i;
+          break;
+        }
+      }
+      if (matchIdx === 0) {
+        const popped = stack[0]!;
+        stack.length = 0;
+        results.push({
+          tag: popped.tag,
+          attrs: popped.attrs,
+          inner: html.slice(popped.innerStart, match.index),
+        });
+      } else if (matchIdx > 0) {
+        stack.length = matchIdx;
+      }
+    }
+  }
+  return results;
+}
+
+function parsePositiveSpanAttr(attrs: string, attrName: "colspan" | "rowspan"): number | undefined {
+  const re = new RegExp(`\\b${attrName}\\s*=\\s*(?:"(\\d+)"|'(\\d+)'|(\\d+))`, "i");
+  const m = attrs.match(re);
+  if (!m) return undefined;
+  const parsed = Number.parseInt(m[1] ?? m[2] ?? m[3] ?? "", 10);
+  return Number.isSafeInteger(parsed) && parsed > 1 ? parsed : undefined;
+}
+
+export function htmlToStudioBlocks(html: string): DocumentBlock[] {
+  const blocks: DocumentBlock[] = [];
+  const topBlocks = extractBalancedElements(
+    html,
+    new Set(["h1", "h2", "h3", "h4", "h5", "h6", "p", "ul", "ol", "table"]),
+  );
+
+  for (const el of topBlocks) {
+    const { tag, inner } = el;
+    if (tag.startsWith("h")) {
+      const parsedLevel = Number.parseInt(tag.slice(1), 10);
+      const level = (parsedLevel >= 1 && parsedLevel <= 3 ? parsedLevel : 3) as 1 | 2 | 3;
       blocks.push({
         id: `blk_${randomUUID().slice(0, 8)}`,
         type: "heading",
@@ -107,10 +181,8 @@ function htmlToStudioBlocks(html: string): DocumentBlock[] {
       }
     } else if (tag === "ul" || tag === "ol") {
       const items: TextRun[][] = [];
-      const liRegex = /<li\b[^>]*>([\s\S]*?)<\/li>/gi;
-      let liMatch: RegExpExecArray | null;
-      while ((liMatch = liRegex.exec(inner)) !== null) {
-        items.push(parseInlineRuns(liMatch[1] ?? ""));
+      for (const li of extractBalancedElements(inner, new Set(["li"]))) {
+        items.push(parseInlineRuns(li.inner));
       }
       if (items.length > 0) {
         blocks.push({
@@ -121,14 +193,16 @@ function htmlToStudioBlocks(html: string): DocumentBlock[] {
       }
     } else if (tag === "table") {
       const rows: TableCell[][] = [];
-      const trRegex = /<tr\b[^>]*>([\s\S]*?)<\/tr>/gi;
-      let trMatch: RegExpExecArray | null;
-      while ((trMatch = trRegex.exec(inner)) !== null) {
+      for (const tr of extractBalancedElements(inner, new Set(["tr"]))) {
         const rowCells: TableCell[] = [];
-        const cellRegex = /<t[hd]\b[^>]*>([\s\S]*?)<\/t[hd]>/gi;
-        let cellMatch: RegExpExecArray | null;
-        while ((cellMatch = cellRegex.exec(trMatch[1] ?? "")) !== null) {
-          rowCells.push({ runs: parseInlineRuns(cellMatch[1] ?? "") });
+        for (const cellEl of extractBalancedElements(tr.inner, new Set(["td", "th"]))) {
+          const colspan = parsePositiveSpanAttr(cellEl.attrs, "colspan");
+          const rowspan = parsePositiveSpanAttr(cellEl.attrs, "rowspan");
+          rowCells.push({
+            runs: parseInlineRuns(cellEl.inner),
+            ...(colspan !== undefined ? { colspan } : {}),
+            ...(rowspan !== undefined ? { rowspan } : {}),
+          });
         }
         if (rowCells.length > 0) rows.push(rowCells);
       }

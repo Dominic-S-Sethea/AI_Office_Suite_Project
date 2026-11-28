@@ -22,9 +22,11 @@
     "@ai-office-suite/speech-engine": "*",
     "@ai-office-suite/documents-module": "*",
     "@ai-office-suite/ai-module": "*",
+    "@ai-office-suite/workers": "*",
     "cors": "^2.8.5",
     "express": "^4.21.2",
     "helmet": "^8.1.0",
+    "pg": "^8.23.1",
     "zod": "^4.0.0"
   }
 }

@@ -39,6 +39,17 @@ const VERIFIED_LEGACY_TRANSITIVE = new Set([
   "nodejs-polars-android-arm64@0.26.2",
 ]);
 
+const ALLOWED_SPDX_EXCEPTIONS = new Set([
+  "LLVM-exception",
+  "GCC-exception-3.1",
+  "Classpath-exception-2.0",
+  "Font-exception-2.0",
+  "Bison-exception-2.2",
+  "Autoconf-exception-3.0",
+  "Libtool-exception",
+  "Swift-exception",
+]);
+
 const DISALLOWED_IDENTIFIERS = [
   /^AGPL/i,
   /^SSPL/i,
@@ -128,12 +139,15 @@ export function isPermissiveOrDualAllowed(licenseStr) {
     if (tok.type === "ID") {
       consume();
       const baseId = tok.value.replace(/\+$/, "");
-      // Consume optional `WITH <exception>` clause (exception must not be disallowed)
+      // Validate optional `WITH <exception>` clause against explicit permissive SPDX exception allowlist
       if (peek()?.type === "WITH") {
         consume();
         const exc = consume();
         if (!exc || exc.type !== "ID") {
           throw new Error("Expected exception identifier after WITH");
+        }
+        if (!ALLOWED_SPDX_EXCEPTIONS.has(exc.value)) {
+          return false;
         }
       }
       if (DISALLOWED_IDENTIFIERS.some((re) => re.test(baseId))) return false;
@@ -181,6 +195,9 @@ function collectDirectDependencies(workspaceDirs) {
       if (!dep.startsWith("@ai-office-suite/")) direct.add(dep);
     }
     for (const dep of Object.keys(pkg.devDependencies ?? {})) {
+      if (!dep.startsWith("@ai-office-suite/")) direct.add(dep);
+    }
+    for (const dep of Object.keys(pkg.optionalDependencies ?? {})) {
       if (!dep.startsWith("@ai-office-suite/")) direct.add(dep);
     }
   }
@@ -248,6 +265,10 @@ if (isMain) {
     const key = `${pkg.name}@${pkg.version}`;
     if (!seen.has(key)) seen.set(key, pkg);
   }
+  if (seen.size === 0) {
+    console.error("ERROR: No installed third-party packages found in node_modules; refusing to pass empty license audit.");
+    process.exit(1);
+  }
 
   const directViolations = [];
   const transitiveWarnings = [];
@@ -260,11 +281,37 @@ if (isMain) {
     if (!ok) {
       if (isDirect) directViolations.push(pkg);
       else transitiveViolations.push(pkg);
-    } else if (isDirect && /\bGPL\b/i.test(pkg.license)) {
+    } else if (isDirect && /\b(?:A|L)?GPL\b/i.test(pkg.license)) {
       directViolations.push(pkg);
-    } else if (!isDirect && /\bGPL\b/i.test(pkg.license)) {
+    } else if (!isDirect && /\b(?:A|L)?GPL\b/i.test(pkg.license)) {
       transitiveWarnings.push(pkg);
     }
+  }
+
+  // Also audit cross-OS optional/uninstalled entries in package-lock.json
+  try {
+    const lock = JSON.parse(readFileSync(path.join(rootDir, "package-lock.json"), "utf8"));
+    for (const [lockPath, entry] of Object.entries(lock.packages ?? {})) {
+      if (!lockPath || entry.link === true || !lockPath.includes("node_modules/")) continue;
+      const idx = lockPath.lastIndexOf("node_modules/");
+      const name = typeof entry.name === "string" && entry.name.trim() ? entry.name.trim() : lockPath.slice(idx + 13);
+      const version = typeof entry.version === "string" ? entry.version : "0.0.0";
+      if (!name || name.startsWith("@ai-office-suite/")) continue;
+      const pkgKey = `${name}@${version}`;
+      if (seen.has(pkgKey)) continue;
+      const lic = typeof entry.license === "string" ? entry.license : "";
+      if (!lic) continue;
+      const isDirect = directDeps.has(name);
+      const ok = isPermissiveOrDualAllowed(lic) || (!isDirect && VERIFIED_LEGACY_TRANSITIVE.has(pkgKey));
+      if (!ok) {
+        if (isDirect) directViolations.push({ name, version, license: lic });
+        else transitiveViolations.push({ name, version, license: lic });
+      } else if (isDirect && /\b(?:A|L)?GPL\b/i.test(lic)) {
+        directViolations.push({ name, version, license: lic });
+      }
+    }
+  } catch {
+    // package-lock.json optional cross-OS scan skipped only if unreadable
   }
 
   console.log(

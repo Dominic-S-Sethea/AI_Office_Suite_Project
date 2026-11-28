@@ -11,14 +11,17 @@ COPY platform/authorization/package.json platform/authorization/
 COPY platform/database/package.json platform/database/
 COPY platform/identity/package.json platform/identity/
 COPY platform/storage/package.json platform/storage/
+COPY engines/calculation/package.json engines/calculation/
 COPY engines/data-processing/package.json engines/data-processing/
 COPY engines/document/package.json engines/document/
 COPY engines/file-conversion/package.json engines/file-conversion/
 COPY engines/integration/package.json engines/integration/
+COPY engines/presentation/package.json engines/presentation/
 COPY engines/speech/package.json engines/speech/
 COPY modules/ai/package.json modules/ai/
 COPY modules/documents/package.json modules/documents/
 COPY apps/api/package.json apps/api/
+COPY apps/workers/package.json apps/workers/
 
 # Install ONLY production runtime dependencies for the API & DB CLI (excludes dev deps, pglite, web UI, and unwired prototype engines)
 RUN npm ci --omit=dev --workspace=@ai-office-suite/api --workspace=@ai-office-suite/database --workspace=@ai-office-suite/identity --no-audit --no-fund
@@ -37,20 +40,23 @@ COPY --from=deps /app/node_modules ./node_modules
 COPY package.json tsconfig.base.json ./
 COPY packages ./packages
 COPY platform ./platform
+COPY engines/calculation ./engines/calculation
 COPY engines/data-processing ./engines/data-processing
 COPY engines/document ./engines/document
 COPY engines/file-conversion ./engines/file-conversion
-COPY engines/speech ./engines/speech
 COPY engines/integration/package.json ./engines/integration/package.json
 COPY engines/integration/src/pgPersistence.ts ./engines/integration/src/pgPersistence.ts
+COPY engines/presentation ./engines/presentation
+COPY engines/speech ./engines/speech
 COPY modules ./modules
 COPY apps/api ./apps/api
+COPY apps/workers ./apps/workers
 COPY scripts/db-cli.mjs ./scripts/db-cli.mjs
 
 USER node
 EXPOSE 4100
 
 HEALTHCHECK --interval=15s --timeout=5s --start-period=10s --retries=3 \
-  CMD node -e "fetch('http://127.0.0.1:4100/api/ready', { signal: AbortSignal.timeout(4000) }).then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"
+  CMD node -e "const port = process.env.PORT || 4100; fetch('http://127.0.0.1:' + port + '/api/ready', { signal: AbortSignal.timeout(4000) }).then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"
 
 CMD ["node", "apps/api/src/server.ts"]

@@ -12,6 +12,18 @@ import {
 import path from "node:path";
 import type { DocumentVersion, StudioDocument } from "@ai-office-suite/shared-contracts";
 
+export class StorageAdapterError extends Error {
+  readonly statusCode: number;
+  readonly code: string;
+
+  constructor(statusCode: number, code: string, message: string) {
+    super(message);
+    this.name = "StorageAdapterError";
+    this.statusCode = statusCode;
+    this.code = code;
+  }
+}
+
 export interface DocumentStorageAdapter {
   saveOriginalBinary(bytes: Uint8Array, extension: string): Promise<{ sha256: string; path: string }>;
   saveDocumentVersion(version: DocumentVersion): Promise<void>;
@@ -38,17 +50,28 @@ export class LocalFilesystemStorageAdapter implements DocumentStorageAdapter {
   private assertContainedPath(targetPath: string): string {
     const resolved = path.resolve(targetPath);
     if (resolved !== this.baseDir && !resolved.startsWith(this.baseDir + path.sep)) {
-      throw new Error(`Storage path containment violation blocked: '${targetPath}'.`);
+      throw new StorageAdapterError(
+        403,
+        "PATH_TRAVERSAL_BLOCKED",
+        `Storage path containment violation blocked: '${targetPath}'.`,
+      );
     }
     return resolved;
   }
 
   private sanitizeDocumentId(documentId: string): string {
-    const safeId = documentId.replace(/[^a-zA-Z0-9_-]/g, "_").replace(/^_+/, "");
-    if (!safeId || safeId.length > 160) {
-      throw new Error("Invalid documentId for local storage.");
+    if (!documentId || documentId.length > 160) {
+      throw new StorageAdapterError(400, "INVALID_DOCUMENT_ID", "Invalid documentId for local storage.");
     }
-    return safeId;
+    if (/^[a-zA-Z0-9_-]{1,128}$/.test(documentId) && !documentId.startsWith("_")) {
+      return documentId;
+    }
+    const slug = documentId.replace(/[^a-zA-Z0-9_-]/g, "_").replace(/^_+/, "").slice(0, 96);
+    if (!slug) {
+      throw new StorageAdapterError(400, "INVALID_DOCUMENT_ID", "Invalid documentId for local storage.");
+    }
+    const disambiguator = createHash("sha256").update(documentId, "utf8").digest("hex").slice(0, 12);
+    return `${slug}-${disambiguator}`;
   }
 
   async saveOriginalBinary(bytes: Uint8Array, extension: string): Promise<{ sha256: string; path: string }> {
@@ -75,7 +98,7 @@ export class LocalFilesystemStorageAdapter implements DocumentStorageAdapter {
 
   async saveDocumentVersion(version: DocumentVersion): Promise<void> {
     if (!Number.isInteger(version.revision) || version.revision < 1) {
-      throw new Error("Version revision must be a positive integer.");
+      throw new StorageAdapterError(400, "INVALID_REVISION", "Version revision must be a positive integer.");
     }
     const dir = this.versionsDir(version.documentId);
     const filename = `rev-${String(version.revision).padStart(6, "0")}.json`;
@@ -88,7 +111,11 @@ export class LocalFilesystemStorageAdapter implements DocumentStorageAdapter {
         linkSync(tmpPath, filePath);
       } catch (linkErr) {
         if ((linkErr as NodeJS.ErrnoException).code === "EEXIST") {
-          throw new Error(`Immutable version conflict: revision ${version.revision} already exists for ${version.documentId}.`);
+          throw new StorageAdapterError(
+            409,
+            "IMMUTABLE_VERSION_CONFLICT",
+            `Immutable version conflict: revision ${version.revision} already exists for ${version.documentId}.`,
+          );
         }
         throw linkErr;
       }
@@ -167,7 +194,11 @@ export class InMemoryStorageAdapter implements DocumentStorageAdapter {
   async saveDocumentVersion(version: DocumentVersion): Promise<void> {
     const list = this.versions.get(version.documentId) ?? [];
     if (list.some((v) => v.revision === version.revision)) {
-      throw new Error(`Immutable version conflict: revision ${version.revision} already exists.`);
+      throw new StorageAdapterError(
+        409,
+        "IMMUTABLE_VERSION_CONFLICT",
+        `Immutable version conflict: revision ${version.revision} already exists.`,
+      );
     }
     list.push(structuredClone(version));
     this.versions.set(version.documentId, list);

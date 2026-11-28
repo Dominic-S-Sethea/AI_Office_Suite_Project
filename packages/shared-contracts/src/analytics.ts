@@ -165,7 +165,7 @@ export interface AnalyticalResult {
     dimensionValues: Record<string, string>;
     value: AnalyticalValuePayload;
   }>;
-  stats?: Record<string, number | string | number[]>;
+  stats?: Record<string, number | string | number[] | null>;
   validationStatus: "certified" | "warning" | "blocked";
   validationErrors: string[];
   observedFacts: string[];

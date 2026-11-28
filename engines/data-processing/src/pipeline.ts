@@ -13,6 +13,7 @@ import type {
 } from "@ai-office-suite/shared-contracts";
 import { assertCanPerform, assertTenantWorkspaceAccess } from "@ai-office-suite/authorization";
 import {
+  currencyScaleFor,
   escapeSafeCsvCell,
   inspectAndExtractOoxmlZip,
   parseExactDecimalToMinorUnits,
@@ -83,6 +84,7 @@ export interface CsvStageOptions {
 
 export interface XlsxStageOptions {
   sheetName?: string;
+  maxRows?: number;
 }
 
 export type SchemaPatternPreset =
@@ -135,6 +137,7 @@ export function compileSafeContractPattern(rawPattern: string): RegExp {
 
   let inCharClass = false;
   let prevWasUnboundedQuantifier = false;
+  let prevQuantifierCh: string | null = null;
   let consecutiveUnboundedTokens = 0;
   const groupStack: Array<{ hasQuantifier: boolean; hasAlternation: boolean }> = [];
 
@@ -154,6 +157,7 @@ export function compileSafeContractPattern(rawPattern: string): RegExp {
       }
       i++;
       prevWasUnboundedQuantifier = false;
+      prevQuantifierCh = null;
       continue;
     }
 
@@ -167,6 +171,7 @@ export function compileSafeContractPattern(rawPattern: string): RegExp {
     if (ch === "[") {
       inCharClass = true;
       prevWasUnboundedQuantifier = false;
+      prevQuantifierCh = null;
       continue;
     }
 
@@ -189,6 +194,7 @@ export function compileSafeContractPattern(rawPattern: string): RegExp {
       }
       groupStack.push({ hasQuantifier: false, hasAlternation: false });
       prevWasUnboundedQuantifier = false;
+      prevQuantifierCh = null;
       continue;
     }
 
@@ -196,6 +202,7 @@ export function compileSafeContractPattern(rawPattern: string): RegExp {
       const top = groupStack[groupStack.length - 1];
       if (top) top.hasAlternation = true;
       prevWasUnboundedQuantifier = false;
+      prevQuantifierCh = null;
       consecutiveUnboundedTokens = 0;
       continue;
     }
@@ -220,26 +227,41 @@ export function compileSafeContractPattern(rawPattern: string): RegExp {
         if (closed.hasAlternation) parent.hasAlternation = true;
       }
       prevWasUnboundedQuantifier = false;
+      prevQuantifierCh = null;
       continue;
     }
 
     if (ch === "+" || ch === "*" || ch === "?") {
-      if (prevWasUnboundedQuantifier && ch !== "?") {
+      if (ch === "?") {
+        if (prevQuantifierCh === "?") {
+          throw new DataPrepError(400, "UNSAFE_CONTRACT_PATTERN", "Stacked '?' quantifiers are prohibited (ReDoS protection).");
+        }
+        if (prevQuantifierCh !== null) {
+          // Lazy modifier immediately following +, *, or {m,n}
+          prevWasUnboundedQuantifier = false;
+          prevQuantifierCh = null;
+        } else {
+          const top = groupStack[groupStack.length - 1];
+          if (top) top.hasQuantifier = true;
+          prevQuantifierCh = "?";
+        }
+        continue;
+      }
+      if (prevWasUnboundedQuantifier) {
         throw new DataPrepError(400, "UNSAFE_CONTRACT_PATTERN", "Stacked quantifiers are prohibited (ReDoS protection).");
       }
       const top = groupStack[groupStack.length - 1];
-      if (top && ch !== "?") top.hasQuantifier = true;
-      if (ch === "+" || ch === "*") {
-        consecutiveUnboundedTokens++;
-        if (consecutiveUnboundedTokens > 2) {
-          throw new DataPrepError(
-            400,
-            "UNSAFE_CONTRACT_PATTERN",
-            "Too many unbounded quantifiers in a single branch (ReDoS protection).",
-          );
-        }
-        prevWasUnboundedQuantifier = true;
+      if (top) top.hasQuantifier = true;
+      consecutiveUnboundedTokens++;
+      if (consecutiveUnboundedTokens > 2) {
+        throw new DataPrepError(
+          400,
+          "UNSAFE_CONTRACT_PATTERN",
+          "Too many unbounded quantifiers in a single branch (ReDoS protection).",
+        );
       }
+      prevWasUnboundedQuantifier = true;
+      prevQuantifierCh = ch;
       continue;
     }
 
@@ -276,11 +298,13 @@ export function compileSafeContractPattern(rawPattern: string): RegExp {
       const top = groupStack[groupStack.length - 1];
       if (top && (hasComma || minBound > 1)) top.hasQuantifier = true;
       i = closeIdx;
-      prevWasUnboundedQuantifier = true;
+      prevWasUnboundedQuantifier = hasComma && !qMatch[2];
+      prevQuantifierCh = "}";
       continue;
     }
 
     prevWasUnboundedQuantifier = false;
+    prevQuantifierCh = null;
   }
 
   if (inCharClass || groupStack.length > 0) {
@@ -308,11 +332,7 @@ export interface CertifiedCsvExportResult {
   status: CertifiedDatasetArtifact["status"];
 }
 
-const ZERO_DECIMAL_CURRENCIES = new Set(["KHR", "JPY", "KRW", "VND"]);
-
-export function currencyScaleFor(currency: string): number {
-  return ZERO_DECIMAL_CURRENCIES.has(currency.trim().toUpperCase()) ? 0 : 2;
-}
+export { currencyScaleFor };
 
 export function normalizeKhmerDigitsText(raw: string, stripCurrencySymbols = false): string {
   let out = raw.normalize("NFC").replace(/[\u17E0-\u17E9]/g, (ch) => String(ch.charCodeAt(0) - 0x17e0));
@@ -584,6 +604,32 @@ export function stageCsvSource(
   };
 }
 
+function unwrapExcelCellValue(raw: unknown): unknown {
+  if (raw === undefined || raw === null || raw === "") return null;
+  if (raw instanceof Date) return raw.toISOString().slice(0, 10);
+  if (typeof raw === "object") {
+    if ("result" in raw) {
+      return unwrapExcelCellValue((raw as { result: unknown }).result);
+    }
+    if ("richText" in raw && Array.isArray((raw as { richText: unknown }).richText)) {
+      const joined = (raw as { richText: Array<{ text?: unknown }> }).richText
+        .map((part) => String(part?.text ?? ""))
+        .join("")
+        .normalize("NFC");
+      return joined === "" ? null : joined;
+    }
+    if ("text" in raw) {
+      const txt = String((raw as { text: unknown }).text ?? "").normalize("NFC");
+      return txt === "" ? null : txt;
+    }
+    if ("error" in raw) {
+      return String((raw as { error: unknown }).error ?? "");
+    }
+  }
+  if (typeof raw === "string") return raw.normalize("NFC");
+  return raw;
+}
+
 export async function stageXlsxSource(
   buffer: Uint8Array,
   filename: string,
@@ -595,6 +641,7 @@ export async function stageXlsxSource(
   }
 
   const sha256 = inspected.originalSha256;
+  const maxRows = Math.max(1, Math.min(1_000_000, Math.trunc(options.maxRows ?? 50_000)));
   const wb = new ExcelJS.Workbook();
   await wb.xlsx.load(Buffer.from(inspected.repackedBuffer) as unknown as ExcelJS.Buffer);
   const ws = options.sheetName ? wb.getWorksheet(options.sheetName) : wb.worksheets[0];
@@ -610,39 +657,35 @@ export async function stageXlsxSource(
 
   const headers: string[] = [];
   const rows: StagedRow[] = [];
+  let headerParsed = false;
+  let dataRowsSeen = 0;
 
   ws.eachRow((excelRow, rowNumber) => {
     const values = (excelRow.values as unknown[]).slice(1);
-    if (rowNumber === 1) {
-      for (const v of values) headers.push(String(v ?? "").trim().normalize("NFC"));
+    if (!headerParsed) {
+      const candidate = values.map((v) => String(unwrapExcelCellValue(v) ?? "").trim().normalize("NFC"));
+      if (candidate.length === 0 || candidate.every((h) => h === "")) {
+        return;
+      }
+      headers.push(...candidate);
       validateUniqueHeaders(headers, filename);
+      headerParsed = true;
       return;
+    }
+    dataRowsSeen++;
+    if (dataRowsSeen > maxRows) {
+      throw new DataPrepError(413, "XLSX_ROW_LIMIT_EXCEEDED", `XLSX exceeds maximum supported row limit (${maxRows}).`);
     }
     const row: StagedRow = { __sourceFile: filename, __sourceRowNumber: rowNumber };
     for (let c = 0; c < headers.length; c++) {
-      const raw = values[c];
-      if (raw === undefined || raw === null || raw === "") {
-        row[headers[c]!] = null;
-      } else if (raw instanceof Date) {
-        row[headers[c]!] = raw.toISOString().slice(0, 10);
-      } else if (typeof raw === "object" && raw !== null && "result" in raw) {
-        const res = (raw as { result: unknown }).result;
-        row[headers[c]!] =
-          res === undefined || res === null || res === ""
-            ? null
-            : typeof res === "string"
-              ? res.normalize("NFC")
-              : res;
-      } else if (typeof raw === "object" && raw !== null && "text" in raw) {
-        row[headers[c]!] = String((raw as { text: unknown }).text).normalize("NFC");
-      } else if (typeof raw === "string") {
-        row[headers[c]!] = raw.normalize("NFC");
-      } else {
-        row[headers[c]!] = raw;
-      }
+      row[headers[c]!] = unwrapExcelCellValue(values[c]);
     }
     rows.push(row);
   });
+
+  if (!headerParsed || headers.length === 0) {
+    throw new DataPrepError(400, "EMPTY_HEADER_ROW", `Workbook '${filename}' contains no valid header row.`);
+  }
 
   return {
     source: {
@@ -731,12 +774,29 @@ export function profileDataset(
   };
 }
 
+function isValidGregorianDate(year: number, month: number, day: number): boolean {
+  if (!Number.isInteger(year) || !Number.isInteger(month) || !Number.isInteger(day)) return false;
+  if (year < 1 || year > 9999 || month < 1 || month > 12 || day < 1 || day > 31) return false;
+  const d = new Date(Date.UTC(year, month - 1, day));
+  d.setUTCFullYear(year);
+  return d.getUTCFullYear() === year && d.getUTCMonth() === month - 1 && d.getUTCDate() === day;
+}
+
 function parseExplicitDate(
   raw: string,
   locale: "ISO" | "DMY" | "MDY" | "UNSPECIFIED",
 ): { ok: true; isoDate: string } | { ok: false; reason: string } {
   const s = raw.trim();
-  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return { ok: true, isoDate: s };
+  const isoMatch = s.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (isoMatch) {
+    const year = Number(isoMatch[1]);
+    const month = Number(isoMatch[2]);
+    const day = Number(isoMatch[3]);
+    if (!isValidGregorianDate(year, month, day)) {
+      return { ok: false, reason: `Calendar out-of-range ISO date '${s}'.` };
+    }
+    return { ok: true, isoDate: s };
+  }
   const slash = s.match(/^(\d{2})\/(\d{2})\/(\d{4})$/);
   if (!slash) return { ok: false, reason: `Unrecognized date format '${s}'.` };
   const p1 = Number(slash[1]);
@@ -750,7 +810,7 @@ function parseExplicitDate(
   }
   const day = locale === "MDY" ? p2 : p1;
   const month = locale === "MDY" ? p1 : p2;
-  if (month < 1 || month > 12 || day < 1 || day > 31) {
+  if (!isValidGregorianDate(Number(year), month, day)) {
     return { ok: false, reason: `Calendar out-of-range date '${s}' under locale '${locale}'.` };
   }
   return { ok: true, isoDate: `${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}` };
@@ -961,7 +1021,10 @@ export class DataPreparationPipeline {
         workingRows = workingRows.map((row) => {
           const val = row[col];
           if (typeof val !== "string") return row;
-          const mapped = BILINGUAL_DEPARTMENT_DICTIONARY[val.trim().toLowerCase()];
+          const dictKey = val.trim().toLowerCase();
+          const mapped = Object.hasOwn(BILINGUAL_DEPARTMENT_DICTIONARY, dictKey)
+            ? BILINGUAL_DEPARTMENT_DICTIONARY[dictKey]
+            : undefined;
           return mapped ? { ...row, [col]: mapped } : row;
         });
       } else if (step.op === "parse_date_locale") {
@@ -1007,9 +1070,55 @@ export class DataPreparationPipeline {
         const surviving: StagedRow[] = [];
         for (const row of workingRows) {
           const raw = row[col];
-          const strVal = typeof raw === "string" ? raw.replace(/,/g, "").trim() : raw;
-          const num = strVal === null || strVal === undefined || strVal === "" ? NaN : Number(strVal);
-          if (!Number.isFinite(num)) {
+          const cleaned = typeof raw === "string" ? raw.replace(/,/g, "").trim() : raw;
+          let isValidNumeric = false;
+          let preservedVal: string | number = 0;
+          if (
+            cleaned !== null &&
+            cleaned !== undefined &&
+            cleaned !== "" &&
+            typeof cleaned !== "boolean" &&
+            (typeof cleaned === "number" || typeof cleaned === "string")
+          ) {
+            if (typeof cleaned === "number") {
+              isValidNumeric = Number.isFinite(cleaned);
+              if (isValidNumeric && col === "amount") {
+                const curr = String(row.currency ?? "USD").trim().toUpperCase();
+                const scale = currencyScaleFor(curr);
+                try {
+                  parseExactDecimalToMinorUnits(cleaned, scale);
+                } catch {
+                  isValidNumeric = false;
+                }
+              }
+              preservedVal = cleaned;
+            } else {
+              isValidNumeric = /^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$/.test(cleaned);
+              if (isValidNumeric && col === "amount") {
+                const curr = String(row.currency ?? "USD").trim().toUpperCase();
+                const scale = currencyScaleFor(curr);
+                try {
+                  const exactMinor = parseExactDecimalToMinorUnits(cleaned, scale);
+                  const asNum = Number(cleaned);
+                  if (Number.isFinite(asNum)) {
+                    try {
+                      preservedVal = parseExactDecimalToMinorUnits(asNum, scale) === exactMinor ? asNum : cleaned;
+                    } catch {
+                      preservedVal = cleaned;
+                    }
+                  } else {
+                    preservedVal = cleaned;
+                  }
+                } catch {
+                  isValidNumeric = false;
+                }
+              } else if (isValidNumeric) {
+                const asNum = Number(cleaned);
+                preservedVal = Number.isFinite(asNum) && (!cleaned.includes(".") ? Number.isSafeInteger(asNum) || Math.abs(asNum) < 1e15 : true) ? asNum : cleaned;
+              }
+            }
+          }
+          if (!isValidNumeric) {
             exceptions.push({
               exceptionId: `exc_${randomUUID().slice(0, 8)}`,
               sourceFile: row.__sourceFile,
@@ -1020,10 +1129,10 @@ export class DataPreparationPipeline {
               rawRecord: { ...row },
               resolved: false,
             });
-            if (col !== "amount") recordExcluded(row);
+            recordExcluded(row);
             continue;
           }
-          surviving.push({ ...row, [col]: num });
+          surviving.push({ ...row, [col]: preservedVal });
         }
         workingRows = surviving;
       } else if (step.op === "validate_schema_contract") {
@@ -1141,7 +1250,7 @@ export class DataPreparationPipeline {
         const seen = new Set<string>();
         const deduped: StagedRow[] = [];
         for (const row of workingRows) {
-          const composite = keys.map((k) => String(row[k] ?? "")).join("|");
+          const composite = JSON.stringify(keys.map((k) => row[k] ?? null));
           if (seen.has(composite)) {
             deduplicatedRows++;
             exceptions.push({

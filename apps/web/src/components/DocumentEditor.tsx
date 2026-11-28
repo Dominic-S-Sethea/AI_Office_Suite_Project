@@ -1,13 +1,14 @@
 import { forwardRef, memo, useEffect, useImperativeHandle, useRef } from "react";
 import { Extension, mergeAttributes, Node as TiptapCustomNode } from "@tiptap/core";
-import { EditorContent, useEditor } from "@tiptap/react";
+import { EditorState } from "@tiptap/pm/state";
+import { EditorContent, useEditor, useEditorState } from "@tiptap/react";
 import StarterKit from "@tiptap/starter-kit";
 import TextAlign from "@tiptap/extension-text-align";
 import { Table, TableCell, TableHeader, TableRow } from "@tiptap/extension-table";
 import Highlight from "@tiptap/extension-highlight";
 import { Color, FontFamily, TextStyle } from "@tiptap/extension-text-style";
 import Placeholder from "@tiptap/extension-placeholder";
-import type { DocumentBlock, LinkedMetricReference, StudioDocument } from "@ai-office-suite/shared-contracts";
+import type { DocumentBlock, LinkedMetricReference, StudioDocument, WorkspaceRole } from "@ai-office-suite/shared-contracts";
 
 const BlockIdAndFontSizeExtension = Extension.create({
   name: "blockIdAndFontSize",
@@ -92,8 +93,11 @@ interface DocumentEditorProps {
   document: StudioDocument;
   tiptapContent: Record<string, unknown>;
   readOnly: boolean;
+  effectiveRole?: WorkspaceRole;
+  syncVersion?: number;
   onDocChange?: (tiptapJson: Record<string, unknown>) => void;
   onDirtyChange?: (dirty: boolean) => void;
+  onEditMutation?: () => void;
   onSelectionChange: (sel: EditorSelectionState) => void;
 }
 
@@ -141,15 +145,27 @@ function findCurrentBlockId(
 }
 
 const DocumentEditorInner = forwardRef<DocumentEditorHandle, DocumentEditorProps>(function DocumentEditorInner(
-  { document, tiptapContent, readOnly, onDocChange, onDirtyChange, onSelectionChange },
+  {
+    document,
+    tiptapContent,
+    readOnly,
+    effectiveRole,
+    syncVersion = 0,
+    onDocChange,
+    onDirtyChange,
+    onEditMutation,
+    onSelectionChange,
+  },
   ref,
 ) {
   const blocksRef = useRef<DocumentBlock[]>(document.blocks);
   const onDocChangeRef = useRef(onDocChange);
   const onDirtyChangeRef = useRef(onDirtyChange);
+  const onEditMutationRef = useRef(onEditMutation);
   const onSelectionChangeRef = useRef(onSelectionChange);
   const isDirtyRef = useRef(false);
-  const lastSyncedKeyRef = useRef<string>(`${document.documentId}:${document.revision}`);
+  const lastSyncedKeyRef = useRef<string>(`${document.documentId}:${document.revision}:${syncVersion}`);
+  const lastSyncVersionRef = useRef<number>(syncVersion);
 
   useEffect(() => {
     blocksRef.current = document.blocks;
@@ -164,14 +180,31 @@ const DocumentEditorInner = forwardRef<DocumentEditorHandle, DocumentEditorProps
   }, [onDirtyChange]);
 
   useEffect(() => {
+    onEditMutationRef.current = onEditMutation;
+  }, [onEditMutation]);
+
+  useEffect(() => {
     onSelectionChangeRef.current = onSelectionChange;
   }, [onSelectionChange]);
 
   const editor = useEditor({
     editable: !readOnly,
+    editorProps: {
+      attributes: {
+        role: "textbox",
+        "aria-multiline": "true",
+        "aria-label": "Document editor",
+        "aria-readonly": String(readOnly),
+      },
+    },
     extensions: [
       StarterKit.configure({
         heading: { levels: [1, 2, 3] },
+        blockquote: false,
+        codeBlock: false,
+        strike: false,
+        code: false,
+        link: false,
       }),
       BlockIdAndFontSizeExtension,
       LinkedMetricPlaceholderNode,
@@ -195,6 +228,7 @@ const DocumentEditorInner = forwardRef<DocumentEditorHandle, DocumentEditorProps
         isDirtyRef.current = true;
         onDirtyChangeRef.current?.(true);
       }
+      onEditMutationRef.current?.();
       if (onDocChangeRef.current) {
         onDocChangeRef.current(ed.getJSON() as Record<string, unknown>);
       }
@@ -209,12 +243,14 @@ const DocumentEditorInner = forwardRef<DocumentEditorHandle, DocumentEditorProps
 
       let startOffset: number | undefined;
       let endOffset: number | undefined;
-      if (to > from && resolvedFrom.depth >= 1) {
+      const supportsInlineOffsets =
+        topNode?.type.name === "paragraph" || topNode?.type.name === "heading";
+      if (to > from && resolvedFrom.depth >= 1 && supportsInlineOffsets) {
         const blockStartPos = resolvedFrom.start(1);
         const blockEndPos = resolvedFrom.end(1);
         if (to <= blockEndPos) {
-          startOffset = ed.state.doc.textBetween(blockStartPos, from, "\n").normalize("NFC").length;
-          endOffset = ed.state.doc.textBetween(blockStartPos, to, "\n").normalize("NFC").length;
+          startOffset = ed.state.doc.textBetween(blockStartPos, from, "\n", "\n").normalize("NFC").length;
+          endOffset = ed.state.doc.textBetween(blockStartPos, to, "\n", "\n").normalize("NFC").length;
         }
       }
 
@@ -237,20 +273,147 @@ const DocumentEditorInner = forwardRef<DocumentEditorHandle, DocumentEditorProps
 
   useEffect(() => {
     if (!editor) return;
-    editor.setEditable(!readOnly);
+    if (editor.isEditable !== !readOnly) {
+      editor.setEditable(!readOnly, false);
+    }
+    const attrs = {
+      role: "textbox",
+      "aria-multiline": "true",
+      "aria-label": "Document editor",
+      "aria-readonly": String(readOnly),
+    };
+    editor.setOptions({ editorProps: { attributes: attrs } });
+    try {
+      if (editor.view?.dom) {
+        editor.view.dom.setAttribute("role", "textbox");
+        editor.view.dom.setAttribute("aria-multiline", "true");
+        editor.view.dom.setAttribute("aria-label", "Document editor");
+        editor.view.dom.setAttribute("aria-readonly", String(readOnly));
+      }
+    } catch {
+      // View DOM unavailable during SSR or unmounted teardown
+    }
   }, [editor, readOnly]);
 
   useEffect(() => {
     if (!editor) return;
-    const nextKey = `${document.documentId}:${document.revision}`;
+    const nextKey = `${document.documentId}:${document.revision}:${syncVersion}`;
     if (lastSyncedKeyRef.current !== nextKey) {
-      editor.commands.setContent(tiptapContent, { emitUpdate: false });
+      const syncForced = lastSyncVersionRef.current !== syncVersion;
+      if (isDirtyRef.current && !syncForced) {
+        lastSyncedKeyRef.current = nextKey;
+        return;
+      }
+      let replacedWithCleanHistory = false;
+      try {
+        if (editor.view && !editor.isDestroyed) {
+          const nextDoc = editor.schema.nodeFromJSON(tiptapContent);
+          const nextState = EditorState.create({
+            doc: nextDoc,
+            plugins: editor.state.plugins,
+          });
+          editor.view.updateState(nextState);
+          editor.emit("transaction", {
+            editor,
+            transaction: nextState.tr,
+            appendedTransactions: [],
+          });
+          replacedWithCleanHistory = true;
+        }
+      } catch {
+        replacedWithCleanHistory = false;
+      }
+      if (!replacedWithCleanHistory) {
+        editor.commands.setContent(tiptapContent, { emitUpdate: false });
+      }
       lastSyncedKeyRef.current = nextKey;
+      lastSyncVersionRef.current = syncVersion;
       isDirtyRef.current = false;
     }
-  }, [editor, document.revision, document.documentId, tiptapContent]);
+  }, [editor, document.revision, document.documentId, syncVersion, tiptapContent]);
 
-  const activeFont = (editor?.getAttributes("textStyle")?.fontFamily as string | undefined) ?? "";
+  const toolbarState =
+    useEditorState({
+      editor,
+      selector: (ctx) => {
+        const ed = ctx.editor;
+        if (!ed) {
+          return {
+            canUndo: false,
+            canRedo: false,
+            activeFont: "",
+            isParagraph: false,
+            isH1: false,
+            isH2: false,
+            isH3: false,
+            isBold: false,
+            isItalic: false,
+            isUnderline: false,
+            isAlignLeft: false,
+            isAlignCenter: false,
+            isAlignRight: false,
+            isAlignJustify: false,
+            isBulletList: false,
+            isOrderedList: false,
+          };
+        }
+        return {
+          canUndo: ed.can().undo(),
+          canRedo: ed.can().redo(),
+          activeFont: (ed.getAttributes("textStyle")?.fontFamily as string | undefined) ?? "",
+          isParagraph: ed.isActive("paragraph"),
+          isH1: ed.isActive("heading", { level: 1 }),
+          isH2: ed.isActive("heading", { level: 2 }),
+          isH3: ed.isActive("heading", { level: 3 }),
+          isBold: ed.isActive("bold"),
+          isItalic: ed.isActive("italic"),
+          isUnderline: ed.isActive("underline"),
+          isAlignLeft: ed.isActive({ textAlign: "left" }),
+          isAlignCenter: ed.isActive({ textAlign: "center" }),
+          isAlignRight: ed.isActive({ textAlign: "right" }),
+          isAlignJustify: ed.isActive({ textAlign: "justify" }),
+          isBulletList: ed.isActive("bulletList"),
+          isOrderedList: ed.isActive("orderedList"),
+        };
+      },
+    }) ?? {
+      canUndo: false,
+      canRedo: false,
+      activeFont: "",
+      isParagraph: false,
+      isH1: false,
+      isH2: false,
+      isH3: false,
+      isBold: false,
+      isItalic: false,
+      isUnderline: false,
+      isAlignLeft: false,
+      isAlignCenter: false,
+      isAlignRight: false,
+      isAlignJustify: false,
+      isBulletList: false,
+      isOrderedList: false,
+    };
+
+  const {
+    canUndo,
+    canRedo,
+    activeFont,
+    isParagraph,
+    isH1,
+    isH2,
+    isH3,
+    isBold,
+    isItalic,
+    isUnderline,
+    isAlignLeft,
+    isAlignCenter,
+    isAlignRight,
+    isAlignJustify,
+    isBulletList,
+    isOrderedList,
+  } = toolbarState;
+
   const sheetClasses = [
     "page-sheet",
     document.layout.size === "Letter" ? "letter" : "",
@@ -259,22 +422,29 @@ const DocumentEditorInner = forwardRef<DocumentEditorHandle, DocumentEditorProps
     .filter(Boolean)
     .join(" ");
 
-  const isParagraph = editor?.isActive("paragraph") ?? false;
-  const isH1 = editor?.isActive("heading", { level: 1 }) ?? false;
-  const isH2 = editor?.isActive("heading", { level: 2 }) ?? false;
-  const isH3 = editor?.isActive("heading", { level: 3 }) ?? false;
-  const isBold = editor?.isActive("bold") ?? false;
-  const isItalic = editor?.isActive("italic") ?? false;
-  const isUnderline = editor?.isActive("underline") ?? false;
-  const isAlignLeft = editor?.isActive({ textAlign: "left" }) ?? false;
-  const isAlignCenter = editor?.isActive({ textAlign: "center" }) ?? false;
-  const isAlignRight = editor?.isActive({ textAlign: "right" }) ?? false;
-  const isAlignJustify = editor?.isActive({ textAlign: "justify" }) ?? false;
-  const isBulletList = editor?.isActive("bulletList") ?? false;
-  const isOrderedList = editor?.isActive("orderedList") ?? false;
+  const readOnlyDetail =
+    effectiveRole === "reviewer"
+      ? "Editing, formatting, and saving are disabled. You may inspect history, compare diffs, and export DOCX/PDF."
+      : effectiveRole === "viewer"
+        ? "Editing, formatting, saving, and exporting are disabled for this role."
+        : "Editing, formatting, and saving are disabled for your current role.";
+  const roleLabel =
+    effectiveRole === "reviewer"
+      ? "Reviewer"
+      : effectiveRole === "viewer"
+        ? "Viewer"
+        : (effectiveRole ?? "restricted");
+  const readOnlyReason = `Read-only role (${roleLabel}): ${readOnlyDetail}`;
+  const toolbarDescribedBy = readOnly ? "editor-readonly-notice" : undefined;
 
   return (
     <div className="editor-container">
+      {readOnly && (
+        <div id="editor-readonly-notice" className="notice-readonly editor-readonly-banner" role="status">
+          <strong>Read-Only Mode ({effectiveRole ?? "restricted"}):</strong> {readOnlyDetail}
+        </div>
+      )}
+
       {editor && (
         <div
           className="toolbar editor-formatting-toolbar"
@@ -284,7 +454,9 @@ const DocumentEditorInner = forwardRef<DocumentEditorHandle, DocumentEditorProps
           <button
             type="button"
             className="btn"
-            disabled={readOnly || !editor.can().undo()}
+            disabled={readOnly || !canUndo}
+            aria-describedby={toolbarDescribedBy}
+            title={readOnly ? readOnlyReason : "Undo last edit (Ctrl+Z)"}
             onClick={() => editor.chain().focus().undo().run()}
           >
             Undo
@@ -292,7 +464,9 @@ const DocumentEditorInner = forwardRef<DocumentEditorHandle, DocumentEditorProps
           <button
             type="button"
             className="btn"
-            disabled={readOnly || !editor.can().redo()}
+            disabled={readOnly || !canRedo}
+            aria-describedby={toolbarDescribedBy}
+            title={readOnly ? readOnlyReason : "Redo edit (Ctrl+Y)"}
             onClick={() => editor.chain().focus().redo().run()}
           >
             Redo
@@ -302,6 +476,8 @@ const DocumentEditorInner = forwardRef<DocumentEditorHandle, DocumentEditorProps
             className={`btn ${isParagraph ? "active" : ""}`}
             aria-pressed={isParagraph}
             disabled={readOnly}
+            aria-describedby={toolbarDescribedBy}
+            title={readOnly ? readOnlyReason : "Normal paragraph"}
             onClick={() => editor.chain().focus().setParagraph().run()}
           >
             Normal
@@ -311,6 +487,8 @@ const DocumentEditorInner = forwardRef<DocumentEditorHandle, DocumentEditorProps
             className={`btn ${isH1 ? "active" : ""}`}
             aria-pressed={isH1}
             disabled={readOnly}
+            aria-describedby={toolbarDescribedBy}
+            title={readOnly ? readOnlyReason : "Heading 1"}
             onClick={() => editor.chain().focus().toggleHeading({ level: 1 }).run()}
           >
             H1
@@ -320,6 +498,8 @@ const DocumentEditorInner = forwardRef<DocumentEditorHandle, DocumentEditorProps
             className={`btn ${isH2 ? "active" : ""}`}
             aria-pressed={isH2}
             disabled={readOnly}
+            aria-describedby={toolbarDescribedBy}
+            title={readOnly ? readOnlyReason : "Heading 2"}
             onClick={() => editor.chain().focus().toggleHeading({ level: 2 }).run()}
           >
             H2
@@ -329,6 +509,8 @@ const DocumentEditorInner = forwardRef<DocumentEditorHandle, DocumentEditorProps
             className={`btn ${isH3 ? "active" : ""}`}
             aria-pressed={isH3}
             disabled={readOnly}
+            aria-describedby={toolbarDescribedBy}
+            title={readOnly ? readOnlyReason : "Heading 3"}
             onClick={() => editor.chain().focus().toggleHeading({ level: 3 }).run()}
           >
             H3
@@ -338,6 +520,8 @@ const DocumentEditorInner = forwardRef<DocumentEditorHandle, DocumentEditorProps
             className={`btn ${isBold ? "active" : ""}`}
             aria-pressed={isBold}
             disabled={readOnly}
+            aria-describedby={toolbarDescribedBy}
+            title={readOnly ? readOnlyReason : "Bold"}
             onClick={() => editor.chain().focus().toggleBold().run()}
           >
             Bold
@@ -347,6 +531,8 @@ const DocumentEditorInner = forwardRef<DocumentEditorHandle, DocumentEditorProps
             className={`btn ${isItalic ? "active" : ""}`}
             aria-pressed={isItalic}
             disabled={readOnly}
+            aria-describedby={toolbarDescribedBy}
+            title={readOnly ? readOnlyReason : "Italic"}
             onClick={() => editor.chain().focus().toggleItalic().run()}
           >
             Italic
@@ -356,6 +542,8 @@ const DocumentEditorInner = forwardRef<DocumentEditorHandle, DocumentEditorProps
             className={`btn ${isUnderline ? "active" : ""}`}
             aria-pressed={isUnderline}
             disabled={readOnly}
+            aria-describedby={toolbarDescribedBy}
+            title={readOnly ? readOnlyReason : "Underline"}
             onClick={() => editor.chain().focus().toggleUnderline().run()}
           >
             Underline
@@ -365,6 +553,8 @@ const DocumentEditorInner = forwardRef<DocumentEditorHandle, DocumentEditorProps
             className={`btn ${isAlignLeft ? "active" : ""}`}
             aria-pressed={isAlignLeft}
             disabled={readOnly}
+            aria-describedby={toolbarDescribedBy}
+            title={readOnly ? readOnlyReason : "Align left"}
             onClick={() => editor.chain().focus().setTextAlign("left").run()}
           >
             Left
@@ -374,6 +564,8 @@ const DocumentEditorInner = forwardRef<DocumentEditorHandle, DocumentEditorProps
             className={`btn ${isAlignCenter ? "active" : ""}`}
             aria-pressed={isAlignCenter}
             disabled={readOnly}
+            aria-describedby={toolbarDescribedBy}
+            title={readOnly ? readOnlyReason : "Align center"}
             onClick={() => editor.chain().focus().setTextAlign("center").run()}
           >
             Center
@@ -383,6 +575,8 @@ const DocumentEditorInner = forwardRef<DocumentEditorHandle, DocumentEditorProps
             className={`btn ${isAlignRight ? "active" : ""}`}
             aria-pressed={isAlignRight}
             disabled={readOnly}
+            aria-describedby={toolbarDescribedBy}
+            title={readOnly ? readOnlyReason : "Align right"}
             onClick={() => editor.chain().focus().setTextAlign("right").run()}
           >
             Right
@@ -392,6 +586,8 @@ const DocumentEditorInner = forwardRef<DocumentEditorHandle, DocumentEditorProps
             className={`btn ${isAlignJustify ? "active" : ""}`}
             aria-pressed={isAlignJustify}
             disabled={readOnly}
+            aria-describedby={toolbarDescribedBy}
+            title={readOnly ? readOnlyReason : "Justify text"}
             onClick={() => editor.chain().focus().setTextAlign("justify").run()}
           >
             Justify
@@ -401,6 +597,8 @@ const DocumentEditorInner = forwardRef<DocumentEditorHandle, DocumentEditorProps
             className={`btn ${isBulletList ? "active" : ""}`}
             aria-pressed={isBulletList}
             disabled={readOnly}
+            aria-describedby={toolbarDescribedBy}
+            title={readOnly ? readOnlyReason : "Bulleted list"}
             onClick={() => editor.chain().focus().toggleBulletList().run()}
           >
             Bullets
@@ -410,6 +608,8 @@ const DocumentEditorInner = forwardRef<DocumentEditorHandle, DocumentEditorProps
             className={`btn ${isOrderedList ? "active" : ""}`}
             aria-pressed={isOrderedList}
             disabled={readOnly}
+            aria-describedby={toolbarDescribedBy}
+            title={readOnly ? readOnlyReason : "Numbered list"}
             onClick={() => editor.chain().focus().toggleOrderedList().run()}
           >
             Numbered
@@ -418,14 +618,18 @@ const DocumentEditorInner = forwardRef<DocumentEditorHandle, DocumentEditorProps
             type="button"
             className="btn"
             disabled={readOnly}
+            aria-describedby={toolbarDescribedBy}
+            title={readOnly ? readOnlyReason : "Insert 3x3 table"}
             onClick={() => editor.chain().focus().insertTable({ rows: 3, cols: 3, withHeaderRow: true }).run()}
           >
             + Table 3×3
           </button>
           <select
-            className="btn"
+            className="select-control toolbar-select"
             disabled={readOnly}
             aria-label="Font family"
+            aria-describedby={toolbarDescribedBy}
+            title={readOnly ? readOnlyReason : "Font family for selected text"}
             value={activeFont}
             onChange={(e) => {
               if (e.target.value) {
@@ -436,14 +640,18 @@ const DocumentEditorInner = forwardRef<DocumentEditorHandle, DocumentEditorProps
             }}
           >
             <option value="">Font (EN/KM Default)</option>
-            <option value="Noto Sans Khmer">Noto Sans Khmer</option>
             <option value="Kantumruy Pro">Kantumruy Pro</option>
-            <option value="Inter">Inter</option>
+            <option value="Noto Sans Khmer">Noto Sans Khmer</option>
+            <option value="Georgia, serif">Georgia (Serif)</option>
           </select>
         </div>
       )}
 
-      <div className={sheetClasses} lang={document.language === "en" ? "en" : "km"}>
+      <div
+        className={sheetClasses}
+        lang={document.language === "km" ? "km" : "en"}
+        data-doc-language={document.language}
+      >
         <div className="page-header-footer top">
           <span>{document.layout.headerText}</span>
           <span>

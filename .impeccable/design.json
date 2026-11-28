@@ -1,0 +1,287 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-11-27T01:20:00.000Z",
+  "title": "Design System: AI Office Suite",
+  "extensions": {
+    "colorMeta": {
+      "sovereign-cobalt": {
+        "role": "primary",
+        "displayName": "Sovereign Cobalt",
+        "canonical": "#1d4ed8",
+        "tonalRamp": ["#0f172a", "#172554", "#1e3a8a", "#1d4ed8", "#3b82f6", "#60a5fa", "#bfdbfe", "#eff6ff"]
+      },
+      "sovereign-cobalt-hover": {
+        "role": "primary",
+        "displayName": "Sovereign Cobalt Hover",
+        "canonical": "#1e40af",
+        "tonalRamp": ["#0f172a", "#172554", "#1e3a8a", "#1e40af", "#2563eb", "#60a5fa", "#bfdbfe", "#eff6ff"]
+      },
+      "cobalt-wash": {
+        "role": "primary",
+        "displayName": "Cobalt Wash",
+        "canonical": "#eff6ff",
+        "tonalRamp": ["#1e3a8a", "#1d4ed8", "#3b82f6", "#60a5fa", "#93c5fd", "#bfdbfe", "#dbeafe", "#eff6ff"]
+      },
+      "cobalt-rule": {
+        "role": "primary",
+        "displayName": "Cobalt Rule",
+        "canonical": "#bfdbfe",
+        "tonalRamp": ["#1e3a8a", "#1d4ed8", "#2563eb", "#3b82f6", "#60a5fa", "#93c5fd", "#bfdbfe", "#eff6ff"]
+      },
+      "ledger-ink-navy": {
+        "role": "neutral",
+        "displayName": "Ledger Ink Navy",
+        "canonical": "#0f172a",
+        "tonalRamp": ["#020617", "#0f172a", "#1e293b", "#334155", "#475569", "#94a3b8", "#cbd5e1", "#f1f5f9"]
+      },
+      "chrome-slate": {
+        "role": "neutral",
+        "displayName": "Chrome Slate",
+        "canonical": "#1e293b",
+        "tonalRamp": ["#0f172a", "#1e293b", "#334155", "#475569", "#64748b", "#94a3b8", "#cbd5e1", "#f1f5f9"]
+      },
+      "archival-slate-mist": {
+        "role": "neutral",
+        "displayName": "Archival Slate Mist",
+        "canonical": "#f1f5f9",
+        "tonalRamp": ["#0f172a", "#1e293b", "#475569", "#64748b", "#94a3b8", "#cbd5e1", "#e2e8f0", "#f1f5f9"]
+      },
+      "paper-white": {
+        "role": "neutral",
+        "displayName": "Paper White",
+        "canonical": "#ffffff",
+        "tonalRamp": ["#0f172a", "#334155", "#64748b", "#94a3b8", "#cbd5e1", "#e2e8f0", "#f8fafc", "#ffffff"]
+      },
+      "paper-subtle": {
+        "role": "neutral",
+        "displayName": "Paper Subtle",
+        "canonical": "#f8fafc",
+        "tonalRamp": ["#0f172a", "#334155", "#475569", "#64748b", "#94a3b8", "#cbd5e1", "#e2e8f0", "#f8fafc"]
+      },
+      "ink-secondary": {
+        "role": "neutral",
+        "displayName": "Ink Secondary",
+        "canonical": "#334155",
+        "tonalRamp": ["#0f172a", "#1e293b", "#334155", "#475569", "#64748b", "#94a3b8", "#cbd5e1", "#f1f5f9"]
+      },
+      "slate-muted": {
+        "role": "neutral",
+        "displayName": "Slate Muted",
+        "canonical": "#475569",
+        "tonalRamp": ["#0f172a", "#1e293b", "#334155", "#475569", "#64748b", "#94a3b8", "#cbd5e1", "#f8fafc"]
+      },
+      "chrome-ink": {
+        "role": "neutral",
+        "displayName": "Chrome Ink",
+        "canonical": "#cbd5e1",
+        "tonalRamp": ["#0f172a", "#1e293b", "#334155", "#475569", "#64748b", "#94a3b8", "#cbd5e1", "#f8fafc"]
+      },
+      "chrome-ink-bright": {
+        "role": "neutral",
+        "displayName": "Chrome Ink Bright",
+        "canonical": "#f8fafc",
+        "tonalRamp": ["#0f172a", "#1e293b", "#334155", "#64748b", "#94a3b8", "#cbd5e1", "#f1f5f9", "#f8fafc"]
+      },
+      "chrome-ink-muted": {
+        "role": "neutral",
+        "displayName": "Chrome Ink Muted",
+        "canonical": "#94a3b8",
+        "tonalRamp": ["#0f172a", "#1e293b", "#334155", "#475569", "#64748b", "#94a3b8", "#cbd5e1", "#f1f5f9"]
+      },
+      "hairline-border": {
+        "role": "neutral",
+        "displayName": "Hairline Border",
+        "canonical": "#cbd5e1",
+        "tonalRamp": ["#1e293b", "#334155", "#475569", "#64748b", "#94a3b8", "#cbd5e1", "#e2e8f0", "#f8fafc"]
+      },
+      "hairline-subtle": {
+        "role": "neutral",
+        "displayName": "Hairline Subtle",
+        "canonical": "#e2e8f0",
+        "tonalRamp": ["#1e293b", "#334155", "#475569", "#64748b", "#94a3b8", "#cbd5e1", "#e2e8f0", "#f8fafc"]
+      },
+      "audit-amber": {
+        "role": "secondary",
+        "displayName": "Audit Amber",
+        "canonical": "#92400e",
+        "tonalRamp": ["#451a03", "#78350f", "#92400e", "#b45309", "#d97706", "#f59e0b", "#fde68a", "#fffbeb"]
+      },
+      "audit-amber-bg": {
+        "role": "secondary",
+        "displayName": "Audit Amber Bg",
+        "canonical": "#fffbeb",
+        "tonalRamp": ["#78350f", "#92400e", "#b45309", "#d97706", "#f59e0b", "#fcd34d", "#fde68a", "#fffbeb"]
+      },
+      "guardrail-crimson": {
+        "role": "secondary",
+        "displayName": "Guardrail Crimson",
+        "canonical": "#b91c1c",
+        "tonalRamp": ["#450a0a", "#7f1d1d", "#991b1b", "#b91c1c", "#dc2626", "#ef4444", "#fecaca", "#fef2f2"]
+      },
+      "guardrail-crimson-bg": {
+        "role": "secondary",
+        "displayName": "Guardrail Crimson Bg",
+        "canonical": "#fef2f2",
+        "tonalRamp": ["#7f1d1d", "#991b1b", "#b91c1c", "#dc2626", "#ef4444", "#fca5a5", "#fecaca", "#fef2f2"]
+      },
+      "verified-emerald": {
+        "role": "secondary",
+        "displayName": "Verified Emerald",
+        "canonical": "#065f46",
+        "tonalRamp": ["#022c22", "#064e3b", "#065f46", "#047857", "#059669", "#34d399", "#a7f3d0", "#ecfdf5"]
+      },
+      "verified-emerald-bg": {
+        "role": "secondary",
+        "displayName": "Verified Emerald Bg",
+        "canonical": "#ecfdf5",
+        "tonalRamp": ["#064e3b", "#065f46", "#047857", "#059669", "#10b981", "#6ee7b7", "#a7f3d0", "#ecfdf5"]
+      }
+    },
+    "typographyMeta": {
+      "headline-h1": { "displayName": "Headline H1", "purpose": "Top document headings inside editorial sheets." },
+      "headline-h2": { "displayName": "Headline H2", "purpose": "Major bilingual report section headings." },
+      "title": { "displayName": "Workspace Title", "purpose": "Application header title and drawer/modal headings." },
+      "body-document": { "displayName": "Body Document", "purpose": "Long-form English and Khmer manuscript prose." },
+      "body-ui": { "displayName": "Body UI", "purpose": "Interactive toolbar buttons, selects, and navigation controls." },
+      "label-caption": { "displayName": "Label Caption", "purpose": "Tabular statusbar telemetry, timestamps, and badges." },
+      "label-rail-heading": { "displayName": "Label Rail Heading", "purpose": "Uppercase section label above dark left rail controls." }
+    },
+    "shadows": [
+      { "name": "subtle-panel", "value": "0 4px 14px rgba(15, 23, 42, 0.06)", "purpose": "Inline contextual sub-panels entering above the canvas." },
+      { "name": "sheet-elevation", "value": "0 6px 24px rgba(15, 23, 42, 0.08)", "purpose": "Manuscript paper sheets and authentication cards." },
+      { "name": "modal-dialog", "value": "0 12px 32px rgba(15, 23, 42, 0.16)", "purpose": "Modal dialogs layered over darkened backdrop." },
+      { "name": "docked-shelf", "value": "0 -4px 18px rgba(15, 23, 42, 0.06)", "purpose": "Upward shadow above the docked AI & Voice bar." },
+      { "name": "active-rail-glow", "value": "0 4px 14px rgba(29, 78, 216, 0.3)", "purpose": "Focused directional elevation behind open rail accordion headers." }
+    ],
+    "motion": [
+      { "name": "control-transition", "value": "140ms ease", "purpose": "Fast button background and border hover transitions." },
+      { "name": "subpanel-enter", "value": "220ms cubic-bezier(0.22, 1, 0.36, 1)", "purpose": "Exponential ease-out entrance for contextual workspace sub-panels." },
+      { "name": "rail-accordion", "value": "300ms cubic-bezier(0.22, 1, 0.36, 1)", "purpose": "Smooth CSS grid 0fr to 1fr accordion expansion on dark rail groups (disabled under prefers-reduced-motion)." }
+    ],
+    "breakpoints": [
+      { "name": "tablet", "value": "1180px" },
+      { "name": "compact", "value": "960px" },
+      { "name": "mobile", "value": "640px" }
+    ]
+  },
+  "components": [
+    {
+      "name": "Primary Button",
+      "kind": "button",
+      "refersTo": "button-primary",
+      "description": "Primary commitment action (Save *, Approve & Apply, Confirm Plan).",
+      "html": "<button type=\"button\" class=\"ds-btn-primary\">Save Changes</button>",
+      "css": ".ds-btn-primary { display: inline-flex; align-items: center; justify-content: center; min-height: 32px; padding: 5px 11px; border-radius: 6px; border: 1px solid var(--primary, #1d4ed8); background: var(--primary, #1d4ed8); color: var(--on-primary, #ffffff); font-size: 12px; font-weight: 500; cursor: pointer; transition: background 140ms ease; } .ds-btn-primary:hover { background: var(--primary-hover, #1e40af); } .ds-btn-primary:focus-visible { outline: 2px solid var(--primary, #1d4ed8); outline-offset: 2px; }"
+    },
+    {
+      "name": "Secondary & Formatting Button",
+      "kind": "button",
+      "refersTo": "button-secondary",
+      "description": "Default action and formatting toolbar toggle with active cobalt state.",
+      "html": "<div style=\"display:flex;gap:6px;\"><button type=\"button\" class=\"ds-btn-secondary\">Bold</button><button type=\"button\" class=\"ds-btn-secondary ds-is-active\" aria-pressed=\"true\">H1</button></div>",
+      "css": ".ds-btn-secondary { display: inline-flex; align-items: center; justify-content: center; min-height: 32px; padding: 5px 11px; border-radius: 6px; border: 1px solid var(--border, #cbd5e1); background: var(--surface, #ffffff); color: var(--text, #0f172a); font-size: 12px; font-weight: 500; cursor: pointer; transition: background 140ms ease, border-color 140ms ease; } .ds-btn-secondary:hover { background: var(--surface-hover, #f8fafc); } .ds-btn-secondary.ds-is-active { background: var(--primary-soft, #eff6ff); border-color: var(--primary, #1d4ed8); color: var(--primary, #1d4ed8); } .ds-btn-secondary:focus-visible { outline: 2px solid var(--primary, #1d4ed8); outline-offset: 2px; }"
+    },
+    {
+      "name": "Danger Guardrail Button",
+      "kind": "button",
+      "refersTo": "button-danger",
+      "description": "Second-step confirmation trigger inside version restore guardrails.",
+      "html": "<button type=\"button\" class=\"ds-btn-danger\">Confirm Restore</button>",
+      "css": ".ds-btn-danger { display: inline-flex; align-items: center; justify-content: center; min-height: 32px; padding: 5px 11px; border-radius: 6px; border: 1px solid var(--danger, #b91c1c); background: var(--danger, #b91c1c); color: var(--on-primary, #ffffff); font-size: 12px; font-weight: 500; cursor: pointer; transition: background 140ms ease; } .ds-btn-danger:hover { background: var(--danger-hover, #991b1b); } .ds-btn-danger:focus-visible { outline: 2px solid var(--primary, #1d4ed8); outline-offset: 2px; }"
+    },
+    {
+      "name": "Text Input & Bilingual Command Field",
+      "kind": "input",
+      "refersTo": "input-field",
+      "description": "Clean document title field and bilingual English/Khmer command input.",
+      "html": "<input type=\"text\" class=\"ds-input\" value=\"របាយការណ៍ប្រចាំខែ · Monthly Report\" aria-label=\"Document title\" />",
+      "css": ".ds-input { width: 100%; border: 1px solid var(--border, #cbd5e1); border-radius: 6px; padding: 7px 10px; font-size: 13px; font-weight: 600; background: var(--surface, #ffffff); color: var(--text, #0f172a); caret-color: var(--primary, #1d4ed8); } .ds-input:focus-visible { outline: 2px solid var(--primary, #1d4ed8); outline-offset: 2px; }"
+    },
+    {
+      "name": "Status & Provenance Badges",
+      "kind": "chip",
+      "refersTo": "badge-ok",
+      "description": "Explicit truthfulness and RBAC status pills.",
+      "html": "<div style=\"display:flex;gap:6px;flex-wrap:wrap;\"><span class=\"ds-badge ds-badge-ok\">Live API</span><span class=\"ds-badge ds-badge-warn\">Mock Speech · Local Planner</span><span class=\"ds-badge ds-badge-neutral\">Reference Benchmark</span></div>",
+      "css": ".ds-badge { display: inline-flex; align-items: center; padding: 3px 9px; border-radius: 999px; font-size: 11px; font-weight: 600; line-height: 1.2; border: 1px solid transparent; white-space: nowrap; } .ds-badge-ok { background: var(--ok-bg, #ecfdf5); color: var(--ok-text, #065f46); border-color: var(--ok-border, #a7f3d0); } .ds-badge-warn { background: var(--warning-bg, #fffbeb); color: var(--warning-text, #92400e); border-color: var(--warning-border, #fde68a); } .ds-badge-neutral { background: var(--surface-subtle, #f8fafc); color: var(--muted, #475569); border-color: var(--border, #cbd5e1); }"
+    },
+    {
+      "name": "Studio Navigation Tabs",
+      "kind": "nav",
+      "refersTo": "studio-tab-active",
+      "description": "Topbar contrast distinguishing active Document Studio from dashed Planned studios.",
+      "html": "<nav class=\"ds-tabs\" aria-label=\"Studios\"><button type=\"button\" class=\"ds-tab ds-tab-active\">Document Studio</button><button type=\"button\" class=\"ds-tab ds-tab-gated\"><span>Spreadsheets</span><span class=\"ds-tag\">Planned</span></button></nav>",
+      "css": ".ds-tabs { display: inline-flex; align-items: center; gap: 6px; padding: 8px 12px; background: var(--chrome-bg, #0f172a); border-radius: 8px; } .ds-tab { display: inline-flex; align-items: center; gap: 6px; min-height: 32px; padding: 5px 11px; border-radius: 6px; font-size: 12px; font-weight: 500; cursor: pointer; transition: background 150ms ease, border-color 150ms ease; } .ds-tab-active { background: var(--primary, #1d4ed8); border: 1px solid var(--primary-bright, #2563eb); color: var(--on-primary, #ffffff); font-weight: 600; } .ds-tab-gated { background: transparent; color: var(--chrome-text, #cbd5e1); border: 1px dashed var(--chrome-border-strong, #475569); } .ds-tab-gated:hover { background: rgba(51, 65, 85, 0.55); } .ds-tag { font-size: 10px; font-weight: 600; padding: 1px 6px; border-radius: 999px; background: var(--chrome-surface, #1e293b); color: var(--chrome-text, #cbd5e1); border: 1px solid var(--chrome-border-strong, #475569); } .ds-tab:focus-visible { outline: 2px solid var(--primary, #1d4ed8); outline-offset: 2px; }"
+    },
+    {
+      "name": "Left Rail Accordion Section",
+      "kind": "nav",
+      "refersTo": "button-primary",
+      "description": "Dark left rail group trigger with inline vector icon and active directional highlight.",
+      "html": "<div class=\"ds-rail\"><button type=\"button\" class=\"ds-rail-btn\"><span class=\"ds-rail-icon\"><svg width=\"15\" height=\"15\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\"><path d=\"M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z\"/><polyline points=\"14 2 14 8 20 8\"/></svg></span><span>Files &amp; Docs</span></button></div>",
+      "css": ".ds-rail { background: var(--chrome-bg, #0f172a); padding: 10px; border-radius: 10px; width: 240px; } .ds-rail-btn { width: 100%; display: flex; align-items: center; gap: 9px; padding: 8px 10px; min-height: 36px; border-radius: 9px; border: 1px solid rgba(147, 197, 253, 0.35); background: linear-gradient(135deg, #2563eb 0%, #1d4ed8 100%); color: #ffffff; font-size: 12.5px; font-weight: 500; cursor: pointer; box-shadow: 0 4px 14px rgba(29, 78, 216, 0.3); } .ds-rail-btn:hover { filter: brightness(1.06); } .ds-rail-btn:focus-visible { outline: 2px solid #93c5fd; outline-offset: 2px; } .ds-rail-icon { display: inline-flex; align-items: center; justify-content: center; width: 24px; height: 24px; border-radius: 7px; background: rgba(255, 255, 255, 0.2); }"
+    },
+    {
+      "name": "Two-Step Restore Confirmation Card",
+      "kind": "card",
+      "refersTo": "button-danger",
+      "description": "Full-perimeter bordered guardrail requiring explicit confirmation before restoring a revision.",
+      "html": "<div class=\"ds-restore-box\"><div>Restore <strong>Revision 1</strong> as a new non-destructive head revision?</div><div style=\"display:flex;gap:6px;\"><button type=\"button\" class=\"ds-restore-confirm\">Confirm Restore</button><button type=\"button\" class=\"ds-restore-cancel\">Cancel</button></div></div>",
+      "css": ".ds-restore-box { background: var(--danger-bg, #fef2f2); border: 1px solid var(--danger-border, #fecaca); border-radius: 6px; padding: 8px 10px; display: flex; flex-direction: column; gap: 8px; font-size: 12px; color: var(--text, #0f172a); } .ds-restore-confirm { min-height: 32px; padding: 5px 11px; border-radius: 6px; border: 1px solid var(--danger, #b91c1c); background: var(--danger, #b91c1c); color: #ffffff; font-size: 12px; cursor: pointer; } .ds-restore-confirm:hover { background: var(--danger-hover, #991b1b); } .ds-restore-cancel { min-height: 32px; padding: 5px 11px; border-radius: 6px; border: 1px solid var(--border, #cbd5e1); background: #ffffff; color: #0f172a; font-size: 12px; cursor: pointer; }"
+    }
+  ],
+  "narrative": {
+    "northStar": "**Creative North Star: \"The Audited Ledger Desk\"**",
+    "overview": "AI Office Suite pairs dark archival perimeter chrome with crisp white editorial paper so bilingual English and ខ្មែរ documents command the central desk. Interactive controls stay refined and restrained, ensuring permissions, diffs, mock speech status, and planned boundaries remain immediately scannable defined across `apps/web/src/styles.css` and `apps/web/src/App.tsx`.\n\nIt rejects glossy consumer gradients across content cards, decorative glassmorphism, neon dark-mode accents, one-sided border bars, and Latin-only fonts that clip Khmer coeng subscripts.",
+    "keyCharacteristics": [
+      "Dark slate perimeter navigation framing an archival mist stage and crisp white manuscripts",
+      "Harmonized bilingual English and ខ្មែរ type scale using `Kantumruy Pro` and `Noto Sans Khmer`",
+      "Hairline-bordered controls at rest with structural shadows reserved for sheets, docks, and overlays",
+      "Honest, color-coded provenance cues separating live APIs, read-only guards, mock speech, and planned studios"
+    ],
+    "rules": [
+      {
+        "name": "The One-Accent Authority Rule",
+        "body": "Sovereign Cobalt (#1d4ed8) is reserved for active selection, primary commitment actions, and focus rings; inactive navigation items and neutral badges never receive saturated blue fills.",
+        "section": "colors"
+      },
+      {
+        "name": "The Honest Semantic Status Rule",
+        "body": "Amber signals mock disclosures, conflicts, and export progress; Crimson guards destructive actions and errors; Emerald marks verified live state.",
+        "section": "colors"
+      },
+      {
+        "name": "The Khmer Clearance Rule",
+        "body": "Prose runs at `1.8` line-height and headings at `1.65` with `0` letter-spacing so stacked Khmer subscripts never clip.",
+        "section": "typography"
+      },
+      {
+        "name": "The Tabular Ledger Rule",
+        "body": "Numeric KPIs, revision counters, and table cells enforce `tabular-nums` alignment.",
+        "section": "typography"
+      },
+      {
+        "name": "The Structural Shadow Rule",
+        "body": "Flat cards remain border-defined at rest; shadows reserve tactile depth strictly for manuscripts, docks, and modals.",
+        "section": "elevation"
+      },
+      {
+        "name": "The Full-Perimeter Border Rule",
+        "body": "Notices, diffs, and two-step confirmations use complete 1px perimeter borders rather than one-sided stripe accents.",
+        "section": "shapes"
+      }
+    ],
+    "dos": [
+      "Do pair `Kantumruy Pro` and `Noto Sans Khmer` with `0em` letter-spacing, `1.8` body line-height, and `1.65` heading line-height so stacked Khmer subscripts never clip.",
+      "Do enforce `44px` minimum target heights on interactive controls under `<= 640px` and `pointer: coarse` (`32px` desktop).",
+      "Do disclose `isMock: true` speech adapters, `Planned` studios, `Reference Benchmark` sub-panels, and RBAC restrictions inline alongside disabled controls.",
+      "Do use full `1px` perimeter borders and inline two-step confirmation before executing version restores."
+    ],
+    "donts": [
+      "Don't apply negative tracking, fixed pixel height clipping, or unbundled font weights to Khmer text or selection excerpts.",
+      "Don't decorate cards or diffs with one-sided stripe borders, decorative blurs, or gradients outside the active left-rail header state.",
+      "Don't share clickable button cursor styles on `<textarea>`/`<select>` fields, or let mobile navigation toggles appear above `960px`.",
+      "Don't sandwich narrow phone viewports into fixed heights that obscure the editorial sheet beneath the AI dock."
+    ]
+  }
+}

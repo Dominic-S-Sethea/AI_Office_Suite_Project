@@ -1,4 +1,14 @@
 import { DuckDBInstance } from "@duckdb/node-api";
+import { currencyScaleFor, parseExactDecimalToMinorUnits } from "@ai-office-suite/validation";
+
+function formatExactDecimalTwoDp(amount: number | string): string {
+  const minor = parseExactDecimalToMinorUnits(amount, 2);
+  const sign = minor < 0n ? "-" : "";
+  const abs = minor < 0n ? -minor : minor;
+  const whole = abs / 100n;
+  const frac = (abs % 100n).toString().padStart(2, "0");
+  return `${sign}${whole}.${frac}`;
+}
 
 export interface EngineComparisonRow {
   organization_id: string;
@@ -35,12 +45,7 @@ export interface EngineStressResult {
   p50Ms: number;
   p95Ms: number;
   rssDeltaMb: number;
-}
-
-function currencyScaleForCode(currency: string): number {
-  const c = currency.trim().toUpperCase();
-  if (c === "KHR" || c === "JPY" || c === "KRW" || c === "VND") return 0;
-  return 2;
+  summaryRows?: Array<{ currency: string; totalAmt: number }>;
 }
 
 export async function runDuckDbComparison(
@@ -58,6 +63,7 @@ export async function runDuckDbComparison(
 
     await conn.run(`
       CREATE TABLE sales_raw (
+        row_seq BIGINT,
         organization_id VARCHAR,
         invoice_id VARCHAR,
         line_number VARCHAR,
@@ -74,16 +80,18 @@ export async function runDuckDbComparison(
     `);
 
     const salesStmt = await conn.prepare(
-      "INSERT INTO sales_raw VALUES ($1, $2, $3, $4, $5, $6, $7)",
+      "INSERT INTO sales_raw VALUES (CAST($1 AS BIGINT), $2, $3, $4, $5, $6, $7, CAST($8 AS DECIMAL(18,2)))",
     );
-    for (const r of salesRows) {
-      salesStmt.bindVarchar(1, r.organization_id);
-      salesStmt.bindVarchar(2, r.invoice_id);
-      salesStmt.bindVarchar(3, r.line_number);
-      salesStmt.bindVarchar(4, r.customer_id);
-      salesStmt.bindVarchar(5, r.department);
-      salesStmt.bindVarchar(6, r.currency);
-      salesStmt.bindDouble(7, r.amount);
+    for (let rowIdx = 0; rowIdx < salesRows.length; rowIdx++) {
+      const r = salesRows[rowIdx]!;
+      salesStmt.bindVarchar(1, String(rowIdx));
+      salesStmt.bindVarchar(2, r.organization_id);
+      salesStmt.bindVarchar(3, r.invoice_id);
+      salesStmt.bindVarchar(4, r.line_number);
+      salesStmt.bindVarchar(5, r.customer_id);
+      salesStmt.bindVarchar(6, r.department);
+      salesStmt.bindVarchar(7, String(r.currency ?? "USD").trim().toUpperCase());
+      salesStmt.bindVarchar(8, formatExactDecimalTwoDp(r.amount));
       await salesStmt.run();
     }
     salesStmt.destroySync();
@@ -124,13 +132,13 @@ export async function runDuckDbComparison(
       .getRowObjects()
       .map((row) => String(row.customer_id));
 
-    // Composite key deduplication preserving first occurrence
+    // Composite key deduplication preserving deterministic insertion order
     await conn.run(`
       CREATE TABLE sales_dedup AS
       SELECT DISTINCT ON (organization_id, invoice_id, line_number)
         organization_id, invoice_id, line_number, customer_id, department, currency, amount
       FROM sales_raw
-      ORDER BY organization_id, invoice_id, line_number;
+      ORDER BY organization_id, invoice_id, line_number, row_seq;
     `);
 
     const cntReader = await conn.runAndReadAll("SELECT COUNT(*)::INTEGER AS cnt FROM sales_dedup");
@@ -150,19 +158,19 @@ export async function runDuckDbComparison(
 
     const totalsReader = await conn.runAndReadAll(`
       SELECT
-        currency,
+        UPPER(TRIM(currency)) AS currency,
         SUM(amount)::DOUBLE AS total_amt,
         CAST(SUM(CAST(ROUND(amount * 100) AS BIGINT)) AS VARCHAR) AS total_minor_scale2,
         CAST(SUM(CAST(ROUND(amount) AS BIGINT)) AS VARCHAR) AS total_minor_scale0
       FROM sales_dedup
-      GROUP BY currency
-      ORDER BY currency
+      GROUP BY UPPER(TRIM(currency))
+      ORDER BY UPPER(TRIM(currency))
     `);
     const currencyTotals: Record<string, number> = {};
     const currencyMinorTotals: Record<string, string> = {};
     for (const row of totalsReader.getRowObjects()) {
-      const code = String(row.currency);
-      const scale = currencyScaleForCode(code);
+      const code = String(row.currency).trim().toUpperCase();
+      const scale = currencyScaleFor(code);
       currencyTotals[code] = Math.round(Number(row.total_amt) * 100) / 100;
       currencyMinorTotals[code] = String(scale === 0 ? row.total_minor_scale0 : row.total_minor_scale2);
     }
@@ -241,9 +249,16 @@ export async function benchmarkDuckDbStress(rowCount: number): Promise<EngineStr
     await conn.runAndReadAll(query);
     const rssBefore = process.memoryUsage().rss;
     const samples: number[] = [];
+    let summaryRows: Array<{ currency: string; totalAmt: number }> = [];
     for (let i = 0; i < 3; i++) {
       const t0 = performance.now();
-      await conn.runAndReadAll(query);
+      const reader = await conn.runAndReadAll(query);
+      if (i === 2) {
+        summaryRows = reader
+          .getRowObjects()
+          .map((r) => ({ currency: String(r.currency), totalAmt: Number(r.total_amt) }))
+          .sort((a, b) => a.currency.localeCompare(b.currency));
+      }
       samples.push(performance.now() - t0);
     }
     const rssAfter = process.memoryUsage().rss;
@@ -254,6 +269,7 @@ export async function benchmarkDuckDbStress(rowCount: number): Promise<EngineStr
       p50Ms: Math.round(samples[1]! * 100) / 100,
       p95Ms: Math.round(samples[2]! * 100) / 100,
       rssDeltaMb: Math.round(((rssAfter - rssBefore) / (1024 * 1024)) * 100) / 100,
+      summaryRows,
     };
   } finally {
     conn.closeSync();

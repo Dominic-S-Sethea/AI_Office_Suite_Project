@@ -50,10 +50,15 @@ export interface PlannedToolStep {
   params: Record<string, unknown>;
 }
 
+export const MAX_AGENT_STEPS = 25;
+export const MAX_RUNTIME_CACHE_ENTRIES = 2_000;
+
 export interface ExecuteAgentRunInput {
   actor: ActorContext;
   source: OperationSource | "workflow";
   idempotencyKey: string;
+  /** Optional caller-supplied run identifier so cancellation can occur before inference begins. */
+  runId?: string;
   instruction: string;
   inputLanguage: "en" | "km";
   outputLanguage: "en" | "km" | "match";
@@ -66,6 +71,8 @@ export interface ExecuteAgentRunInput {
   approved: boolean;
   knowledgeQuery?: string;
   steps: readonly PlannedToolStep[];
+  /** Optional hook invoked right before provider inference; return `{ cancel: true }` to test pre-inference cancel. */
+  beforeInferenceHook?: (runId: string) => Promise<{ cancel?: boolean } | void>;
   /** Optional hook invoked right before executing a step; return true to trigger mid-run cancellation (AI-T24). */
   beforeStepHook?: (stepIndex: number, run: AgentRunRecord) => Promise<{ cancel?: boolean } | void>;
   /** Optional hook invoked right before final citation recheck (tests mid-flight revocation AI-T17). */
@@ -91,6 +98,7 @@ export class AiIntelligenceCore {
   private readonly quota?: QuotaAccountingHooks;
   private readonly adapterResolver: (providerId: any) => AIProviderAdapter;
   private readonly runsByIdempotency = new Map<string, AgentRunRecord>();
+  private readonly inFlightByIdempotency = new Map<string, Promise<{ run: AgentRunRecord; deduplicated: boolean }>>();
   private readonly canceledRunIds = new Set<string>();
 
   constructor(deps: {
@@ -109,8 +117,90 @@ export class AiIntelligenceCore {
     this.adapterResolver = deps.adapterResolver ?? getAIProviderAdapter;
   }
 
-  requestCancel(runId: string): void {
-    this.canceledRunIds.add(runId);
+  requestCancel(runId: string, tenantId?: string): void {
+    const cancelKey = `${tenantId ?? "*"}::${runId}`;
+    if (this.canceledRunIds.size >= MAX_RUNTIME_CACHE_ENTRIES && !this.canceledRunIds.has(cancelKey)) {
+      const oldestRunId = this.canceledRunIds.keys().next().value;
+      if (oldestRunId !== undefined) {
+        this.canceledRunIds.delete(oldestRunId);
+      }
+    }
+    this.canceledRunIds.add(cancelKey);
+  }
+
+  private isRunCanceled(runId: string, tenantId: string): boolean {
+    return this.canceledRunIds.has(`${tenantId}::${runId}`) || this.canceledRunIds.has(`*::${runId}`);
+  }
+
+  private clearCancelFlag(runId: string, tenantId: string): void {
+    this.canceledRunIds.delete(`${tenantId}::${runId}`);
+    this.canceledRunIds.delete(`*::${runId}`);
+  }
+
+  private recordCompletedRun(idempKey: string, run: AgentRunRecord): void {
+    if (this.runsByIdempotency.size >= MAX_RUNTIME_CACHE_ENTRIES && !this.runsByIdempotency.has(idempKey)) {
+      const oldestKey = this.runsByIdempotency.keys().next().value;
+      if (oldestKey !== undefined) {
+        this.runsByIdempotency.delete(oldestKey);
+      }
+    }
+    this.runsByIdempotency.set(idempKey, structuredClone(run));
+  }
+
+  private async cancelRun(params: {
+    input: ExecuteAgentRunInput;
+    idempKey: string;
+    run: AgentRunRecord;
+    fromStepIndex: number;
+    reservationRef: { id?: string };
+    inferenceMeta?: {
+      estimatedCostMicroUsd: number;
+      providerId: string;
+      modelId: string;
+      isMock: boolean;
+    };
+    summary: string;
+  }): Promise<{ run: AgentRunRecord; deduplicated: false }> {
+    const { input, idempKey, run, fromStepIndex, reservationRef, inferenceMeta, summary } = params;
+    for (let rem = fromStepIndex; rem < run.steps.length; rem++) {
+      run.steps[rem]!.status = "skipped_canceled";
+    }
+    run.state = "canceled";
+    run.updatedAt = new Date().toISOString();
+    if (this.quota && reservationRef.id) {
+      const resId = reservationRef.id;
+      reservationRef.id = undefined;
+      if (run.tokensUsed > 0 && inferenceMeta) {
+        await this.quota.settleTokens({
+          tenantId: input.actor.tenantId,
+          reservationId: resId,
+          actualTokens: run.tokensUsed,
+          estimatedCostMicroUsd: inferenceMeta.estimatedCostMicroUsd,
+          source: input.source,
+          providerId: inferenceMeta.providerId,
+          modelId: inferenceMeta.modelId,
+          isMock: inferenceMeta.isMock,
+        });
+      } else {
+        await this.quota.releaseTokens(input.actor.tenantId, resId);
+      }
+    }
+    this.audit.append({
+      auditId: `aud_${randomUUID()}`,
+      tenantId: input.actor.tenantId,
+      workspaceId: input.actor.workspaceId,
+      actorId: input.actor.userId,
+      actorRole: input.actor.role,
+      source: input.source === "workflow" ? "system" : input.source,
+      action: "ai_core.run_canceled",
+      outcome: "success",
+      operationId: run.runId,
+      summary,
+      createdAt: run.updatedAt,
+    });
+    this.clearCancelFlag(run.runId, input.actor.tenantId);
+    this.recordCompletedRun(idempKey, run);
+    return { run, deduplicated: false };
   }
 
   async executeRun(input: ExecuteAgentRunInput): Promise<{ run: AgentRunRecord; deduplicated: boolean }> {
@@ -119,12 +209,38 @@ export class AiIntelligenceCore {
     if (existing) {
       return { run: structuredClone(existing), deduplicated: true };
     }
+    const inFlight = this.inFlightByIdempotency.get(idempKey);
+    if (inFlight) {
+      const settled = await inFlight;
+      return { run: structuredClone(settled.run), deduplicated: true };
+    }
+
+    const promise = this.executeRunInternal(input, idempKey);
+    this.inFlightByIdempotency.set(idempKey, promise);
+    try {
+      return await promise;
+    } finally {
+      this.inFlightByIdempotency.delete(idempKey);
+    }
+  }
+
+  private async executeRunInternal(
+    input: ExecuteAgentRunInput,
+    idempKey: string,
+  ): Promise<{ run: AgentRunRecord; deduplicated: boolean }> {
+    if (input.steps.length > MAX_AGENT_STEPS) {
+      throw new AiPlanningError(
+        400,
+        "TOO_MANY_STEPS",
+        `Agent run requested ${input.steps.length} steps, exceeding maximum allowed (${MAX_AGENT_STEPS}).`,
+      );
+    }
 
     const now = new Date().toISOString();
-    const runId = `run_${randomUUID()}`;
+    const runId = input.runId?.trim() || `run_${randomUUID()}`;
 
-    // 1. Direct prompt-injection check
-    const promptScan = scanForPromptInjection(input.instruction);
+    // 1. Direct prompt-injection check (instruction + knowledgeQuery)
+    const promptScan = scanForPromptInjection(input.instruction, input.knowledgeQuery);
     if (!promptScan.safe) {
       this.audit.append({
         auditId: `aud_${randomUUID()}`,
@@ -216,6 +332,7 @@ export class AiIntelligenceCore {
       policy: input.routingPolicy,
       classification: input.classification,
       requiredCapabilities,
+      expectedTenantId: input.actor.tenantId,
       ...(input.unhealthyModelIds ? { unhealthyModelIds: input.unhealthyModelIds } : {}),
     });
 
@@ -254,7 +371,7 @@ export class AiIntelligenceCore {
 
     // 5. Atomic quota reservation before inference & execution
     const estimatedTokens = Math.max(250, Math.ceil(input.instruction.length / 2) + input.steps.length * 150);
-    let reservationId: string | undefined;
+    const reservationRef: { id?: string } = {};
     if (this.quota) {
       const res = await this.quota.reserveTokens({
         tenantId: input.actor.tenantId,
@@ -264,7 +381,7 @@ export class AiIntelligenceCore {
         idempotencyKey: `ai-run:${input.idempotencyKey}`,
         correlationId: runId,
       });
-      reservationId = res.reservationId;
+      reservationRef.id = res.reservationId;
     }
 
     const run: AgentRunRecord = {
@@ -281,12 +398,21 @@ export class AiIntelligenceCore {
       routingDecision,
       steps: stepRecords,
       verifiedFacts: [],
-      ...(reservationId ? { reservationId } : {}),
+      ...(reservationRef.id ? { reservationId: reservationRef.id } : {}),
       tokensUsed: 0,
       isMock: adapter.isMock,
       createdAt: now,
       updatedAt: now,
     };
+
+    let lastInferenceMeta:
+      | {
+          estimatedCostMicroUsd: number;
+          providerId: string;
+          modelId: string;
+          isMock: boolean;
+        }
+      | undefined;
 
     try {
       // 6. Permission-aware corporate knowledge retrieval (if requested)
@@ -294,6 +420,24 @@ export class AiIntelligenceCore {
       let retrievalResult = this.knowledge && input.knowledgeQuery
         ? this.knowledge.retrieve({ actor: input.actor, query: input.knowledgeQuery })
         : undefined;
+
+      // Pre-inference cancellation check: full quota release when canceled before model inference
+      if (input.beforeInferenceHook) {
+        const hookRes = await input.beforeInferenceHook(runId);
+        if (hookRes?.cancel) {
+          this.requestCancel(runId, input.actor.tenantId);
+        }
+      }
+      if (this.isRunCanceled(runId, input.actor.tenantId)) {
+        return await this.cancelRun({
+          input,
+          idempKey,
+          run,
+          fromStepIndex: 0,
+          reservationRef,
+          summary: `AgentRun ${runId} canceled safely before provider inference.`,
+        });
+      }
 
       // 7. Provider inference (strictly fail-closed for locked external providers!)
       const inference = await adapter.infer({
@@ -308,6 +452,12 @@ export class AiIntelligenceCore {
       });
       run.tokensUsed = inference.inputTokens + inference.outputTokens;
       run.isMock = inference.isMock;
+      lastInferenceMeta = {
+        estimatedCostMicroUsd: inference.estimatedCostMicroUsd,
+        providerId: inference.providerId,
+        modelId: inference.modelId,
+        isMock: inference.isMock,
+      };
 
       if (retrievalResult && this.knowledge) {
         if (input.beforeCitationRecheckHook) {
@@ -318,12 +468,25 @@ export class AiIntelligenceCore {
           claim: f.claim,
           citation: f.citation,
         }));
-        groundedSummary =
-          retrievalResult.status === "insufficient_evidence"
-            ? "INSUFFICIENT_EVIDENCE"
-            : retrievalResult.status === "conflicting_evidence"
-              ? `CONFLICTING_EVIDENCE (${retrievalResult.conflicts.length} conflict(s))`
-              : inference.text;
+        if (retrievalResult.status === "insufficient_evidence") {
+          groundedSummary = "INSUFFICIENT_EVIDENCE";
+        } else if (retrievalResult.status === "conflicting_evidence") {
+          groundedSummary = `CONFLICTING_EVIDENCE (${retrievalResult.conflicts.length} conflict(s))`;
+        } else if (retrievalResult.revokedAtRecheckCount > 0) {
+          // Scrub ungrounded pre-revocation model narrative and expose only surviving cited facts
+          const survivingClaims = run.verifiedFacts
+            .map((f) =>
+              f.citation
+                ? `${f.claim} [${f.citation.artifactId}#rev${f.citation.revision}]`
+                : f.claim,
+            )
+            .join("; ");
+          groundedSummary = survivingClaims
+            ? `GROUNDED_AFTER_REVOCATION: ${survivingClaims}`
+            : "INSUFFICIENT_EVIDENCE";
+        } else {
+          groundedSummary = inference.text;
+        }
       }
 
       run.aiInterpretation = {
@@ -339,47 +502,20 @@ export class AiIntelligenceCore {
         if (input.beforeStepHook) {
           const hookRes = await input.beforeStepHook(idx, run);
           if (hookRes?.cancel) {
-            this.canceledRunIds.add(runId);
+            this.requestCancel(runId, input.actor.tenantId);
           }
         }
 
-        if (this.canceledRunIds.has(runId)) {
-          for (let rem = idx; rem < run.steps.length; rem++) {
-            run.steps[rem]!.status = "skipped_canceled";
-          }
-          run.state = "canceled";
-          run.updatedAt = new Date().toISOString();
-          if (this.quota && reservationId) {
-            if (idx === 0) {
-              await this.quota.releaseTokens(input.actor.tenantId, reservationId);
-            } else {
-              await this.quota.settleTokens({
-                tenantId: input.actor.tenantId,
-                reservationId,
-                actualTokens: run.tokensUsed,
-                estimatedCostMicroUsd: inference.estimatedCostMicroUsd,
-                source: input.source,
-                providerId: inference.providerId,
-                modelId: inference.modelId,
-                isMock: inference.isMock,
-              });
-            }
-          }
-          this.audit.append({
-            auditId: `aud_${randomUUID()}`,
-            tenantId: input.actor.tenantId,
-            workspaceId: input.actor.workspaceId,
-            actorId: input.actor.userId,
-            actorRole: input.actor.role,
-            source: input.source === "workflow" ? "system" : input.source,
-            action: "ai_core.run_canceled",
-            outcome: "success",
-            operationId: runId,
+        if (this.isRunCanceled(runId, input.actor.tenantId)) {
+          return await this.cancelRun({
+            input,
+            idempKey,
+            run,
+            fromStepIndex: idx,
+            reservationRef,
+            inferenceMeta: lastInferenceMeta,
             summary: `AgentRun ${runId} canceled safely before step ${idx}.`,
-            createdAt: run.updatedAt,
           });
-          this.runsByIdempotency.set(idempKey, structuredClone(run));
-          return { run, deduplicated: false };
         }
 
         const { step, tool } = validatedSteps[idx]!;
@@ -433,10 +569,12 @@ export class AiIntelligenceCore {
       }
       run.updatedAt = new Date().toISOString();
 
-      if (this.quota && reservationId) {
+      if (this.quota && reservationRef.id) {
+        const resId = reservationRef.id;
+        reservationRef.id = undefined;
         await this.quota.settleTokens({
           tenantId: input.actor.tenantId,
-          reservationId,
+          reservationId: resId,
           actualTokens: run.tokensUsed,
           estimatedCostMicroUsd: inference.estimatedCostMicroUsd,
           source: input.source,
@@ -466,12 +604,27 @@ export class AiIntelligenceCore {
         createdAt: run.updatedAt,
       });
 
-      this.runsByIdempotency.set(idempKey, structuredClone(run));
+      this.recordCompletedRun(idempKey, run);
       return { run, deduplicated: false };
     } catch (err) {
-      // Release quota cleanly if inference/setup failed before completion
-      if (this.quota && reservationId) {
-        await this.quota.releaseTokens(input.actor.tenantId, reservationId);
+      // Settle if inference already consumed tokens; otherwise release quota cleanly
+      if (this.quota && reservationRef.id) {
+        const resId = reservationRef.id;
+        reservationRef.id = undefined;
+        if (run.tokensUsed > 0 && lastInferenceMeta) {
+          await this.quota.settleTokens({
+            tenantId: input.actor.tenantId,
+            reservationId: resId,
+            actualTokens: run.tokensUsed,
+            estimatedCostMicroUsd: lastInferenceMeta.estimatedCostMicroUsd,
+            source: input.source,
+            providerId: lastInferenceMeta.providerId,
+            modelId: lastInferenceMeta.modelId,
+            isMock: lastInferenceMeta.isMock,
+          });
+        } else {
+          await this.quota.releaseTokens(input.actor.tenantId, resId);
+        }
       }
       throw err;
     }

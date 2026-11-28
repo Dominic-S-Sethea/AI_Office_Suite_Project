@@ -1,6 +1,6 @@
 import type { PgDatabaseAdapter } from "./adapter.ts";
 
-export const PA_SCHEMA_VERSION = "2026.11.v3-pa00";
+export const PA_SCHEMA_VERSION = "2026.11.v3.2-pa00";
 const PA_SCHEMA_LOCK_KEY = 84102003;
 
 export const PA_RLS_TABLES = [
@@ -110,16 +110,20 @@ CREATE TABLE IF NOT EXISTS pa_plan_versions (
 
 -- 3. Tenant subscription & seat/entitlement assignments (PLT-06)
 CREATE TABLE IF NOT EXISTS pa_tenant_subscriptions (
-  tenant_id           UUID PRIMARY KEY REFERENCES organizations(tenant_id),
-  plan_id             TEXT NOT NULL,
-  plan_version        INTEGER NOT NULL,
-  status              TEXT NOT NULL CHECK (status IN ('active', 'grace', 'past_due', 'suspended', 'canceled')),
-  seat_limit          INTEGER NOT NULL CHECK (seat_limit >= 1),
-  entitlements_json   JSONB NOT NULL,
-  policy_version      INTEGER NOT NULL DEFAULT 1,
-  updated_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+  tenant_id              UUID PRIMARY KEY REFERENCES organizations(tenant_id),
+  plan_id                TEXT NOT NULL,
+  plan_version           INTEGER NOT NULL,
+  status                 TEXT NOT NULL CHECK (status IN ('active', 'grace', 'past_due', 'suspended', 'canceled')),
+  seat_limit             INTEGER NOT NULL CHECK (seat_limit >= 1),
+  entitlements_json      JSONB NOT NULL,
+  policy_version         INTEGER NOT NULL DEFAULT 1,
+  last_billing_event_at  TIMESTAMPTZ NULL,
+  updated_at             TIMESTAMPTZ NOT NULL DEFAULT now(),
   FOREIGN KEY (plan_id, plan_version) REFERENCES pa_plan_versions(plan_id, version)
 );
+
+ALTER TABLE pa_tenant_subscriptions
+  ADD COLUMN IF NOT EXISTS last_billing_event_at TIMESTAMPTZ NULL;
 
 -- 4. Atomic quota reservations (estimate -> reserve -> settle/release)
 CREATE TABLE IF NOT EXISTS pa_usage_reservations (
@@ -243,6 +247,7 @@ CREATE TABLE IF NOT EXISTS pa_voice_policies (
 
 -- Secondary indexes
 CREATE INDEX IF NOT EXISTS pa_invitations_email_idx ON pa_invitations (tenant_id, lower(email), status);
+CREATE UNIQUE INDEX IF NOT EXISTS pa_invitations_pending_email_uidx ON pa_invitations (tenant_id, workspace_id, lower(email)) WHERE status = 'pending';
 CREATE INDEX IF NOT EXISTS pa_usage_res_period_idx ON pa_usage_reservations (tenant_id, dimension, period_key, status);
 CREATE INDEX IF NOT EXISTS pa_usage_ledger_created_idx ON pa_usage_ledger (tenant_id, dimension, created_at DESC);
 CREATE INDEX IF NOT EXISTS pa_file_objects_ws_idx ON pa_file_objects (tenant_id, workspace_id, deleted_at);
@@ -269,8 +274,20 @@ ALTER TABLE pa_invitations ENABLE ROW LEVEL SECURITY;
 ALTER TABLE pa_invitations FORCE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS tenant_isolation_pa_invitations ON pa_invitations;
 CREATE POLICY tenant_isolation_pa_invitations ON pa_invitations
-  USING (tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')::uuid)
-  WITH CHECK (tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')::uuid);
+  USING (
+    tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')::uuid
+    AND (
+      NULLIF(current_setting('app.current_workspace_id', true), '') IS NULL
+      OR workspace_id = NULLIF(current_setting('app.current_workspace_id', true), '')::uuid
+    )
+  )
+  WITH CHECK (
+    tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')::uuid
+    AND (
+      NULLIF(current_setting('app.current_workspace_id', true), '') IS NULL
+      OR workspace_id = NULLIF(current_setting('app.current_workspace_id', true), '')::uuid
+    )
+  );
 
 ALTER TABLE pa_tenant_subscriptions ENABLE ROW LEVEL SECURITY;
 ALTER TABLE pa_tenant_subscriptions FORCE ROW LEVEL SECURITY;
@@ -366,11 +383,31 @@ export async function initializePaGovernanceSchema(
       );
     `);
     if (!options.force) {
-      const existing = await tx.query<{ version: string; pa_present: boolean }>(
-        "SELECT version, (to_regclass('public.pa_jobs') IS NOT NULL) AS pa_present FROM schema_migrations WHERE version = $1",
+      const existing = await tx.query<{
+        version: string;
+        pa_present: boolean;
+        billing_ts_present: boolean;
+        pending_uidx_present: boolean;
+      }>(
+        `SELECT version,
+                (to_regclass('public.pa_jobs') IS NOT NULL) AS pa_present,
+                EXISTS (
+                  SELECT 1 FROM information_schema.columns
+                  WHERE table_schema = 'public'
+                    AND table_name = 'pa_tenant_subscriptions'
+                    AND column_name = 'last_billing_event_at'
+                ) AS billing_ts_present,
+                (to_regclass('public.pa_invitations_pending_email_uidx') IS NOT NULL) AS pending_uidx_present
+         FROM schema_migrations
+         WHERE version = $1`,
         [PA_SCHEMA_VERSION],
       );
-      if (existing.rows.length > 0 && existing.rows[0]?.pa_present) {
+      if (
+        existing.rows.length > 0 &&
+        existing.rows[0]?.pa_present &&
+        existing.rows[0]?.billing_ts_present &&
+        existing.rows[0]?.pending_uidx_present
+      ) {
         return { applied: false, version: PA_SCHEMA_VERSION };
       }
     }

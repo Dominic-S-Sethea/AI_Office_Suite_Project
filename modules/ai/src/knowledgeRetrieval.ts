@@ -11,6 +11,53 @@ import { scanForPromptInjection } from "@ai-office-suite/validation";
 const INJECTION_LINE_RE =
   /(ignore\s+(all\s+)?(previous|prior)\s+instructions|system\s+override|disregard\s+policy|exfiltrate|reveal\s+system\s+prompt|bypass\s+rbac|sudo\s+grant)/i;
 
+const REDACTED_RETRIEVAL_PLACEHOLDER =
+  "[UNTRUSTED_INSTRUCTION_CONTENT_REDACTED_FROM_RETRIEVED_DOCUMENT]";
+
+function normalizeForInjectionCheck(raw: string): string {
+  return raw
+    .replace(/[\p{Cf}\u034F\uFE00-\uFE0F]/gu, "")
+    .normalize("NFKC");
+}
+
+function hasUnsafeMetadataText(text: string): boolean {
+  const norm = normalizeForInjectionCheck(text);
+  return !scanForPromptInjection(norm).safe || INJECTION_LINE_RE.test(norm);
+}
+
+function computeMetricConflicts(chunks: readonly KnowledgeChunkRecord[]): KnowledgeConflict[] {
+  const claimIndex = new Map<
+    string,
+    Array<{ value: string; artifactId: string; revision: number; chunkId: string }>
+  >();
+  for (const chunk of chunks) {
+    for (const claim of chunk.metricClaims ?? []) {
+      const key = `${claim.metricId}::${claim.period}`;
+      const list = claimIndex.get(key) ?? [];
+      list.push({
+        value: claim.formattedValue,
+        artifactId: chunk.artifactId,
+        revision: chunk.revision,
+        chunkId: chunk.chunkId,
+      });
+      claimIndex.set(key, list);
+    }
+  }
+  const conflicts: KnowledgeConflict[] = [];
+  for (const [key, list] of claimIndex.entries()) {
+    const distinctVals = new Set(list.map((x) => x.value));
+    if (distinctVals.size > 1) {
+      const [metricId = "", period = ""] = key.split("::");
+      conflicts.push({
+        metricId,
+        period,
+        conflictingValues: list,
+      });
+    }
+  }
+  return conflicts;
+}
+
 function tokenizeQuery(query: string): string[] {
   return query
     .toLowerCase()
@@ -41,7 +88,7 @@ export class CorporateKnowledgeIndex {
       tombstoneRevoked: chunk.tombstoneRevoked ?? false,
       contentHash: chunk.contentHash ?? createHash("sha256").update(chunk.text, "utf8").digest("hex"),
     };
-    this.chunks.set(`${record.tenantId}::${record.chunkId}`, record);
+    this.chunks.set(`${record.tenantId}::${record.workspaceId}::${record.chunkId}`, record);
     return record;
   }
 
@@ -100,18 +147,32 @@ export class CorporateKnowledgeIndex {
   }
 
   private sanitizeRetrievedText(chunk: KnowledgeChunkRecord): { cleanText: string; hadInjection: boolean } {
-    const scan = scanForPromptInjection(chunk.text);
-    const hasLinePattern = INJECTION_LINE_RE.test(chunk.text);
+    if (hasUnsafeMetadataText(chunk.artifactId)) {
+      return { cleanText: REDACTED_RETRIEVAL_PLACEHOLDER, hadInjection: true };
+    }
+    for (const claim of chunk.metricClaims ?? []) {
+      if (hasUnsafeMetadataText(`${claim.metricId} ${claim.period} ${claim.formattedValue}`)) {
+        return { cleanText: REDACTED_RETRIEVAL_PLACEHOLDER, hadInjection: true };
+      }
+    }
+
+    const normalizedFull = normalizeForInjectionCheck(chunk.text);
+    const scan = scanForPromptInjection(normalizedFull);
+    const hasLinePattern = INJECTION_LINE_RE.test(normalizedFull);
     if (scan.safe && !hasLinePattern) {
       return { cleanText: chunk.text, hadInjection: false };
     }
-    const cleanLines = chunk.text
-      .split(/\r?\n/)
-      .filter((line) => scanForPromptInjection(line).safe && !INJECTION_LINE_RE.test(line));
+    const cleanLines = chunk.text.split(/\r?\n/).filter((line) => {
+      const normalizedLine = normalizeForInjectionCheck(line);
+      return scanForPromptInjection(normalizedLine).safe && !INJECTION_LINE_RE.test(normalizedLine);
+    });
+    const joined = cleanLines.join(" ").trim();
+    const rescan = joined
+      ? scanForPromptInjection(normalizeForInjectionCheck(joined)).safe &&
+        !INJECTION_LINE_RE.test(normalizeForInjectionCheck(joined))
+      : false;
     return {
-      cleanText:
-        cleanLines.join(" ").trim() ||
-        "[UNTRUSTED_INSTRUCTION_CONTENT_REDACTED_FROM_RETRIEVED_DOCUMENT]",
+      cleanText: joined && rescan ? joined : REDACTED_RETRIEVAL_PLACEHOLDER,
       hadInjection: true,
     };
   }
@@ -163,37 +224,10 @@ export class CorporateKnowledgeIndex {
       };
     }
 
-    // Detect metric value conflicts across active authorized sources (AI-T20)
-    const claimIndex = new Map<
-      string,
-      Array<{ value: string; artifactId: string; revision: number; chunkId: string }>
-    >();
-    for (const item of top) {
-      for (const claim of item.chunk.metricClaims ?? []) {
-        const key = `${claim.metricId}::${claim.period}`;
-        const list = claimIndex.get(key) ?? [];
-        list.push({
-          value: claim.formattedValue,
-          artifactId: item.chunk.artifactId,
-          revision: item.chunk.revision,
-          chunkId: item.chunk.chunkId,
-        });
-        claimIndex.set(key, list);
-      }
-    }
-
-    const conflicts: KnowledgeConflict[] = [];
-    for (const [key, list] of claimIndex.entries()) {
-      const distinctVals = new Set(list.map((x) => x.value));
-      if (distinctVals.size > 1) {
-        const [metricId = "", period = ""] = key.split("::");
-        conflicts.push({
-          metricId,
-          period,
-          conflictingValues: list,
-        });
-      }
-    }
+    const nonRedactedChunks = top
+      .filter((item) => item.cleanText !== REDACTED_RETRIEVAL_PLACEHOLDER)
+      .map((item) => item.chunk);
+    const conflicts = computeMetricConflicts(nonRedactedChunks);
 
     const citations: KnowledgeCitation[] = top.map(({ chunk, cleanText }) => ({
       chunkId: chunk.chunkId,
@@ -204,13 +238,22 @@ export class CorporateKnowledgeIndex {
       verifiedAtRecheck: true,
     }));
 
-    const verifiedFacts = top.map(({ cleanText }, idx) => ({
-      claim: cleanText,
-      citation: citations[idx]!,
-    }));
+    const verifiedFacts = top.flatMap(({ cleanText }, idx) =>
+      cleanText === REDACTED_RETRIEVAL_PLACEHOLDER
+        ? []
+        : [{
+            claim: cleanText,
+            citation: citations[idx]!,
+          }],
+    );
 
     return {
-      status: conflicts.length > 0 ? "conflicting_evidence" : "grounded",
+      status:
+        verifiedFacts.length === 0
+          ? "insufficient_evidence"
+          : conflicts.length > 0
+            ? "conflicting_evidence"
+            : "grounded",
       verifiedFacts,
       citations,
       conflicts,
@@ -228,35 +271,50 @@ export class CorporateKnowledgeIndex {
     result: KnowledgeRetrievalResult,
   ): KnowledgeRetrievalResult {
     const survivingCitations: KnowledgeCitation[] = [];
-    const survivingFacts: KnowledgeRetrievalResult["verifiedFacts"] = [];
+    const survivingChunkIds = new Set<string>();
+    const survivingChunks: KnowledgeChunkRecord[] = [];
     let revokedAtRecheckCount = 0;
 
-    for (let i = 0; i < result.citations.length; i++) {
-      const cit = result.citations[i]!;
-      const liveChunk = this.chunks.get(`${actor.tenantId}::${cit.chunkId}`);
-      if (!liveChunk || !this.isChunkAuthorized(actor, liveChunk)) {
+    for (const cit of result.citations) {
+      const liveChunk = this.chunks.get(`${actor.tenantId}::${actor.workspaceId}::${cit.chunkId}`);
+      if (
+        !liveChunk ||
+        !this.isChunkAuthorized(actor, liveChunk) ||
+        liveChunk.contentHash !== cit.contentHash ||
+        liveChunk.revision !== cit.revision
+      ) {
         revokedAtRecheckCount += 1;
         continue;
       }
-      survivingCitations.push({ ...cit, verifiedAtRecheck: true });
-      if (result.verifiedFacts[i]) {
-        survivingFacts.push({
-          claim: result.verifiedFacts[i]!.claim,
-          citation: { ...cit, verifiedAtRecheck: true },
-        });
+      const verifiedCit: KnowledgeCitation = { ...cit, verifiedAtRecheck: true };
+      survivingCitations.push(verifiedCit);
+      survivingChunkIds.add(cit.chunkId);
+      if (this.sanitizeRetrievedText(liveChunk).cleanText !== REDACTED_RETRIEVAL_PLACEHOLDER) {
+        survivingChunks.push(liveChunk);
       }
     }
+
+    const survivingCitationMap = new Map(survivingCitations.map((c) => [c.chunkId, c]));
+    const survivingFacts: KnowledgeRetrievalResult["verifiedFacts"] = result.verifiedFacts
+      .filter((f) => f.citation && survivingChunkIds.has(f.citation.chunkId))
+      .map((f) => ({
+        claim: f.claim,
+        citation: survivingCitationMap.get(f.citation!.chunkId)!,
+      }));
+
+    const survivingConflicts = computeMetricConflicts(survivingChunks);
 
     return {
       ...result,
       status:
-        survivingCitations.length === 0
+        survivingFacts.length === 0
           ? "insufficient_evidence"
-          : result.conflicts.length > 0
+          : survivingConflicts.length > 0
             ? "conflicting_evidence"
             : "grounded",
       citations: survivingCitations,
       verifiedFacts: survivingFacts,
+      conflicts: survivingConflicts,
       revokedAtRecheckCount: result.revokedAtRecheckCount + revokedAtRecheckCount,
     };
   }

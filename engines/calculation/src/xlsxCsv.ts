@@ -14,6 +14,8 @@ import {
   recalculateWorkbook,
 } from "./formulaEngine.ts";
 
+const MAX_EXPORT_GRID_CELLS = 2_000_000;
+
 export class WorkbookInteroperabilityError extends Error {
   readonly statusCode: number;
   readonly code: string;
@@ -105,13 +107,16 @@ export async function importWorkbookFromXlsxBuffer(
         const addr = cell.address.toUpperCase();
         const val = cell.value;
         let record: SpreadsheetCellRecord;
-        if (val && typeof val === "object" && "formula" in val) {
-          const formulaObj = val as ExcelJS.CellFormulaValue;
-          record = {
-            value: null,
-            formula: `=${formulaObj.formula}`,
-            numberFormat: cell.numFmt || undefined,
-          };
+        if (val && typeof val === "object" && ("formula" in val || "sharedFormula" in val)) {
+          const formulaObj = val as Partial<ExcelJS.CellFormulaValue>;
+          const resolvedFormula = cell.formula || formulaObj.formula || "";
+          record = resolvedFormula
+            ? {
+                value: null,
+                formula: resolvedFormula.startsWith("=") ? resolvedFormula : `=${resolvedFormula}`,
+                numberFormat: cell.numFmt || undefined,
+              }
+            : { value: null, numberFormat: cell.numFmt || undefined };
         } else if (val && typeof val === "object" && "richText" in val) {
           const rt = (val as ExcelJS.CellRichTextValue).richText.map((r) => r.text).join("").normalize("NFC");
           record = { value: rt, numberFormat: cell.numFmt || undefined };
@@ -170,6 +175,13 @@ export function exportSheetToSafeCsv(sheet: SpreadsheetWorksheet): CsvExportSafe
     maxRow = Math.max(maxRow, parsed.row);
     maxCol = Math.max(maxCol, parsed.col);
   }
+  if (maxRow * maxCol > MAX_EXPORT_GRID_CELLS) {
+    throw new WorkbookInteroperabilityError(
+      413,
+      "EXPORT_GRID_TOO_LARGE",
+      `CSV export grid (${maxRow}x${maxCol} cells) exceeds maximum limit (${MAX_EXPORT_GRID_CELLS} cells).`,
+    );
+  }
 
   let neutralizedFormulaCells = 0;
   const warnings: string[] = [];
@@ -224,6 +236,17 @@ export function sortWorksheetTableByColumn(
   const c1 = colLettersToIndex(startCol);
   const c2 = colLettersToIndex(endCol);
   const sCol = colLettersToIndex(sortCol);
+  if (endRow < startRow || c2 < c1) {
+    throw new WorkbookInteroperabilityError(400, "INVALID_SORT_RANGE", "Sort range start must not exceed end.");
+  }
+  const sortCells = (endRow - startRow + 1) * (c2 - c1 + 1);
+  if (sortCells > MAX_EXPORT_GRID_CELLS) {
+    throw new WorkbookInteroperabilityError(
+      413,
+      "EXPORT_GRID_TOO_LARGE",
+      `Sort table range (${sortCells} cells) exceeds maximum limit (${MAX_EXPORT_GRID_CELLS} cells).`,
+    );
+  }
   const next = structuredClone(sheet);
 
   const rows: Array<Record<number, SpreadsheetCellRecord>> = [];

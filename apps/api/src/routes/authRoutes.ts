@@ -2,11 +2,14 @@ import type { Express, Request, RequestHandler } from "express";
 import type { ActorContext } from "@ai-office-suite/shared-contracts";
 import { assertCanPerform } from "@ai-office-suite/authorization";
 import type { PgDatabaseAdapter } from "@ai-office-suite/database";
+import { redactAuditString } from "@ai-office-suite/audit";
 import {
   authenticateUserWithPassword,
   parseCookie,
+  revokeSessionByJti,
   revokeUserSessions,
   SESSION_COOKIE_NAME,
+  verifySessionToken,
 } from "@ai-office-suite/identity";
 import {
   clearSessionCookie,
@@ -17,7 +20,7 @@ import {
 } from "@ai-office-suite/identity/express";
 import { loginRequestSchema } from "@ai-office-suite/validation";
 import type { ApiObservabilityHandle } from "../observability.ts";
-import type { SlidingWindowRateLimiter } from "../rateLimit.ts";
+import type { RateLimitStoreMode, SlidingWindowRateLimiter } from "../rateLimit.ts";
 
 export interface AuthRoutesDeps {
   useJwtPg: boolean;
@@ -25,6 +28,7 @@ export interface AuthRoutesDeps {
   db?: PgDatabaseAdapter;
   allowedOrigins: readonly string[];
   rateLimitEnabled: boolean;
+  rateLimitStore: RateLimitStoreMode;
   loginLimiter: SlidingWindowRateLimiter;
   loginIpLimiter: SlidingWindowRateLimiter;
   apiLimiter: SlidingWindowRateLimiter;
@@ -39,6 +43,7 @@ export function registerAuthAndMetricsRoutes(app: Express, deps: AuthRoutesDeps)
     db,
     allowedOrigins,
     rateLimitEnabled,
+    rateLimitStore,
     loginLimiter,
     loginIpLimiter,
     apiLimiter,
@@ -47,7 +52,18 @@ export function registerAuthAndMetricsRoutes(app: Express, deps: AuthRoutesDeps)
   } = deps;
 
   if (useJwtPg && db) {
-    const jwtMiddleware = createJwtAuthMiddleware(db, allowedOrigins);
+    const jwtMiddleware = createJwtAuthMiddleware(db, allowedOrigins, {
+      onError: (err, ctx) => {
+        observability.logEvent("error", "auth_jwt_backend_error", {
+          requestId: ctx.requestId,
+          method: ctx.method,
+          path: ctx.path,
+          errorName: err instanceof Error ? err.name : "Error",
+          message: redactAuditString(err instanceof Error ? err.message : String(err)),
+        });
+      },
+    });
+    const apiRateLimiters: RequestHandler[] = rateLimitEnabled ? [apiLimiter.middleware] : [];
 
     if (rateLimitEnabled) {
       app.use("/api/auth/login", loginLimiter.middleware);
@@ -56,7 +72,7 @@ export function registerAuthAndMetricsRoutes(app: Express, deps: AuthRoutesDeps)
 
     const metricsMiddleware: RequestHandler[] = [
       jwtMiddleware as unknown as RequestHandler,
-      ...(rateLimitEnabled ? [apiLimiter.middleware] : []),
+      ...apiRateLimiters,
     ];
 
     app.get("/api/metrics", ...metricsMiddleware, (req, res, next) => {
@@ -79,6 +95,7 @@ export function registerAuthAndMetricsRoutes(app: Express, deps: AuthRoutesDeps)
           metrics: observability.getMetrics(),
           rateLimits: {
             enabled: rateLimitEnabled,
+            store: rateLimitStore,
             login: loginLimiter.getStats(),
             loginIp: loginIpLimiter.getStats(),
             api: apiLimiter.getStats(),
@@ -146,22 +163,36 @@ export function registerAuthAndMetricsRoutes(app: Express, deps: AuthRoutesDeps)
       }
     });
 
-    app.post("/api/auth/logout", (req, res) => {
-      const hasBearer = Boolean(req.headers.authorization?.startsWith("Bearer "));
-      const hasCookie = Boolean(parseCookie(req.headers.cookie, SESSION_COOKIE_NAME));
-      if (!hasBearer && hasCookie) {
-        if (!verifyCookieCsrf(req, res, allowedOrigins)) return;
+    app.post("/api/auth/logout", ...apiRateLimiters, async (req, res, next) => {
+      try {
+        const authHeader = req.headers.authorization;
+        const bearerToken = authHeader?.startsWith("Bearer ") ? authHeader.slice(7).trim() : "";
+        const cookieToken = parseCookie(req.headers.cookie, SESSION_COOKIE_NAME);
+        if (!bearerToken && cookieToken) {
+          if (!verifyCookieCsrf(req, res, allowedOrigins)) return;
+        }
+        const token = bearerToken || cookieToken || "";
+        const claims = token ? verifySessionToken(token) : null;
+        if (claims?.jti) {
+          await revokeSessionByJti(db, {
+            jti: claims.jti,
+            userId: claims.userId,
+            ...(claims.expiresAtIso ? { expiresAtIso: claims.expiresAtIso } : {}),
+          });
+        }
+        clearSessionCookie(req, res);
+        res.json({ ok: true, revoked: Boolean(claims?.jti) });
+      } catch (err) {
+        next(err);
       }
-      clearSessionCookie(req, res);
-      res.json({ ok: true });
     });
 
-    app.get("/api/auth/me", jwtMiddleware, (req, res) => {
+    app.get("/api/auth/me", jwtMiddleware, ...apiRateLimiters, (req, res) => {
       const authReq = req as AuthenticatedRequest;
       res.json({ actor: authReq.actor, authSource: authReq.authSource });
     });
 
-    app.post("/api/auth/revoke-sessions", jwtMiddleware, async (req, res, next) => {
+    app.post("/api/auth/revoke-sessions", jwtMiddleware, ...apiRateLimiters, async (req, res, next) => {
       try {
         const authReq = req as AuthenticatedRequest;
         const nextVersion = await revokeUserSessions(db, authReq.actor!.userId);
@@ -209,6 +240,7 @@ export function registerAuthAndMetricsRoutes(app: Express, deps: AuthRoutesDeps)
         metrics: observability.getMetrics(),
         rateLimits: {
           enabled: rateLimitEnabled,
+          store: rateLimitStore,
           login: loginLimiter.getStats(),
           api: apiLimiter.getStats(),
         },

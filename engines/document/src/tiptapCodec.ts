@@ -125,6 +125,20 @@ function parseFontSizePt(raw: unknown): number | undefined {
   return undefined;
 }
 
+function normalizeCssFontFamily(raw: string): string | undefined {
+  const trimmed = raw.trim();
+  if (!trimmed) return undefined;
+  if (trimmed.length <= 100) return trimmed;
+  const primary = trimmed.split(",")[0]?.trim().replace(/^["']+|["']+$/g, "").trim() ?? "";
+  return (primary || trimmed).slice(0, 100);
+}
+
+function clampMarkString(raw: unknown, maxLen: number): string | undefined {
+  if (typeof raw !== "string") return undefined;
+  const trimmed = raw.trim();
+  return trimmed ? trimmed.slice(0, maxLen) : undefined;
+}
+
 function tiptapInlineToRuns(nodes?: TiptapNode[]): TextRun[] {
   if (!nodes || nodes.length === 0) return [{ text: "" }];
   const runs: TextRun[] = [];
@@ -139,10 +153,14 @@ function tiptapInlineToRuns(nodes?: TiptapNode[]): TextRun[] {
       if (m.type === "bold") marks.bold = true;
       if (m.type === "italic") marks.italic = true;
       if (m.type === "underline") marks.underline = true;
-      if (m.type === "highlight") marks.highlight = String(m.attrs?.color ?? "#fef08a");
+      if (m.type === "highlight") marks.highlight = clampMarkString(m.attrs?.color, 40) ?? "#fef08a";
       if (m.type === "textStyle") {
-        if (typeof m.attrs?.fontFamily === "string") marks.fontFamily = m.attrs.fontFamily;
-        if (typeof m.attrs?.color === "string") marks.color = m.attrs.color;
+        if (typeof m.attrs?.fontFamily === "string") {
+          const normFont = normalizeCssFontFamily(m.attrs.fontFamily);
+          if (normFont) marks.fontFamily = normFont;
+        }
+        const normColor = clampMarkString(m.attrs?.color, 40);
+        if (normColor) marks.color = normColor;
         const pt = parseFontSizePt(m.attrs?.fontSize);
         if (pt !== undefined) marks.fontSizePt = pt;
       }
@@ -159,6 +177,10 @@ function tiptapBlockChildrenToRuns(children?: TiptapNode[]): TextRun[] {
   if (!children || children.length === 0) return [{ text: "" }];
   const combined: TextRun[] = [];
   children.forEach((child, idx) => {
+    if (child.type === "text" || child.type === "hardBreak") {
+      combined.push(...tiptapInlineToRuns([child]));
+      return;
+    }
     if (idx > 0) combined.push({ text: "\n" });
     if (child.type === "paragraph" || child.type === "heading") {
       combined.push(...tiptapInlineToRuns(child.content));
@@ -210,7 +232,26 @@ export function fromTiptapJson(
   for (let i = 0; i < content.length; i++) {
     const node = content[i]!;
     const mappedType = mapTiptapNodeTypeToBlockType(node.type);
-    if (!mappedType) continue;
+    if (!mappedType) {
+      const fallbackRuns =
+        node.content && node.content.some((c) => c.type === "text" || c.type === "hardBreak")
+          ? tiptapInlineToRuns(node.content)
+          : tiptapBlockChildrenToRuns(node.content);
+      if (fallbackRuns.some((r) => r.text.trim().length > 0)) {
+        const attrId =
+          typeof node.attrs?.blockId === "string" && node.attrs.blockId.trim()
+            ? node.attrs.blockId.trim()
+            : undefined;
+        const fallbackId = attrId && !usedIds.has(attrId) ? attrId : browserSafeId("blk");
+        usedIds.add(fallbackId);
+        blocks.push({
+          id: fallbackId,
+          type: "paragraph",
+          runs: fallbackRuns,
+        });
+      }
+      continue;
+    }
 
     const attrId = typeof node.attrs?.blockId === "string" && node.attrs.blockId.trim() ? node.attrs.blockId.trim() : undefined;
     // Only fall back to positional existing block ID if type matches AND that ID is not explicitly owned by another node

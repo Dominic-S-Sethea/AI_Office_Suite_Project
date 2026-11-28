@@ -50,6 +50,8 @@ export interface ProcessVoiceUtteranceInput {
   durationMs: number;
   simulatedTranscript?: string;
   fixtureId?: string;
+  audioBase64?: string;
+  mimeType?: string;
   overrideConfidence?: number;
   targetResource?: PolicyResourceType;
   targetAction?: PolicyAction;
@@ -62,12 +64,21 @@ export interface ProcessVoiceUtteranceInput {
 
 export interface ProcessVoiceUtteranceResult {
   session: VoiceSessionRecord;
-  outcome: "dictated_text_only" | "awaiting_review_clarify" | "ready_to_propose";
+  outcome: "silence_no_op" | "dictated_text_only" | "awaiting_review_clarify" | "ready_to_propose";
   effectiveTranscript: string;
   literalText?: string;
   executableCommand: string | null;
   isMock: boolean;
   warnings: string[];
+}
+
+const NOISE_OR_FILLER_RE =
+  /^(?:[\s.,!?;:\-–—…'"()[\]]*|\[(?:noise|silence|background\s*noise|inaudible|static|cough|music)\]|(?:uh+|um+|ah+|er+|hmm+|អឺ+|អឹ+)[.,!?\s]*)$/i;
+
+export function isSilenceOrNoiseUtterance(transcript: string): boolean {
+  const trimmed = transcript.trim();
+  if (trimmed.length === 0) return true;
+  return NOISE_OR_FILLER_RE.test(trimmed);
 }
 
 export const DEFAULT_VOICE_POLICY = (tenantId: string): VoicePolicyConfig => ({
@@ -108,6 +119,20 @@ export class VoiceGovernancePipeline {
   }
 
   async processUtterance(input: ProcessVoiceUtteranceInput): Promise<ProcessVoiceUtteranceResult> {
+    if (!Number.isFinite(input.durationMs) || input.durationMs < 0) {
+      throw new SpeechProviderError(
+        400,
+        "INVALID_AUDIO_DURATION",
+        `Invalid audio clip duration '${input.durationMs}'. Duration must be a non-negative finite number.`,
+      );
+    }
+    if (input.policy.tenantId !== input.actor.tenantId) {
+      throw new SpeechProviderError(
+        403,
+        "TENANT_POLICY_MISMATCH",
+        `VoicePolicyConfig tenant '${input.policy.tenantId}' does not match actor tenant '${input.actor.tenantId}'.`,
+      );
+    }
     const durationSec = Math.max(1, Math.ceil(input.durationMs / 1000));
 
     // 1. Voice policy checks (language, provider, max clip duration)
@@ -215,12 +240,40 @@ export class VoiceGovernancePipeline {
         durationMs: input.durationMs,
         ...(input.simulatedTranscript !== undefined ? { simulatedTranscript: input.simulatedTranscript } : {}),
         ...(input.fixtureId !== undefined ? { fixtureId: input.fixtureId } : {}),
+        ...(input.audioBase64 !== undefined ? { audioBase64: input.audioBase64 } : {}),
+        ...(input.mimeType !== undefined ? { mimeType: input.mimeType } : {}),
       });
 
       const confidence = input.overrideConfidence ?? asr.confidence;
       const retainAudio = input.policy.audioRetentionMode === "opt_in_short_term";
 
-      // 5. Tenant-scoped terminology normalization (VOC-T17)
+      // 4b. Silence / background noise / filler-only guard (VOC-T16) — zero business mutation
+      if (isSilenceOrNoiseUtterance(asr.transcript)) {
+        const canceled = this.sessions.transition(created.sessionId, {
+          eventId: `${created.sessionId}:silence-noop`,
+          eventSeq: 5,
+          targetState: "canceled",
+          errorCode: "VOICE_SILENCE_OR_NOISE",
+          errorMessage: "No actionable speech detected (silence or background noise only).",
+        }).session;
+        if (this.quota && reservationId) {
+          await this.quota.releaseVoiceSeconds(input.actor.tenantId, reservationId);
+          reservationId = undefined;
+        }
+        return {
+          session: canceled,
+          outcome: "silence_no_op",
+          effectiveTranscript: "",
+          executableCommand: null,
+          isMock: asr.isMock,
+          warnings: [
+            ...asr.warnings,
+            "No actionable speech detected (silence/background noise); no operation executed.",
+          ],
+        };
+      }
+
+      // 5. Tenant-scoped terminology normalization (VOC-T14)
       const norm = this.terminology.normalizeTranscript(input.actor.tenantId, asr.transcript);
 
       // 6. Strict Dictation Mode Isolation (VOC-T08, VOC-T09) — NEVER executes imperatives!
@@ -255,7 +308,7 @@ export class VoiceGovernancePipeline {
           eventSeq: 7,
           targetState: "execute_verify",
         });
-        const done = this.sessions.transition(created.sessionId, {
+        let done = this.sessions.transition(created.sessionId, {
           eventId: `${created.sessionId}:done`,
           eventSeq: 8,
           targetState: "completed",
@@ -270,6 +323,8 @@ export class VoiceGovernancePipeline {
             providerId: asr.provider,
             isMock: asr.isMock,
           });
+          done = this.sessions.markQuotaSettled(created.sessionId);
+          reservationId = undefined;
         }
 
         return {
@@ -299,6 +354,7 @@ export class VoiceGovernancePipeline {
         });
         if (this.quota && reservationId) {
           await this.quota.releaseVoiceSeconds(input.actor.tenantId, reservationId);
+          reservationId = undefined;
         }
         throw new SpeechProviderError(400, "PROMPT_INJECTION_DETECTED", injectionReason);
       }
@@ -339,6 +395,8 @@ export class VoiceGovernancePipeline {
           providerId: asr.provider,
           isMock: asr.isMock,
         });
+        this.sessions.markQuotaSettled(created.sessionId);
+        reservationId = undefined;
       }
 
       if (needsReview) {
@@ -394,11 +452,42 @@ export class VoiceGovernancePipeline {
    * and CriticalField validation before releasing the command for proposal (VOC-T16).
    */
   confirmReviewedTranscript(params: {
+    actor: ActorContext;
     sessionId: string;
     editedTranscript?: string;
+    policy?: VoicePolicyConfig;
     eventId: string;
     eventSeq: number;
   }): { session: VoiceSessionRecord; effectiveCommand: string } {
+    this.sessions.assertSessionActorAccess(params.sessionId, params.actor);
+    const initial = this.sessions.getSession(params.sessionId);
+    if (!initial) {
+      throw new SpeechProviderError(404, "VOICE_SESSION_NOT_FOUND", "Voice session not found.");
+    }
+    assertPolicyAllowed({
+      actor: params.actor,
+      resourceTenantId: params.actor.tenantId,
+      resourceWorkspaceId: params.actor.workspaceId,
+      resource: "speech",
+      action: "transcribe",
+      source: "voice_command",
+    });
+    if (params.policy) {
+      if (params.policy.tenantId !== params.actor.tenantId) {
+        throw new SpeechProviderError(
+          403,
+          "TENANT_POLICY_MISMATCH",
+          `VoicePolicyConfig tenant '${params.policy.tenantId}' does not match actor tenant '${params.actor.tenantId}'.`,
+        );
+      }
+      if (!params.policy.allowedLanguages.includes(initial.language)) {
+        throw new SpeechProviderError(
+          403,
+          "VOICE_LANGUAGE_NOT_ALLOWED",
+          `Language '${initial.language}' is disabled by tenant voice policy.`,
+        );
+      }
+    }
     if (params.editedTranscript !== undefined) {
       this.sessions.editTranscriptDuringReview(params.sessionId, params.editedTranscript);
     }
@@ -407,6 +496,13 @@ export class VoiceGovernancePipeline {
       throw new SpeechProviderError(404, "VOICE_SESSION_NOT_FOUND", "Voice session not found.");
     }
     const effective = (current.editedTranscript ?? current.normalizedTranscript ?? "").trim();
+    if (isSilenceOrNoiseUtterance(effective)) {
+      throw new SpeechProviderError(
+        400,
+        "VOICE_SILENCE_OR_NOISE",
+        "Confirmed transcript contains only silence or filler noise.",
+      );
+    }
     const scan = scanForPromptInjection(effective);
     if (!scan.safe) {
       throw new SpeechProviderError(
@@ -438,21 +534,74 @@ export class VoiceGovernancePipeline {
   }
 
   async cancelSessionWithQuotaRelease(params: {
+    actor: ActorContext;
     sessionId: string;
     eventId: string;
     eventSeq: number;
   }): Promise<{ session: VoiceSessionRecord; quotaReleased: boolean }> {
-    const before = this.sessions.getSession(params.sessionId);
+    const before = this.sessions.assertSessionActorAccess(params.sessionId, params.actor);
     const canceled = this.sessions.transition(params.sessionId, {
       eventId: params.eventId,
       eventSeq: params.eventSeq,
       targetState: "canceled",
     }).session;
     let quotaReleased = false;
-    if (this.quota && before?.reservationId) {
+    if (this.quota && before.reservationId && !before.quotaSettled) {
       await this.quota.releaseVoiceSeconds(before.tenantId, before.reservationId);
       quotaReleased = true;
     }
     return { session: canceled, quotaReleased };
+  }
+
+  /**
+   * Terminates all active voice sessions for an actor on sign-out, tenant switch, or UI close,
+   * releasing any active voice-seconds quota reservations (VOC-T27 / PLT-T13).
+   */
+  async cancelOnActorSessionEnd(
+    tenantId: string,
+    actorId: string,
+    reason = "ACTOR_SESSION_ENDED",
+  ): Promise<{ terminatedSessions: VoiceSessionRecord[]; releasedReservations: number }> {
+    const terminatedSessions = this.sessions.terminateActiveSessionsForActor(tenantId, actorId, reason);
+    let releasedReservations = 0;
+    if (this.quota) {
+      for (const sess of terminatedSessions) {
+        if (sess.reservationId && !sess.quotaSettled) {
+          try {
+            await this.quota.releaseVoiceSeconds(sess.tenantId, sess.reservationId);
+            releasedReservations += 1;
+          } catch {
+            // best-effort release per session
+          }
+        }
+      }
+    }
+    return { terminatedSessions, releasedReservations };
+  }
+
+  /**
+   * Handles hardware microphone disconnect (VOC-T17) or mid-recording network failure (VOC-T18),
+   * transitioning the session safely to error with audio wiped and releasing reserved quota.
+   */
+  async handleInterruption(params: {
+    actor: ActorContext;
+    sessionId: string;
+    kind: "microphone_disconnected" | "network_failure";
+    eventId: string;
+    eventSeq: number;
+  }): Promise<{ session: VoiceSessionRecord; quotaReleased: boolean }> {
+    const before = this.sessions.assertSessionActorAccess(params.sessionId, params.actor);
+    const outcome = this.sessions.handleHardwareOrNetworkInterruption(
+      params.sessionId,
+      params.kind,
+      params.eventId,
+      params.eventSeq,
+    );
+    let quotaReleased = false;
+    if (this.quota && before.reservationId && !before.quotaSettled) {
+      await this.quota.releaseVoiceSeconds(before.tenantId, before.reservationId);
+      quotaReleased = true;
+    }
+    return { session: outcome.session, quotaReleased };
   }
 }

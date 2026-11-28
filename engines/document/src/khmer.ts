@@ -47,6 +47,9 @@ export function snapRangeToGraphemeBoundaries(
   startOffset: number,
   endOffset: number,
 ): { start: number; end: number } {
+  if (!Number.isFinite(startOffset) || !Number.isFinite(endOffset)) {
+    throw new RangeError("Selection offsets must be finite numbers.");
+  }
   const normalized = normalizeDocumentText(text);
   const clampedStart = Math.max(0, Math.min(startOffset, normalized.length));
   const clampedEnd = Math.max(clampedStart, Math.min(endOffset, normalized.length));
@@ -110,7 +113,7 @@ export function analyzeKhmerText(text: string): KhmerTextAnalysis {
     if (cp === 0x17d2) {
       coengSubscriptCount++;
       const next = chars[i + 1]?.codePointAt(0) ?? 0;
-      if (next < 0x1780 || next > 0x17a2) {
+      if (next < 0x1780 || next > 0x17b3) {
         danglingCoengCount++;
       }
     }

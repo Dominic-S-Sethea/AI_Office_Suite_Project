@@ -31,6 +31,48 @@ function mapAlignment(align?: string) {
   }
 }
 
+const NAMED_DOCX_COLORS: Record<string, string> = {
+  black: "000000",
+  white: "FFFFFF",
+  red: "FF0000",
+  blue: "0000FF",
+  green: "008000",
+  yellow: "FFFF00",
+  gray: "808080",
+  grey: "808080",
+  navy: "000080",
+  teal: "008080",
+  orange: "FFA500",
+  purple: "800080",
+  silver: "C0C0C0",
+  maroon: "800000",
+  olive: "808000",
+  lime: "00FF00",
+  aqua: "00FFFF",
+  fuchsia: "FF00FF",
+};
+
+export function normalizeDocxHexColor(raw?: string): string | undefined {
+  if (!raw) return undefined;
+  const trimmed = raw.trim();
+  const hex6 = trimmed.match(/^#?([0-9a-fA-F]{6})$/);
+  if (hex6) return hex6[1]!.toUpperCase();
+  const hex3 = trimmed.match(/^#?([0-9a-fA-F]{3})$/);
+  if (hex3) {
+    const [r, g, b] = hex3[1]!;
+    return `${r}${r}${g}${g}${b}${b}`.toUpperCase();
+  }
+  const rgbMatch = trimmed.match(
+    /^rgba?\(\s*(25[0-5]|2[0-4]\d|1?\d?\d)\s*,\s*(25[0-5]|2[0-4]\d|1?\d?\d)\s*,\s*(25[0-5]|2[0-4]\d|1?\d?\d)(?:\s*,\s*(?:0|1|0?\.\d+))?\s*\)$/i,
+  );
+  if (rgbMatch) {
+    const toHex = (s: string) => Number.parseInt(s, 10).toString(16).padStart(2, "0").toUpperCase();
+    return `${toHex(rgbMatch[1]!)}${toHex(rgbMatch[2]!)}${toHex(rgbMatch[3]!)}`;
+  }
+  const lower = trimmed.toLowerCase();
+  return Object.hasOwn(NAMED_DOCX_COLORS, lower) ? NAMED_DOCX_COLORS[lower] : undefined;
+}
+
 function buildDocxRuns(runs: TextRun[]): DocxTextRun[] {
   return runs.map((run) => {
     const fontName = run.marks?.fontFamily ?? "Noto Sans Khmer";
@@ -39,7 +81,7 @@ function buildDocxRuns(runs: TextRun[]): DocxTextRun[] {
       bold: run.marks?.bold,
       italics: run.marks?.italic,
       underline: run.marks?.underline ? {} : undefined,
-      color: run.marks?.color?.replace("#", ""),
+      color: normalizeDocxHexColor(run.marks?.color),
       size: run.marks?.fontSizePt ? Math.round(run.marks.fontSizePt * 2) : undefined,
       font: {
         ascii: fontName,
@@ -98,6 +140,8 @@ export async function exportToDocxBuffer(doc: StudioDocument): Promise<Buffer> {
           tableHeader: block.hasHeaderRow && rowIdx === 0,
           children: row.map((cell) =>
             new TableCell({
+              ...(cell.colspan && cell.colspan > 1 ? { columnSpan: cell.colspan } : {}),
+              ...(cell.rowspan && cell.rowspan > 1 ? { rowSpan: cell.rowspan } : {}),
               shading:
                 block.hasHeaderRow && rowIdx === 0
                   ? { type: ShadingType.CLEAR, fill: "E2E8F0" }

@@ -5,17 +5,25 @@ import {
   createDocumentSchema,
   importDocxRequestSchema,
   listDocumentsQuerySchema,
+  paginationQuerySchema,
+  restoreVersionRequestSchema,
   updateDocumentSchema,
 } from "@ai-office-suite/validation";
 import type { DocumentGateway } from "../documentGateway.ts";
 
 const MAX_PG_INT32 = 2_147_483_647;
+const MAX_DOCX_IMPORT_BYTES = 10 * 1024 * 1024;
+const SAFE_DOCUMENT_ID_PARAM = /^[^\s/\\]{1,160}$/;
 
 export function parseStrictRevisionParam(raw: string): number | null {
   if (!/^\d{1,10}$/.test(raw)) return null;
   const n = Number(raw);
   if (!Number.isSafeInteger(n) || n < 1 || n > MAX_PG_INT32) return null;
   return n;
+}
+
+export function isValidDocumentIdParam(raw: string): boolean {
+  return SAFE_DOCUMENT_ID_PARAM.test(raw) && !raw.includes("..");
 }
 
 export function safeDownloadFilename(raw: string): string {
@@ -36,6 +44,14 @@ export interface DocumentRoutesDeps {
 
 export function registerDocumentRoutes(app: Express, deps: DocumentRoutesDeps): void {
   const { gateway, getActor, pdfExportGate } = deps;
+
+  app.param("id", (_req, res, next, idValue: string) => {
+    if (!isValidDocumentIdParam(idValue)) {
+      res.status(400).json({ error: "Invalid document id parameter", code: "INVALID_DOCUMENT_ID" });
+      return;
+    }
+    next();
+  });
 
   app.get("/api/documents", async (req, res, next) => {
     try {
@@ -86,6 +102,13 @@ export function registerDocumentRoutes(app: Express, deps: DocumentRoutesDeps): 
         return;
       }
       const buffer = Buffer.from(parsed.data.contentBase64, "base64");
+      if (buffer.byteLength > MAX_DOCX_IMPORT_BYTES) {
+        res.status(413).json({
+          error: "Decoded DOCX exceeds 10 MB maximum upload size.",
+          code: "PAYLOAD_TOO_LARGE",
+        });
+        return;
+      }
       const imported = await gateway.importDocx(actor, parsed.data.filename, buffer);
       res.status(201).json(imported);
     } catch (err) {
@@ -121,8 +144,17 @@ export function registerDocumentRoutes(app: Express, deps: DocumentRoutesDeps): 
   app.get("/api/documents/:id/versions", async (req, res, next) => {
     try {
       const actor = getActor(req);
-      const versions = await gateway.listVersions(actor, req.params.id);
-      res.json({ versions });
+      const parsed = paginationQuerySchema.safeParse(req.query);
+      if (!parsed.success) {
+        res.status(400).json({ error: "Invalid pagination query", code: "VALIDATION_ERROR", details: parsed.error.flatten() });
+        return;
+      }
+      const page = await gateway.listVersionsPage(actor, req.params.id, {
+        ...(typeof parsed.data.limit === "number" ? { limit: parsed.data.limit } : {}),
+        ...(typeof parsed.data.offset === "number" ? { offset: parsed.data.offset } : {}),
+        ...(parsed.data.order ? { order: parsed.data.order } : {}),
+      });
+      res.json(page);
     } catch (err) {
       next(err);
     }
@@ -157,7 +189,19 @@ export function registerDocumentRoutes(app: Express, deps: DocumentRoutesDeps): 
         res.status(400).json({ error: "Invalid revision number (must be integer 1..2147483647)", code: "VALIDATION_ERROR" });
         return;
       }
-      const restored = await gateway.restoreVersion(actor, req.params.id, rev);
+      const bodyParsed = restoreVersionRequestSchema.safeParse(req.body ?? {});
+      if (!bodyParsed.success) {
+        res.status(400).json({ error: "Invalid restore request body", code: "VALIDATION_ERROR", details: bodyParsed.error.flatten() });
+        return;
+      }
+      const restored = await gateway.restoreVersion(
+        actor,
+        req.params.id,
+        rev,
+        typeof bodyParsed.data.expectedRevision === "number"
+          ? { expectedRevision: bodyParsed.data.expectedRevision }
+          : undefined,
+      );
       res.json({ document: restored });
     } catch (err) {
       next(err);
@@ -207,8 +251,16 @@ export function registerDocumentRoutes(app: Express, deps: DocumentRoutesDeps): 
   app.get("/api/documents/:id/audit", async (req, res, next) => {
     try {
       const actor = getActor(req);
-      const events = await gateway.listAuditEvents(actor, req.params.id);
-      res.json({ events });
+      const parsed = paginationQuerySchema.safeParse(req.query);
+      if (!parsed.success) {
+        res.status(400).json({ error: "Invalid pagination query", code: "VALIDATION_ERROR", details: parsed.error.flatten() });
+        return;
+      }
+      const page = await gateway.listAuditEventsPage(actor, req.params.id, {
+        ...(typeof parsed.data.limit === "number" ? { limit: parsed.data.limit } : {}),
+        ...(typeof parsed.data.offset === "number" ? { offset: parsed.data.offset } : {}),
+      });
+      res.json(page);
     } catch (err) {
       next(err);
     }

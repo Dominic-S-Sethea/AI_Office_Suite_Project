@@ -188,3 +188,10 @@ Following Founder authorization of bounded local feasibility for **V1.3 (`FR-09`
 3. **External Provider Consent & ZDR Agreements:** Required before unlocking `ALLOW_LIVE_AI_PROVIDERS=true` or `ALLOW_LIVE_SPEECH_PROVIDERS=true` (`423` remains enforced).
 4. **Live Billing / Payment Processor & OIDC IdP (`PLT-01.10`, `PLT-06.07`):** Deferred to `PA-01+`; only signed mock webhook fixtures were used locally.
 5. **Verbatim V1.3 Research Report Archival Note:** Because conversation context compacted before file-write authorization was granted, no synthetic copy of `AI_Office_Suite_FR09_FR10_FR11_Main_Research_Report_V1.3.md` was fabricated; attach or drop the original `.md` into `documentation/` to archive it verbatim.
+
+---
+
+## 5. V1.4 Consolidation Addendum (`CR-008` / `TF-01`, 2026-11-26)
+
+Under `APPROVAL-02` (`TF-01`), all four V1.3 test suites (`v13-aic00`, `v13-vi00`, `v13-pa00`, `v13-integrated`) were realigned **1:1 to V1.4 Appendix A's canonical test-ID numbering** (`AI-T01..28`, `VOC-T01..30`, `PLT-T01..36`, `GOV-T01..08`), closing all missing local edge assertions (`AI-T24`, `AI-T26`, `AI-T28`, `VOC-T16/17/18/24/27/28/30`, `PLT-T13`) and moving the 7 `VOC-03` fail-closed P1 gates into `RC-P1-05` (`tests/v14-rc00-consolidation-and-tf01.test.ts`). During `PLT-T35`/`GOV-T08` realignment, a real security defect was discovered and fixed in `restorePaExtendedLogicalBackup` (`platform/database/src/governanceRepository.ts`): PA-00 additive core columns (`memberships.status`, `memberships.content_access`, `workspaces.visibility`, `organizations.mfa_required_for_privileged`) are now explicitly restored so revoked memberships and restricted workspaces can never silently revert on backup restore. See `documentation/REQUIREMENTS_TRACEABILITY_MATRIX.md` for the authoritative 51-parent / 313-test V1.4 mapping.
+

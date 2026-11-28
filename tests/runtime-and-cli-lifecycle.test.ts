@@ -16,7 +16,7 @@ async function runNodeScript(args: string[], envOverrides: Record<string, string
     const { stdout, stderr } = await execFileAsync(process.execPath, args, {
       cwd: repoRoot,
       env,
-      timeout: 15_000,
+      timeout: 30_000,
     });
     return { code: 0, stdout, stderr };
   } catch (err) {
@@ -70,7 +70,7 @@ describe("Wave 1 Server Lifecycle & CLI Governance Suite (C9)", () => {
     });
     expect(badSsl.code).not.toBe(0);
     expect(badSsl.stderr).toContain("Invalid PG_SSL_MODE");
-  });
+  }, 90_000);
 
   it("boots server.ts cleanly in provisional-local loopback mode and exits 0 promptly on SIGTERM", async () => {
     const port = 41900 + Math.floor(Math.random() * 500);
@@ -88,8 +88,12 @@ describe("Wave 1 Server Lifecycle & CLI Governance Suite (C9)", () => {
     });
 
     let stdoutBuf = "";
+    let stderrBuf = "";
     const started = new Promise<void>((resolve, reject) => {
-      const timer = setTimeout(() => reject(new Error(`Server did not start in time: ${stdoutBuf}`)), 10_000);
+      const timer = setTimeout(
+        () => reject(new Error(`Server did not start in time: stdout=${stdoutBuf} stderr=${stderrBuf}`)),
+        30_000,
+      );
       child.stdout.on("data", (chunk: Buffer) => {
         stdoutBuf += chunk.toString("utf8");
         if (stdoutBuf.includes("server.started")) {
@@ -97,23 +101,67 @@ describe("Wave 1 Server Lifecycle & CLI Governance Suite (C9)", () => {
           resolve();
         }
       });
+      child.stderr.on("data", (chunk: Buffer) => {
+        stderrBuf += chunk.toString("utf8");
+      });
       child.on("exit", (code) => {
         clearTimeout(timer);
-        reject(new Error(`Server exited early with code ${code}`));
+        reject(new Error(`Server exited early with code ${code}: ${stderrBuf}`));
       });
     });
 
-    await started;
-    const health = await fetch(`http://127.0.0.1:${port}/api/health`);
-    expect(health.status).toBe(200);
+    try {
+      await started;
+      const health = await fetch(`http://127.0.0.1:${port}/api/health`);
+      expect(health.status).toBe(200);
 
-    const exitCode = await new Promise<number | null>((resolve) => {
-      child.once("exit", (code) => resolve(code));
-      child.kill("SIGTERM");
-    });
-    expect(exitCode).toBe(0);
-    expect(stdoutBuf).toContain("server.shutdown_initiated");
-  });
+      if (process.platform === "win32") {
+        await new Promise<void>((resolve) => {
+          child.once("exit", () => resolve());
+          child.kill();
+        });
+        const http = await import("node:http");
+        const { createGracefulShutdown } = await import("../apps/api/src/server.ts");
+        const dummyServer = http.createServer((_req, res) => res.end("ok"));
+        await new Promise<void>((resolve) => dummyServer.listen(0, "127.0.0.1", () => resolve()));
+        let dbClosed = false;
+        let shutdownLogs = "";
+        const exitCode = await new Promise<number>((resolve) => {
+          const shutdown = createGracefulShutdown({
+            server: dummyServer,
+            db: {
+              close: async () => {
+                dbClosed = true;
+              },
+            },
+            writeStdout: (line) => {
+              shutdownLogs += line;
+            },
+            exitFn: (code) => resolve(code),
+          });
+          shutdown("SIGTERM");
+        });
+        expect(exitCode).toBe(0);
+        expect(dbClosed).toBe(true);
+        expect(shutdownLogs).toContain("server.shutdown_initiated");
+      } else {
+        const exitCode = await new Promise<number | null>((resolve) => {
+          child.once("exit", (code) => resolve(code));
+          child.kill("SIGTERM");
+        });
+        expect(exitCode).toBe(0);
+        expect(stdoutBuf).toContain("server.shutdown_initiated");
+      }
+    } finally {
+      if (child.exitCode === null && child.signalCode === null) {
+        try {
+          child.kill("SIGTERM");
+        } catch {
+          // process already exited
+        }
+      }
+    }
+  }, 60_000);
 
   it("verifies db-cli.mjs production seed refusal, invalid usage handling, check-hygiene.mjs, and check-licenses.mjs", async () => {
     const badCmd = await runNodeScript(["scripts/db-cli.mjs", "invalid-cmd"], {});

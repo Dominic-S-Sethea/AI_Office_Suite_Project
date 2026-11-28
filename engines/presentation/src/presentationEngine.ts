@@ -188,6 +188,7 @@ export function createGoldenManagementDeck(params: {
   opMarginRef: LinkedMetricReference;
   revenueChartSpec: ChartSpec;
   budgetChartSpec: ChartSpec;
+  departmentTableRows: string[][];
 }): StudioPresentation {
   const lang = params.language ?? "bilingual";
   const scopeLabel = params.scopeLabel ?? "All Departments (November 2026)";
@@ -408,12 +409,17 @@ export function createGoldenManagementDeck(params: {
             lang === "km"
               ? ["ផ្នែក", "ចំណូលសុទ្ធ (USD)", "ចំណាយប្រតិបត្តិការ & ថ្លៃដើម", "ប្រាក់ចំណេញប្រតិបត្តិការ"]
               : ["Department", "Net Sales (USD)", "Total Costs (COGS + OpEx)", "Operating Profit"],
-          rows: [
-            ["Sales", "$80,000.00", "$60,000.00", "$20,000.00"],
-            ["Services", "$45,000.00", "$30,000.00", "$15,000.00"],
-            ["Retail", "$25,000.00", "$20,000.00", "$5,000.00"],
-            ["Combined Total", params.netSalesRef.cachedFormattedValue, "Scoped Total", params.opProfitRef.cachedFormattedValue],
-          ],
+          rows:
+            params.departmentTableRows.length > 0
+              ? structuredClone(params.departmentTableRows)
+              : [
+                  [
+                    scopeLabel,
+                    params.netSalesRef.cachedFormattedValue,
+                    "—",
+                    params.opProfitRef.cachedFormattedValue,
+                  ],
+                ],
           bounds: { xIn: 0.8, yIn: 1.6, wIn: 11.7, hIn: 4.5 },
           zIndex: 2,
           locked: false,
@@ -521,9 +527,16 @@ export interface ExportDisclosureReport {
   includedScopeLabel: string;
 }
 
+const ALLOWED_CHART_KINDS = new Set(["column", "bar", "grouped_bar", "stacked_bar", "line", "pie"]);
+
+interface PresentationHistoryEntry {
+  deck: StudioPresentation;
+  restoredFromHistoryIdx?: number;
+}
+
 export class PresentationWorkspaceStore {
   private readonly decks = new Map<string, StudioPresentation>();
-  private readonly history = new Map<string, StudioPresentation[]>();
+  private readonly history = new Map<string, PresentationHistoryEntry[]>();
   private readonly publishedSnapshots = new Map<string, StudioPresentation>();
   private readonly audit?: AuditStore;
 
@@ -536,7 +549,23 @@ export class PresentationWorkspaceStore {
     assertTenantWorkspaceAccess(actor, deck.tenantId, deck.workspaceId);
     const clone = structuredClone(deck);
     this.decks.set(clone.presentationId, clone);
-    this.history.set(clone.presentationId, [structuredClone(clone)]);
+    this.history.set(clone.presentationId, [{ deck: structuredClone(clone) }]);
+    return structuredClone(clone);
+  }
+
+  updateDeckRevision(actor: ActorContext, deck: StudioPresentation): StudioPresentation {
+    assertCanPerform(actor, "document", "write");
+    assertTenantWorkspaceAccess(actor, deck.tenantId, deck.workspaceId);
+    const existing = this.decks.get(deck.presentationId);
+    if (!existing) {
+      throw new PresentationEngineError(404, "PRESENTATION_NOT_FOUND", `Presentation '${deck.presentationId}' not found.`);
+    }
+    assertTenantWorkspaceAccess(actor, existing.tenantId, existing.workspaceId);
+    const clone = structuredClone(deck);
+    this.decks.set(clone.presentationId, clone);
+    const stack = this.history.get(clone.presentationId) ?? [];
+    stack.push({ deck: structuredClone(clone) });
+    this.history.set(clone.presentationId, stack);
     return structuredClone(clone);
   }
 
@@ -570,7 +599,7 @@ export class PresentationWorkspaceStore {
     deck.revision += 1;
     deck.updatedAt = new Date().toISOString();
     this.decks.set(deck.presentationId, structuredClone(deck));
-    this.history.get(deck.presentationId)?.push(structuredClone(deck));
+    this.history.get(deck.presentationId)?.push({ deck: structuredClone(deck) });
     return deck;
   }
 
@@ -590,9 +619,27 @@ export class PresentationWorkspaceStore {
       throw new PresentationEngineError(404, "SLIDE_NOT_FOUND", `Slide '${params.slideId}' not found.`);
     }
 
-    const slideText = slide.elements
-      .map((e) => (e.type === "text" ? e.text : e.altText))
-      .join(" ");
+    const slideTextParts: string[] = [slide.title, slide.speakerNotes];
+    for (const e of slide.elements) {
+      slideTextParts.push(e.altText);
+      if (e.type === "text") {
+        slideTextParts.push(e.text);
+      } else if (e.type === "table") {
+        slideTextParts.push(...e.headers, ...e.rows.flat());
+      } else if (e.type === "chart") {
+        slideTextParts.push(
+          e.chartSpec.titleEn,
+          e.chartSpec.titleKm,
+          e.chartSpec.altSummaryEn,
+          e.chartSpec.altSummaryKm,
+          ...e.chartSpec.categories,
+          ...e.chartSpec.series.flatMap((s) => [s.labelEn, s.labelKm]),
+        );
+      } else if (e.type === "metric") {
+        slideTextParts.push(e.labelEn, e.labelKm);
+      }
+    }
+    const slideText = slideTextParts.filter(Boolean).join(" ");
     const safety = scanForPromptInjection(params.command, slideText);
     if (!safety.safe) {
       throw new PresentationEngineError(400, "PROMPT_INJECTION_BLOCKED", safety.reasons.join(" "));
@@ -709,12 +756,18 @@ export class PresentationWorkspaceStore {
       if (!el || el.type !== "text") {
         throw new PresentationEngineError(404, "TARGET_ELEMENT_NOT_FOUND", "Target text box no longer exists.");
       }
+      if (el.locked) {
+        throw new PresentationEngineError(403, "ELEMENT_LOCKED", `Element '${el.elementId}' is locked and cannot be modified.`);
+      }
       el.text = normalizeDocumentText(String(proposal.params.newText ?? el.text));
     } else if (proposal.action === "move_resize_element") {
       const slide = deck.slides.find((s) => s.slideId === proposal.targetSlideId);
       const el = slide?.elements.find((e) => e.elementId === proposal.targetElementId);
       if (!el) {
         throw new PresentationEngineError(404, "TARGET_ELEMENT_NOT_FOUND", "Target element not found.");
+      }
+      if (el.locked) {
+        throw new PresentationEngineError(403, "ELEMENT_LOCKED", `Element '${el.elementId}' is locked and cannot be moved or resized.`);
       }
       const nextBounds: SlideGeometry = {
         xIn: Number(proposal.params.xIn ?? el.bounds.xIn),
@@ -730,7 +783,14 @@ export class PresentationWorkspaceStore {
       if (!el || el.type !== "chart") {
         throw new PresentationEngineError(404, "TARGET_CHART_NOT_FOUND", "Target chart element not found.");
       }
-      const nextKind = String(proposal.params.chartType ?? "bar") as SlideElement & { type: "chart" } extends { chartSpec: { kind: infer K } } ? K : never;
+      if (el.locked) {
+        throw new PresentationEngineError(403, "ELEMENT_LOCKED", `Chart element '${el.elementId}' is locked and cannot be changed.`);
+      }
+      const rawKind = String(proposal.params.chartType ?? "bar");
+      if (!ALLOWED_CHART_KINDS.has(rawKind)) {
+        throw new PresentationEngineError(400, "INVALID_CHART_KIND", `Unsupported chart kind '${rawKind}'.`);
+      }
+      const nextKind = rawKind as SlideElement & { type: "chart" } extends { chartSpec: { kind: infer K } } ? K : never;
       // Preserve series values, units, currency, categories & binding intact (PPT-T08)
       el.chartSpec.kind = nextKind;
     } else if (proposal.action === "apply_theme") {
@@ -740,7 +800,7 @@ export class PresentationWorkspaceStore {
       deck.language = "km";
       for (const slide of deck.slides) {
         for (const el of slide.elements) {
-          if (el.type === "text" && el.elementId === "el_s2_heading") {
+          if (el.type === "text" && el.elementId === "el_s2_heading" && !el.locked) {
             el.text = "សូចនាករហិរញ្ញវត្ថុសំខាន់ៗ";
           }
         }
@@ -750,7 +810,7 @@ export class PresentationWorkspaceStore {
     deck.revision += 1;
     deck.updatedAt = new Date().toISOString();
     this.decks.set(deck.presentationId, structuredClone(deck));
-    this.history.get(deck.presentationId)?.push(structuredClone(deck));
+    this.history.get(deck.presentationId)?.push({ deck: structuredClone(deck) });
 
     this.audit?.append({
       auditId: `aud_${randomUUID()}`,
@@ -777,11 +837,19 @@ export class PresentationWorkspaceStore {
     if (stack.length < 2) {
       return deck;
     }
-    const prev = structuredClone(stack[stack.length - 2]!);
+    const topEntry = stack[stack.length - 1]!;
+    const targetIdx =
+      topEntry.restoredFromHistoryIdx !== undefined
+        ? topEntry.restoredFromHistoryIdx - 1
+        : stack.length - 2;
+    if (targetIdx < 0) {
+      return deck;
+    }
+    const prev = structuredClone(stack[targetIdx]!.deck);
     prev.revision = deck.revision + 1;
     prev.updatedAt = new Date().toISOString();
     this.decks.set(presentationId, structuredClone(prev));
-    stack.push(structuredClone(prev));
+    stack.push({ deck: structuredClone(prev), restoredFromHistoryIdx: targetIdx });
     return prev;
   }
 
@@ -795,6 +863,16 @@ export class PresentationWorkspaceStore {
       for (const ref of s.sourceRefs) {
         ref.approvalStatus = "published_snapshot";
         ref.mode = "published_snapshot";
+      }
+      for (const el of s.elements) {
+        if (el.type === "metric") {
+          el.metricRef.approvalStatus = "published_snapshot";
+          el.metricRef.mode = "published_snapshot";
+        }
+        if ("sourceRef" in el && el.sourceRef) {
+          el.sourceRef.approvalStatus = "published_snapshot";
+          el.sourceRef.mode = "published_snapshot";
+        }
       }
     }
     this.publishedSnapshots.set(`${presentationId}::${snapshotHash}`, structuredClone(deck));
@@ -832,18 +910,24 @@ export class PresentationWorkspaceStore {
       slide.sourceRefs = slide.sourceRefs.map((ref) => updatedRefsByMetricId[ref.metricId] ?? ref);
       for (const el of slide.elements) {
         if (el.type === "metric" && updatedRefsByMetricId[el.metricRef.metricId]) {
-          el.metricRef = structuredClone(updatedRefsByMetricId[el.metricRef.metricId]!);
+          const nextRef = structuredClone(updatedRefsByMetricId[el.metricRef.metricId]!);
+          el.metricRef = nextRef;
+          const label = deck.language === "km" ? el.labelKm : el.labelEn;
+          el.altText = `${label}: ${nextRef.cachedFormattedValue}`;
         } else if (el.type === "chart" && opts?.chartSpecBySlideId?.[slide.slideId]) {
           el.chartSpec = structuredClone(opts.chartSpecBySlideId[slide.slideId]!);
         } else if (el.type === "table" && opts?.tableRowsBySlideId?.[slide.slideId]) {
           el.rows = structuredClone(opts.tableRowsBySlideId[slide.slideId]!);
+        }
+        if ("sourceRef" in el && el.sourceRef && updatedRefsByMetricId[el.sourceRef.metricId]) {
+          el.sourceRef = structuredClone(updatedRefsByMetricId[el.sourceRef.metricId]!);
         }
       }
     }
     deck.revision += 1;
     deck.updatedAt = new Date().toISOString();
     this.decks.set(presentationId, structuredClone(deck));
-    this.history.get(presentationId)?.push(structuredClone(deck));
+    this.history.get(presentationId)?.push({ deck: structuredClone(deck) });
     return deck;
   }
 
@@ -890,4 +974,27 @@ export class PresentationWorkspaceStore {
       },
     };
   }
+}
+
+export type PresentationDeliveryKey = "ArrowRight" | "ArrowLeft" | "Home" | "End" | "Escape";
+
+export function createPresentationDeliverySession(deck: StudioPresentation) {
+  const visibleSlides = [...deck.slides].filter((s) => !s.hidden).sort((a, b) => a.order - b.order);
+  let activeIndex = 0;
+  let presenting = true;
+
+  return {
+    visibleSlides,
+    getActiveSlide: () => visibleSlides[activeIndex],
+    getActiveIndex: () => activeIndex,
+    isPresenting: () => presenting,
+    handleKey: (key: PresentationDeliveryKey) => {
+      if (!presenting) return;
+      if (key === "ArrowRight") activeIndex = Math.min(visibleSlides.length - 1, activeIndex + 1);
+      else if (key === "ArrowLeft") activeIndex = Math.max(0, activeIndex - 1);
+      else if (key === "Home") activeIndex = 0;
+      else if (key === "End") activeIndex = visibleSlides.length - 1;
+      else if (key === "Escape") presenting = false;
+    },
+  };
 }

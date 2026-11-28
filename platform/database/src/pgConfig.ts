@@ -46,7 +46,8 @@ export function createPgPoolConfigFromEnv(
   if (sslModeRaw && sslModeRaw !== "disable" && sslModeRaw !== "require" && sslModeRaw !== "verify-full") {
     throw new Error(`Invalid PG_SSL_MODE '${sslModeRaw}'. Allowed: disable, require, verify-full.`);
   }
-  const sslMode: PgSslMode = (sslModeRaw as PgSslMode) || "disable";
+  const isProduction = (env.NODE_ENV ?? "").trim().toLowerCase() === "production";
+  const sslMode: PgSslMode = (sslModeRaw as PgSslMode) || (isProduction ? "require" : "disable");
   const caFile = (env.PG_SSL_CA_FILE ?? "").trim();
 
   let sslConfig: PoolConfig["ssl"];

@@ -18,7 +18,9 @@ import { BusinessMetricRegistry } from "./metricRegistry.ts";
 import {
   addMinorUnits,
   AnalyticsError,
+  computeDescriptiveStatistics,
   convertCurrencyMinorUnits,
+  currencyScaleFor,
   DEFAULT_FINANCIAL_PRECISION_POLICY,
   divideExactScaled,
   formatCurrencyOrRatioDisplay,
@@ -114,11 +116,22 @@ function computeFiscalYtdStart(anchorDate: string, fiscalYearStartMonth = 1): st
   return `${fyStartYear}-${String(fiscalYearStartMonth).padStart(2, "0")}-01`;
 }
 
+function computeQuarterStart(anchorDate: string): string {
+  const year = Number.parseInt(anchorDate.slice(0, 4), 10);
+  const month = Number.parseInt(anchorDate.slice(5, 7), 10);
+  const qStartMonth = Math.floor((Math.max(1, month) - 1) / 3) * 3 + 1;
+  return `${year}-${String(qStartMonth).padStart(2, "0")}-01`;
+}
+
 function shiftMonthRange(start: string, endExclusive: string, monthsDelta: number): { start: string; endExclusive: string } {
   const shiftDate = (iso: string): string => {
     const [yStr = "2026", mStr = "1", dStr = "1"] = iso.split("-");
-    const date = new Date(Date.UTC(Number(yStr), Number(mStr) - 1 + monthsDelta, Number(dStr)));
-    return date.toISOString().slice(0, 10);
+    const targetMonthStart = new Date(Date.UTC(Number(yStr), Number(mStr) - 1 + monthsDelta, 1));
+    const targetYear = targetMonthStart.getUTCFullYear();
+    const targetMonth0 = targetMonthStart.getUTCMonth();
+    const lastDay = new Date(Date.UTC(targetYear, targetMonth0 + 1, 0)).getUTCDate();
+    const clampedDay = Math.min(Number(dStr), lastDay);
+    return new Date(Date.UTC(targetYear, targetMonth0, clampedDay)).toISOString().slice(0, 10);
   };
   return {
     start: shiftDate(start),
@@ -132,12 +145,26 @@ function isPresentAmount(val: string | number | null | undefined): val is string
   return true;
 }
 
+export const MAX_ANALYTICS_CACHE_ENTRIES = 1_000;
+export const MAX_ANALYTICS_DATASET_ENTRIES = 250;
+
+function setBoundedMapLru<K, V>(map: Map<K, V>, key: K, value: V, maxSize: number): void {
+  if (map.has(key)) {
+    map.delete(key);
+  } else if (map.size >= maxSize) {
+    const oldest = map.keys().next().value;
+    if (oldest !== undefined) map.delete(oldest);
+  }
+  map.set(key, value);
+}
+
 export class BusinessAnalysisEngine {
   readonly registry: BusinessMetricRegistry;
   private readonly datasets = new Map<string, AnalyticalDatasetRecord>();
   private readonly resultCache = new Map<string, AnalyticalResult>();
   private readonly idempotencyResults = new Map<string, AnalyticalResult>();
   private readonly publishedSnapshots = new Map<string, PublishedAnalyticalSnapshot>();
+  private readonly publishedByPubKey = new Map<string, PublishedAnalyticalSnapshot>();
   private readonly publicationCountByKey = new Map<string, number>();
   private readonly simulatedFailureTriggered = new Set<string>();
   private readonly audit?: AuditStore;
@@ -152,11 +179,44 @@ export class BusinessAnalysisEngine {
     if (!clone.sha256) {
       clone.sha256 = stableSha256(clone.rows);
     }
-    this.datasets.set(
+    setBoundedMapLru(
+      this.datasets,
       datasetKey(clone.tenantId, clone.workspaceId, clone.datasetId, clone.version),
       clone,
+      MAX_ANALYTICS_DATASET_ENTRIES,
     );
     return clone;
+  }
+
+  unregisterDataset(tenantId: string, workspaceId: string, datasetId: string, version?: number): number {
+    if (typeof version === "number") {
+      return this.datasets.delete(datasetKey(tenantId, workspaceId, datasetId, version)) ? 1 : 0;
+    }
+    let deleted = 0;
+    const prefix = `${tenantId}::${workspaceId}::${datasetId}::`;
+    for (const key of Array.from(this.datasets.keys())) {
+      if (key.startsWith(prefix)) {
+        this.datasets.delete(key);
+        deleted += 1;
+      }
+    }
+    return deleted;
+  }
+
+  getCacheStats(): {
+    datasets: number;
+    resultCache: number;
+    idempotencyResults: number;
+    publishedSnapshots: number;
+    simulatedFailureTriggered: number;
+  } {
+    return {
+      datasets: this.datasets.size,
+      resultCache: this.resultCache.size,
+      idempotencyResults: this.idempotencyResults.size,
+      publishedSnapshots: this.publishedSnapshots.size,
+      simulatedFailureTriggered: this.simulatedFailureTriggered.size,
+    };
   }
 
   getCachedResult(actor: ActorContext, resultId: string): AnalyticalResult {
@@ -165,15 +225,20 @@ export class BusinessAnalysisEngine {
       throw new AnalyticsError(404, "RESULT_NOT_FOUND", `Analytical result '${resultId}' does not exist.`);
     }
     assertTenantWorkspaceAccess(actor, found.tenantId, found.workspaceId);
+    setBoundedMapLru(this.resultCache, resultId, found, MAX_ANALYTICS_CACHE_ENTRIES);
     return structuredClone(found);
   }
 
   publishSnapshot(actor: ActorContext, resultId: string, publicationIdempotencyKey?: string): PublishedAnalyticalSnapshot {
     const result = this.getCachedResult(actor, resultId);
     const pubKey = `${actor.tenantId}::${actor.workspaceId}::${publicationIdempotencyKey ?? result.idempotencyKey}`;
-    const existing = Array.from(this.publishedSnapshots.values()).find(
-      (s) => s.tenantId === actor.tenantId && s.workspaceId === actor.workspaceId && s.result.idempotencyKey === result.idempotencyKey,
-    );
+    const existing =
+      this.publishedByPubKey.get(pubKey) ??
+      (!publicationIdempotencyKey
+        ? Array.from(this.publishedSnapshots.values()).find(
+            (s) => s.tenantId === actor.tenantId && s.workspaceId === actor.workspaceId && s.result.idempotencyKey === result.idempotencyKey,
+          )
+        : undefined);
     if (existing) {
       return structuredClone(existing);
     }
@@ -193,8 +258,14 @@ export class BusinessAnalysisEngine {
         },
       },
     };
-    this.publishedSnapshots.set(snapshot.snapshotId, snapshot);
-    this.publicationCountByKey.set(pubKey, (this.publicationCountByKey.get(pubKey) ?? 0) + 1);
+    setBoundedMapLru(this.publishedSnapshots, snapshot.snapshotId, snapshot, MAX_ANALYTICS_CACHE_ENTRIES);
+    setBoundedMapLru(this.publishedByPubKey, pubKey, snapshot, MAX_ANALYTICS_CACHE_ENTRIES);
+    setBoundedMapLru(
+      this.publicationCountByKey,
+      pubKey,
+      (this.publicationCountByKey.get(pubKey) ?? 0) + 1,
+      MAX_ANALYTICS_CACHE_ENTRIES,
+    );
     return structuredClone(snapshot);
   }
 
@@ -233,10 +304,15 @@ export class BusinessAnalysisEngine {
     const idemKey = `${actor.tenantId}::${actor.workspaceId}::${query.idempotencyKey}`;
     const existing = this.idempotencyResults.get(idemKey);
     if (existing) {
+      setBoundedMapLru(this.idempotencyResults, idemKey, existing, MAX_ANALYTICS_CACHE_ENTRIES);
       return structuredClone(existing);
     }
 
     if (options.simulateTransientFailureOnce && !this.simulatedFailureTriggered.has(idemKey)) {
+      if (this.simulatedFailureTriggered.size >= MAX_ANALYTICS_CACHE_ENTRIES) {
+        const oldest = this.simulatedFailureTriggered.values().next().value;
+        if (oldest !== undefined) this.simulatedFailureTriggered.delete(oldest);
+      }
       this.simulatedFailureTriggered.add(idemKey);
       throw new AnalyticsError(503, "TRANSIENT_JOB_FAILURE", "Simulated transient analytical worker interruption before commit.");
     }
@@ -263,7 +339,9 @@ export class BusinessAnalysisEngine {
     const effectiveStart =
       query.comparison === "ytd"
         ? computeFiscalYtdStart(query.period.start, query.period.fiscalYearStartMonth ?? 1)
-        : query.period.start;
+        : query.comparison === "qtd"
+          ? computeQuarterStart(query.period.start)
+          : query.period.start;
 
     const instance = await DuckDBInstance.create(":memory:");
     const conn = await instance.connect();
@@ -322,14 +400,28 @@ export class BusinessAnalysisEngine {
 
       if (query.filters) {
         for (const [k, rawVal] of Object.entries(query.filters)) {
-          const mappedCol = DUCKDB_COLUMN_MAP[k];
-          if (!mappedCol) {
+          if (!Object.hasOwn(DUCKDB_COLUMN_MAP, k)) {
             throw new AnalyticsError(400, "INVALID_FILTER_DIMENSION", `Filter dimension '${k}' is not permitted.`);
           }
-          const val = Array.isArray(rawVal) ? (rawVal[0] ?? "") : rawVal;
-          params.push(val);
-          filterSqlClauses.push(`${mappedCol} = $${params.length}`);
-          normalizedFilterContext[k] = val;
+          const mappedCol = DUCKDB_COLUMN_MAP[k]!;
+          if (Array.isArray(rawVal)) {
+            if (rawVal.length === 0) {
+              filterSqlClauses.push("1 = 0");
+              normalizedFilterContext[k] = "";
+            } else {
+              const placeholders: string[] = [];
+              for (const item of rawVal) {
+                params.push(String(item));
+                placeholders.push(`$${params.length}`);
+              }
+              filterSqlClauses.push(`${mappedCol} IN (${placeholders.join(", ")})`);
+              normalizedFilterContext[k] = rawVal.join(",");
+            }
+          } else {
+            params.push(rawVal);
+            filterSqlClauses.push(`${mappedCol} = $${params.length}`);
+            normalizedFilterContext[k] = rawVal;
+          }
         }
       }
 
@@ -385,13 +477,15 @@ export class BusinessAnalysisEngine {
         );
       }
 
+      const targetScale = currencyScaleFor(query.currency);
       const convertRowMinor = (rawVal: string | number | null, rowCurrency: string, rowId: string, fieldName: string): bigint => {
         if (!isPresentAmount(rawVal)) {
           validationErrors.push(`MISSING_REQUIRED_AMOUNT: Row '${rowId}' is missing '${fieldName}'.`);
           return 0n;
         }
-        const parsed = parseDecimalToMinorUnits(rawVal, 2);
-        return convertCurrencyMinorUnits(parsed, 2, rowCurrency, query.currency, query.exchangeRate, roundingMode);
+        const sourceScale = currencyScaleFor(rowCurrency);
+        const parsed = parseDecimalToMinorUnits(rawVal, sourceScale, undefined, roundingMode);
+        return convertCurrencyMinorUnits(parsed, targetScale, rowCurrency, query.currency, query.exchangeRate, roundingMode, sourceScale);
       };
 
       interface GroupAccum {
@@ -412,22 +506,59 @@ export class BusinessAnalysisEngine {
         customers: new Set<string>(),
       });
 
+      const needsGrossSales =
+        query.operation === "budget_vs_actual" ||
+        query.operation === "descriptive_stats" ||
+        query.operation === "historical_trend" ||
+        query.operation === "basic_anomaly" ||
+        definition.metricId === "FIN-GROSS-SALES" ||
+        definition.metricId === "FIN-NET-SALES" ||
+        definition.metricId === "FIN-GROSS-PROFIT" ||
+        definition.metricId === "FIN-GROSS-MARGIN" ||
+        definition.metricId === "FIN-OPERATING-PROFIT" ||
+        definition.metricId === "FIN-OPERATING-MARGIN" ||
+        definition.metricId === "FIN-REVENUE-GROWTH" ||
+        definition.metricId === "FIN-BUDGET-VARIANCE";
+      const needsCogs =
+        query.operation === "budget_vs_actual" ||
+        definition.metricId === "FIN-COGS" ||
+        definition.metricId === "FIN-TOTAL-COSTS" ||
+        definition.metricId === "FIN-GROSS-PROFIT" ||
+        definition.metricId === "FIN-GROSS-MARGIN" ||
+        definition.metricId === "FIN-OPERATING-PROFIT" ||
+        definition.metricId === "FIN-OPERATING-MARGIN" ||
+        definition.metricId === "FIN-BUDGET-VARIANCE";
+      const needsOpex =
+        query.operation === "budget_vs_actual" ||
+        definition.metricId === "FIN-OPEX" ||
+        definition.metricId === "FIN-TOTAL-COSTS" ||
+        definition.metricId === "FIN-OPERATING-PROFIT" ||
+        definition.metricId === "FIN-OPERATING-MARGIN" ||
+        definition.metricId === "FIN-BUDGET-VARIANCE";
+
       const aggregateRowsExact = (rows: AnalyticalFinanceRow[]) => {
         const overall = newAccum();
         const groups = new Map<string, GroupAccum>();
+        const lineNetSalesDecimals: Array<string | null> = [];
         for (const r of rows) {
-          const gs = convertRowMinor(r.grossSales, r.currency, r.rowId, "grossSales");
-          const rd = convertRowMinor(r.returnsDiscounts ?? "0", r.currency, r.rowId, "returnsDiscounts");
+          const gs = needsGrossSales ? convertRowMinor(r.grossSales, r.currency, r.rowId, "grossSales") : 0n;
+          const rd = needsGrossSales
+            ? convertRowMinor(r.returnsDiscounts ?? "0", r.currency, r.rowId, "returnsDiscounts")
+            : 0n;
           const ns = subMinorUnits(gs, rd);
-          const cg = convertRowMinor(r.cogs, r.currency, r.rowId, "cogs");
-          const ox = convertRowMinor(r.opex, r.currency, r.rowId, "opex");
+          const cg = needsCogs ? convertRowMinor(r.cogs, r.currency, r.rowId, "cogs") : 0n;
+          const ox = needsOpex ? convertRowMinor(r.opex, r.currency, r.rowId, "opex") : 0n;
+          lineNetSalesDecimals.push(
+            needsGrossSales && isPresentAmount(r.grossSales) ? formatScaledBigInt(ns, targetScale) : null,
+          );
 
           overall.grossSalesMinor = addMinorUnits(overall.grossSalesMinor, gs);
           overall.returnsMinor = addMinorUnits(overall.returnsMinor, rd);
           overall.netSalesMinor = addMinorUnits(overall.netSalesMinor, ns);
           overall.cogsMinor = addMinorUnits(overall.cogsMinor, cg);
           overall.opexMinor = addMinorUnits(overall.opexMinor, ox);
-          if (r.customerId.trim()) overall.customers.add(r.customerId);
+          const trimmedCust = r.customerId.trim();
+          if (trimmedCust) overall.customers.add(trimmedCust);
 
           if (groupByCols.length > 0) {
             const keyObj: Record<string, string> = {};
@@ -441,14 +572,14 @@ export class BusinessAnalysisEngine {
             gAcc.netSalesMinor = addMinorUnits(gAcc.netSalesMinor, ns);
             gAcc.cogsMinor = addMinorUnits(gAcc.cogsMinor, cg);
             gAcc.opexMinor = addMinorUnits(gAcc.opexMinor, ox);
-            if (r.customerId.trim()) gAcc.customers.add(r.customerId);
+            if (trimmedCust) gAcc.customers.add(trimmedCust);
             groups.set(gKey, gAcc);
           }
         }
-        return { overall, groups };
+        return { overall, groups, lineNetSalesDecimals };
       };
 
-      const { overall, groups } = aggregateRowsExact(filteredRows);
+      const { overall, groups, lineNetSalesDecimals } = aggregateRowsExact(filteredRows);
 
       // Compute metric value from an Accumulator cleanly & uniformly
       const computeFromAccum = (acc: GroupAccum, metricId: string, priorAcc?: GroupAccum): AnalyticalValuePayload => {
@@ -461,8 +592,8 @@ export class BusinessAnalysisEngine {
             return {
               status: "available",
               minorUnits: acc.grossSalesMinor.toString(),
-              decimalString: formatScaledBigInt(acc.grossSalesMinor, 2),
-              displayValue: formatCurrencyOrRatioDisplay(acc.grossSalesMinor, 2, { currency: query.currency }),
+              decimalString: formatScaledBigInt(acc.grossSalesMinor, targetScale),
+              displayValue: formatCurrencyOrRatioDisplay(acc.grossSalesMinor, targetScale, { currency: query.currency }),
               unit: "currency",
               currency: query.currency,
             };
@@ -470,8 +601,8 @@ export class BusinessAnalysisEngine {
             return {
               status: "available",
               minorUnits: acc.netSalesMinor.toString(),
-              decimalString: formatScaledBigInt(acc.netSalesMinor, 2),
-              displayValue: formatCurrencyOrRatioDisplay(acc.netSalesMinor, 2, { currency: query.currency }),
+              decimalString: formatScaledBigInt(acc.netSalesMinor, targetScale),
+              displayValue: formatCurrencyOrRatioDisplay(acc.netSalesMinor, targetScale, { currency: query.currency }),
               unit: "currency",
               currency: query.currency,
             };
@@ -479,8 +610,8 @@ export class BusinessAnalysisEngine {
             return {
               status: "available",
               minorUnits: acc.cogsMinor.toString(),
-              decimalString: formatScaledBigInt(acc.cogsMinor, 2),
-              displayValue: formatCurrencyOrRatioDisplay(acc.cogsMinor, 2, { currency: query.currency }),
+              decimalString: formatScaledBigInt(acc.cogsMinor, targetScale),
+              displayValue: formatCurrencyOrRatioDisplay(acc.cogsMinor, targetScale, { currency: query.currency }),
               unit: "currency",
               currency: query.currency,
             };
@@ -488,8 +619,8 @@ export class BusinessAnalysisEngine {
             return {
               status: "available",
               minorUnits: acc.opexMinor.toString(),
-              decimalString: formatScaledBigInt(acc.opexMinor, 2),
-              displayValue: formatCurrencyOrRatioDisplay(acc.opexMinor, 2, { currency: query.currency }),
+              decimalString: formatScaledBigInt(acc.opexMinor, targetScale),
+              displayValue: formatCurrencyOrRatioDisplay(acc.opexMinor, targetScale, { currency: query.currency }),
               unit: "currency",
               currency: query.currency,
             };
@@ -497,8 +628,8 @@ export class BusinessAnalysisEngine {
             return {
               status: "available",
               minorUnits: totalCosts.toString(),
-              decimalString: formatScaledBigInt(totalCosts, 2),
-              displayValue: formatCurrencyOrRatioDisplay(totalCosts, 2, { currency: query.currency }),
+              decimalString: formatScaledBigInt(totalCosts, targetScale),
+              displayValue: formatCurrencyOrRatioDisplay(totalCosts, targetScale, { currency: query.currency }),
               unit: "currency",
               currency: query.currency,
             };
@@ -506,8 +637,8 @@ export class BusinessAnalysisEngine {
             return {
               status: "available",
               minorUnits: grossProfit.toString(),
-              decimalString: formatScaledBigInt(grossProfit, 2),
-              displayValue: formatCurrencyOrRatioDisplay(grossProfit, 2, { currency: query.currency }),
+              decimalString: formatScaledBigInt(grossProfit, targetScale),
+              displayValue: formatCurrencyOrRatioDisplay(grossProfit, targetScale, { currency: query.currency }),
               unit: "currency",
               currency: query.currency,
             };
@@ -515,8 +646,8 @@ export class BusinessAnalysisEngine {
             return {
               status: "available",
               minorUnits: operatingProfit.toString(),
-              decimalString: formatScaledBigInt(operatingProfit, 2),
-              displayValue: formatCurrencyOrRatioDisplay(operatingProfit, 2, { currency: query.currency }),
+              decimalString: formatScaledBigInt(operatingProfit, targetScale),
+              displayValue: formatCurrencyOrRatioDisplay(operatingProfit, targetScale, { currency: query.currency }),
               unit: "currency",
               currency: query.currency,
             };
@@ -588,27 +719,28 @@ export class BusinessAnalysisEngine {
               unit: "count",
             };
           default:
-            return {
-              status: "available",
-              minorUnits: operatingProfit.toString(),
-              decimalString: formatScaledBigInt(operatingProfit, 2),
-              displayValue: formatCurrencyOrRatioDisplay(operatingProfit, 2, { currency: query.currency }),
-              unit: "currency",
-              currency: query.currency,
-            };
+            throw new AnalyticsError(400, "UNSUPPORTED_METRIC", `Metric '${metricId}' is not supported by computeFromAccum.`);
         }
       };
 
       let priorOverall: GroupAccum | undefined;
-      if (query.comparison === "previous_month" || definition.metricId === "FIN-REVENUE-GROWTH") {
-        const prevRange = shiftMonthRange(query.period.start, query.period.endExclusive, -1);
+      let priorGroups: Map<string, GroupAccum> | undefined;
+      if (
+        query.comparison === "previous_month" ||
+        query.comparison === "previous_year" ||
+        definition.metricId === "FIN-REVENUE-GROWTH"
+      ) {
+        const monthsDelta = query.comparison === "previous_year" ? -12 : -1;
+        const prevRange = shiftMonthRange(query.period.start, query.period.endExclusive, monthsDelta);
         const priorRows = await fetchPeriodRows(prevRange.start, prevRange.endExclusive);
-        priorOverall = aggregateRowsExact(priorRows).overall;
+        const priorAgg = aggregateRowsExact(priorRows);
+        priorOverall = priorAgg.overall;
+        priorGroups = priorAgg.groups;
       }
 
-      // Verify distinct count parity directly against DuckDB SQL COUNT(DISTINCT customer_id)
+      // Verify distinct count parity directly against DuckDB SQL COUNT(DISTINCT NULLIF(TRIM(customer_id), ''))
       const distinctReader = await conn.prepare(
-        `SELECT COUNT(DISTINCT customer_id)::INTEGER AS cnt FROM sales_lines WHERE ${filterSqlClauses.join(" AND ")}`,
+        `SELECT COUNT(DISTINCT NULLIF(TRIM(customer_id), ''))::INTEGER AS cnt FROM sales_lines WHERE ${filterSqlClauses.join(" AND ")}`,
       );
       for (let idx = 0; idx < params.length; idx++) {
         distinctReader.bindVarchar(idx + 1, params[idx]!);
@@ -635,26 +767,51 @@ export class BusinessAnalysisEngine {
         budgetDatasetUsed = { id: budgetDs.datasetId, version: budgetDs.version };
         assumptions.push("Pre-aggregated invoice_line actuals to (reporting_month, department) before 1:1 budget join to prevent budget multiplication.");
 
-        // Sum budgets once per category across filtered departments/months (guaranteed NO invoice multiplication!)
-        const monthSet = new Set(filteredRows.map((r) => r.reportingMonth));
-        const deptFilter = query.filters?.department
-          ? Array.isArray(query.filters.department)
-            ? query.filters.department[0]
-            : query.filters.department
-          : undefined;
+        // Enumerate eligible YYYY-MM months directly from [effectiveStart, endExclusive) intersected with any reportingMonth filter
+        const periodMonths = new Set<string>();
+        const [startYStr = "2026", startMStr = "1"] = effectiveStart.split("-");
+        let curYear = Number(startYStr);
+        let curMonth = Number(startMStr);
+        while (true) {
+          const monthStart = `${String(curYear).padStart(4, "0")}-${String(curMonth).padStart(2, "0")}-01`;
+          if (monthStart >= query.period.endExclusive) break;
+          periodMonths.add(monthStart.slice(0, 7));
+          curMonth += 1;
+          if (curMonth > 12) {
+            curMonth = 1;
+            curYear += 1;
+          }
+          if (periodMonths.size > 1_200) break;
+        }
+        const rmFilter = query.filters?.reportingMonth;
+        const explicitRmSet = rmFilter
+          ? new Set(Array.isArray(rmFilter) ? rmFilter : [rmFilter])
+          : null;
+        const eligibleMonths = new Set<string>();
+        for (const m of periodMonths) {
+          if (!explicitRmSet || explicitRmSet.has(m)) {
+            eligibleMonths.add(m);
+          }
+        }
+        const deptFilterRaw = query.filters?.department;
+        const deptSet = deptFilterRaw
+          ? new Set(Array.isArray(deptFilterRaw) ? deptFilterRaw : [deptFilterRaw])
+          : null;
         let revBudgetMinor = 0n;
         let costBudgetMinor = 0n;
         let opProfitBudgetMinor = 0n;
         for (const b of budgetDs.rows) {
-          if (monthSet.size > 0 && !monthSet.has(b.reportingMonth)) continue;
-          if (deptFilter && b.department !== deptFilter) continue;
+          if (!eligibleMonths.has(b.reportingMonth)) continue;
+          if (deptSet && !deptSet.has(b.department)) continue;
+          const bScale = currencyScaleFor(b.currency);
           const bMinor = convertCurrencyMinorUnits(
-            parseDecimalToMinorUnits(b.budgetAmount, 2),
-            2,
+            parseDecimalToMinorUnits(b.budgetAmount, bScale, undefined, roundingMode),
+            targetScale,
             b.currency,
             query.currency,
             query.exchangeRate,
             roundingMode,
+            bScale,
           );
           if (b.budgetCategory === "revenue") revBudgetMinor = addMinorUnits(revBudgetMinor, bMinor);
           if (b.budgetCategory === "costs") costBudgetMinor = addMinorUnits(costBudgetMinor, bMinor);
@@ -676,8 +833,8 @@ export class BusinessAnalysisEngine {
         primaryValue = {
           status: "available",
           minorUnits: profitVar.toString(),
-          decimalString: formatScaledBigInt(profitVar, 2),
-          displayValue: formatCurrencyOrRatioDisplay(profitVar, 2, { currency: query.currency }),
+          decimalString: formatScaledBigInt(profitVar, targetScale),
+          displayValue: formatCurrencyOrRatioDisplay(profitVar, targetScale, { currency: query.currency }),
           unit: "currency",
           currency: query.currency,
           varianceAssessment: assess(profitVar, "higher_is_favorable"),
@@ -685,31 +842,31 @@ export class BusinessAnalysisEngine {
 
         breakdown = [
           {
-            dimensionValues: { category: "revenue", budget: formatScaledBigInt(revBudgetMinor, 2), actual: formatScaledBigInt(overall.netSalesMinor, 2) },
+            dimensionValues: { category: "revenue", budget: formatScaledBigInt(revBudgetMinor, targetScale), actual: formatScaledBigInt(overall.netSalesMinor, targetScale) },
             value: {
               status: "available",
               minorUnits: revVar.toString(),
-              decimalString: formatScaledBigInt(revVar, 2),
-              displayValue: formatCurrencyOrRatioDisplay(revVar, 2, { currency: query.currency }),
+              decimalString: formatScaledBigInt(revVar, targetScale),
+              displayValue: formatCurrencyOrRatioDisplay(revVar, targetScale, { currency: query.currency }),
               unit: "currency",
               currency: query.currency,
               varianceAssessment: assess(revVar, "higher_is_favorable"),
             },
           },
           {
-            dimensionValues: { category: "total_costs", budget: formatScaledBigInt(costBudgetMinor, 2), actual: formatScaledBigInt(actualTotalCosts, 2) },
+            dimensionValues: { category: "total_costs", budget: formatScaledBigInt(costBudgetMinor, targetScale), actual: formatScaledBigInt(actualTotalCosts, targetScale) },
             value: {
               status: "available",
               minorUnits: costVar.toString(),
-              decimalString: formatScaledBigInt(costVar, 2),
-              displayValue: formatCurrencyOrRatioDisplay(costVar, 2, { currency: query.currency }),
+              decimalString: formatScaledBigInt(costVar, targetScale),
+              displayValue: formatCurrencyOrRatioDisplay(costVar, targetScale, { currency: query.currency }),
               unit: "currency",
               currency: query.currency,
               varianceAssessment: assess(costVar, "lower_is_favorable"),
             },
           },
           {
-            dimensionValues: { category: "operating_profit", budget: formatScaledBigInt(opProfitBudgetMinor, 2), actual: formatScaledBigInt(actualOpProfit, 2) },
+            dimensionValues: { category: "operating_profit", budget: formatScaledBigInt(opProfitBudgetMinor, targetScale), actual: formatScaledBigInt(actualOpProfit, targetScale) },
             value: primaryValue,
           },
         ];
@@ -719,41 +876,39 @@ export class BusinessAnalysisEngine {
           const dimensionValues = JSON.parse(keyJson) as Record<string, string>;
           breakdown.push({
             dimensionValues,
-            value: computeFromAccum(gAcc, definition.metricId),
+            value: computeFromAccum(gAcc, definition.metricId, priorGroups?.get(keyJson)),
           });
         }
       }
 
-      // Basic descriptive stats (ANA-02.05..07) computed over line net sales when requested
-      let stats: Record<string, number | string | number[]> | undefined;
+      // Hardened descriptive stats & anomaly detection over FX-normalized exact decimals (F-15)
+      let stats: AnalyticalResult["stats"];
       if (query.operation === "descriptive_stats" || query.operation === "historical_trend" || query.operation === "basic_anomaly") {
-        const netValues = filteredRows
-          .filter((r) => isPresentAmount(r.grossSales))
-          .map((r) => Number(r.grossSales) - Number(r.returnsDiscounts ?? 0))
-          .sort((a, b) => a - b);
-        const count = netValues.length;
-        const mean = count > 0 ? netValues.reduce((a, b) => a + b, 0) / count : 0;
-        const mid = Math.floor(count / 2);
-        const median =
-          count === 0 ? 0 : count % 2 === 1 ? netValues[mid]! : (netValues[mid - 1]! + netValues[mid]!) / 2;
-        const min = netValues[0] ?? 0;
-        const max = netValues[count - 1] ?? 0;
-        const variance = count > 0 ? netValues.reduce((s, x) => s + (x - mean) ** 2, 0) / count : 0;
-        const stddev = Math.sqrt(variance);
-        const q1 = netValues[Math.floor(count * 0.25)] ?? 0;
-        const q3 = netValues[Math.floor(count * 0.75)] ?? 0;
-        const iqr = q3 - q1;
-        const outlierHigh = q3 + 1.5 * iqr;
-        const outliers = netValues.filter((x) => x > outlierHigh);
+        const computed = computeDescriptiveStatistics(lineNetSalesDecimals, {
+          missingPolicy: "exclude_nulls",
+          percentileMethod: "linear_r7",
+        });
+        const displayFactor = 10 ** Math.max(2, targetScale);
+        const roundDisplay = (v: number | null): number =>
+          v === null ? 0 : Math.round(v * displayFactor) / displayFactor;
+        const roundNullable = (v: number | null): number | null =>
+          v === null ? null : Math.round(v * displayFactor) / displayFactor;
         stats = {
-          count,
-          mean: Math.round(mean * 100) / 100,
-          median: Math.round(median * 100) / 100,
-          min,
-          max,
-          stddev: Math.round(stddev * 100) / 100,
-          iqr: Math.round(iqr * 100) / 100,
-          outliers,
+          count: computed.count,
+          missingCount: computed.missingCount,
+          missingPolicy: computed.missingPolicy,
+          percentileMethod: computed.percentileMethod,
+          mean: roundDisplay(computed.mean),
+          median: roundDisplay(computed.median),
+          min: computed.min ?? 0,
+          max: computed.max ?? 0,
+          stddev: roundDisplay(computed.sampleStdDev ?? computed.populationStdDev),
+          sampleStdDev: roundNullable(computed.sampleStdDev),
+          populationStdDev: roundNullable(computed.populationStdDev),
+          p25: roundNullable(computed.p25),
+          p75: roundNullable(computed.p75),
+          iqr: roundDisplay(computed.iqr),
+          outliers: computed.outliers,
         };
       }
 
@@ -807,7 +962,7 @@ export class BusinessAnalysisEngine {
 
       const observedFacts = [
         `${definition.displayNameEn} (${definition.metricId} v${versionSpec.version}) = ${primaryValue.displayValue} over ${filteredRows.length} eligible posted rows.`,
-        ...(priorOverall ? [`Prior-period reference net sales = ${formatCurrencyOrRatioDisplay(priorOverall.netSalesMinor, 2, { currency: query.currency })}.`] : []),
+        ...(priorOverall ? [`Prior-period reference net sales = ${formatCurrencyOrRatioDisplay(priorOverall.netSalesMinor, targetScale, { currency: query.currency })}.`] : []),
         ...warnings,
       ];
 
@@ -839,8 +994,8 @@ export class BusinessAnalysisEngine {
         linkedMetricReference,
       };
 
-      this.resultCache.set(result.resultId, structuredClone(result));
-      this.idempotencyResults.set(idemKey, structuredClone(result));
+      setBoundedMapLru(this.resultCache, result.resultId, structuredClone(result), MAX_ANALYTICS_CACHE_ENTRIES);
+      setBoundedMapLru(this.idempotencyResults, idemKey, structuredClone(result), MAX_ANALYTICS_CACHE_ENTRIES);
 
       this.audit?.append({
         auditId: `aud_${randomUUID()}`,
@@ -921,7 +1076,15 @@ export function buildCrossModuleReconciledOutputs(
 
   const netSalesNum = Number(metricResults.netSales.value.decimalString ?? "0");
   const opProfitNum = Number(metricResults.operatingProfit.value.decimalString ?? "0");
-  const opMarginRatioNum = opProfitNum / (netSalesNum || 1);
+  const rawCurr = metricResults.netSales.value.currency;
+  const currency: "USD" | "KHR" | "NONE" | undefined =
+    rawCurr === "USD" || rawCurr === "KHR" || rawCurr === "NONE" ? rawCurr : "USD";
+  const monetaryNumberFormat = currency === "KHR" ? "៛#,##0" : currency === "USD" ? "$#,##0.00" : "#,##0.00";
+  const opMarginVal = metricResults.operatingMargin.value;
+  const b3EvaluatedValue: number | { error: "#DIV/0!"; detail?: string } =
+    opMarginVal.status === "available" && opMarginVal.decimalString !== undefined
+      ? Number(opMarginVal.decimalString)
+      : { error: "#DIV/0!", detail: opMarginVal.unavailableReason ?? "ZERO_DENOMINATOR" };
 
   const workbook: SpreadsheetWorkbook = {
     workbookId: `wb_reconciled_${randomUUID().slice(0, 8)}`,
@@ -938,23 +1101,23 @@ export function buildCrossModuleReconciledOutputs(
           B1: {
             value: netSalesNum,
             evaluatedValue: netSalesNum,
-            currency: "USD",
-            numberFormat: "$#,##0.00",
+            currency,
+            numberFormat: monetaryNumberFormat,
             protected: true,
           },
           A2: { value: "Operating profit" },
           B2: {
             value: opProfitNum,
             evaluatedValue: opProfitNum,
-            currency: "USD",
-            numberFormat: "$#,##0.00",
+            currency,
+            numberFormat: monetaryNumberFormat,
             protected: true,
           },
           A3: { value: "Operating margin" },
           B3: {
             value: null,
             formula: "=ROUND((B2/B1)*100, 2)",
-            evaluatedValue: Math.round(opMarginRatioNum * 10000) / 100,
+            evaluatedValue: b3EvaluatedValue,
             numberFormat: "0.00%",
             protected: true,
           },
@@ -964,10 +1127,14 @@ export function buildCrossModuleReconciledOutputs(
   };
 
   const docOpMargin = (doc.blocks[2] as Extract<StudioDocument["blocks"][number], { type: "linked_metric_placeholder" }>).metric.cachedFormattedValue;
-  const sheetOpMargin = `${Number(workbook.sheets[0]!.cells.B3!.evaluatedValue).toFixed(2)}%`;
+  const sheetOpMargin =
+    typeof b3EvaluatedValue === "number" ? `${b3EvaluatedValue.toFixed(2)}%` : undefined;
   const allMatchExactDecimals =
-    docOpMargin === metricResults.operatingMargin.value.displayValue &&
-    sheetOpMargin === metricResults.operatingMargin.value.displayValue;
+    opMarginVal.status === "available"
+      ? docOpMargin === opMarginVal.displayValue && sheetOpMargin === opMarginVal.displayValue
+      : docOpMargin === opMarginVal.displayValue &&
+        typeof b3EvaluatedValue === "object" &&
+        b3EvaluatedValue.error === "#DIV/0!";
 
   return { document: doc, workbook, allMatchExactDecimals };
 }
