@@ -1,6 +1,6 @@
 # Full Security, Architecture, Financial Precision & Compliance Audit Report
 
-**Audit Date:** 2026-11-25  
+**Audit Date:** 2026-11-28  
 **Branch:** `sprint/8h-security-pipeline-devops-audit`  
 **Standards Mapped:** OWASP ASVS L2, OWASP API Security Top 10 (2023), OWASP Top 10 for LLM Applications, `FIN-POL-V1` Financial Precision Policy, `security/DEPENDENCY_LICENSE_POLICY.md`
 
@@ -10,7 +10,7 @@
 
 - **Workspace Architecture:** **PASS** — `20` workspaces form a strict Directed Acyclic Graph (`0` circular dependencies).
 - **Dynamic Code / Injection Sinks:** **PASS** — `0` occurrences of `eval()`, `new Function()`, `innerHTML`, `dangerouslySetInnerHTML`, or `shell: true` subprocess invocations across `apps/`, `engines/`, `modules/`, `packages/`, `platform/`, and `scripts/`. Every `execFile`/`spawn` passes fixed argv arrays.
-- **SQL Injection & Multi-Tenant RLS:** **PASS** — 100% parameterized PostgreSQL queries (`$1..$N`) across all repositories and identity services; all `13` tenant-scoped tables enforce `ENABLE` + `FORCE ROW LEVEL SECURITY` under least-privilege `app_runtime` (`NOSUPERUSER NOBYPASSRLS NOLOGIN`); immutable ledgers (`audit_logs`, `document_versions`, `ai_applied_operations`, `xi_artifact_revisions`) revoke `UPDATE` and `DELETE` from `app_runtime`; `FOR UPDATE` locks operate cleanly on `documents` alone (eliminating `READ COMMITTED` EvalPlanQual phantom 404s).
+- **SQL Injection & Multi-Tenant RLS:** **PASS** — 100% parameterized PostgreSQL queries (`$1..$N`, with `ESCAPE '\\'` on prefix `LIKE` queries) across all repositories and identity services; all `22` tenant-scoped tables across Core, XI, and PA-00 schemas enforce `ENABLE` + `FORCE ROW LEVEL SECURITY` under least-privilege `app_runtime` (`NOSUPERUSER NOBYPASSRLS NOLOGIN`); immutable ledgers (`audit_logs`, `document_versions`, `ai_applied_operations`, `xi_artifact_revisions`) revoke `UPDATE` and `DELETE` from `app_runtime`; `FOR UPDATE` locks operate cleanly on `documents` alone (eliminating `READ COMMITTED` EvalPlanQual phantom 404s).
 - **Financial Precision (`FIN-POL-V1`):** **PASS** — BigInt integer minor units enforced across `engines/analytics`, `engines/data-processing` (`KHR` scale `0`, `USD` scale `2`, verified `0` minor-unit reconciliation drift up to `125B+ KHR` and fractional `0.10 + 0.20 - 0.05 USD`), and DuckDB/Polars minor-unit parity checks.
 - **License & Supply-Chain Policy:** **PASS** — `467` third-party package versions scanned (`47` direct), `0` disallowed licenses, `0` high/critical production advisories (`npm audit --omit=dev --audit-level=high` exits `0`).
 
@@ -22,29 +22,29 @@
 | :--- | :---: | :---: | :---: | :--- | :--- | :--- |
 | `GET /api/health` | Public | N/A | None | Public liveness | None | Stateless |
 | `GET /api/ready` | Public | N/A | None | Public readiness | None | Live PG `SELECT 1` + `app_runtime` + `FORCE RLS` check |
-| `GET /api/metrics` | `jwtMiddleware` | N/A (GET) | None | `owner` / `administrator` | None | Process + `pg-pool` telemetry |
+| `GET /api/metrics` | `jwtMiddleware` | N/A (GET) | `apiLimiter` | `owner` / `administrator` (`metrics:read`) | `format` query | Process + `pg-pool` telemetry |
 | `POST /api/auth/login` | Public | N/A (issues cookie) | Strict (`loginLimiter`, IP+email) | Active user + active org + membership | `loginRequestSchema` | Constant-time bcrypt + `users`/`memberships`/`organizations` |
-| `POST /api/auth/logout` | Cookie / Bearer | `verifyCookieCsrf` | None | Authenticated session | None | Clears `HttpOnly` cookie |
-| `GET /api/auth/me` | `jwtMiddleware` | N/A (GET) | None | Valid session + live `token_version` | None | Live DB check |
-| `POST /api/auth/revoke-sessions` | `jwtMiddleware` | `verifyCookieCsrf` | None | Authenticated principal | None | Increments `users.token_version` |
+| `POST /api/auth/logout` | Cookie / Bearer | `verifyCookieCsrf` | `apiLimiter` | Authenticated session | None | Clears `HttpOnly` cookie |
+| `GET /api/auth/me` | `jwtMiddleware` | N/A (GET) | `apiLimiter` | Valid session + live `token_version` | None | Live DB check |
+| `POST /api/auth/revoke-sessions` | `jwtMiddleware` | `verifyCookieCsrf` | `apiLimiter` | Authenticated principal | None | Increments `users.token_version` |
 | `GET /api/documents` | `jwtMiddleware` | N/A (GET) | `apiLimiter` | `document:read` | `listDocumentsQuerySchema` | `app_runtime` RLS + escaped `ILIKE` |
 | `POST /api/documents` | `jwtMiddleware` | `verifyCookieCsrf` | `apiLimiter` | `document:create` | `createDocumentSchema` | `app_runtime` RLS + audit |
 | `POST /api/documents/seed-bilingual-fixture` | `jwtMiddleware` | `verifyCookieCsrf` | `apiLimiter` | `document:create` | None | `app_runtime` RLS + audit |
 | `GET /api/documents/:id` | `jwtMiddleware` | N/A (GET) | `apiLimiter` | `document:read` | UUID format check | `app_runtime` RLS |
 | `PUT /api/documents/:id` | `jwtMiddleware` | `verifyCookieCsrf` | `apiLimiter` | `document:write` | `updateDocumentSchema` | `FOR UPDATE` + `409` lock + RLS |
-| `GET /api/documents/:id/versions` | `jwtMiddleware` | N/A (GET) | `apiLimiter` | `document:read` | UUID format check | `app_runtime` RLS |
+| `GET /api/documents/:id/versions` | `jwtMiddleware` | N/A (GET) | `apiLimiter` | `document:read` | `paginationQuerySchema` (`limit`/`offset`) + UUID | `app_runtime` RLS |
 | `GET /api/documents/:id/versions/:fromRev/diff/:toRev` | `jwtMiddleware` | N/A (GET) | `apiLimiter` | `document:read` | Positive integer revs + UUID | `app_runtime` RLS |
-| `POST /api/documents/:id/versions/:revision/restore` | `jwtMiddleware` | `verifyCookieCsrf` | `apiLimiter` | `document:restore` | Positive integer rev + UUID | `FOR UPDATE` + new revision + RLS |
-| `POST /api/documents/:id/ai/plan` | `jwtMiddleware` | `verifyCookieCsrf` | `apiLimiter` | `ai_assistant:read` | `aiPlanRequestSchema` + prompt injection scan | `app_runtime` RLS |
+| `POST /api/documents/:id/versions/:revision/restore` | `jwtMiddleware` | `verifyCookieCsrf` | `apiLimiter` | `document:restore` | `restoreVersionRequestSchema` (`expectedRevision` `409`) + UUID | `FOR UPDATE` + new revision + RLS |
+| `POST /api/documents/:id/ai/plan` | `jwtMiddleware` | `verifyCookieCsrf` | `apiLimiter` | `document:write` (`document:write` upfront + `ai_assistant:read`) | `aiPlanRequestSchema` + prompt injection scan (cmd + block + `selectedText`) | `app_runtime` RLS |
 | `POST /api/documents/:id/ai/apply` | `jwtMiddleware` | `verifyCookieCsrf` | `apiLimiter` | `ai_assistant:apply_ai` + `document:write` + explicit `approved: true` | `aiApplyRequestSchema` | Atomic PG `ai_applied_operations` ledger + `409` + RLS |
-| `POST /api/documents/import/docx` | `jwtMiddleware` | `verifyCookieCsrf` | `apiLimiter` | `document:create` | `importDocxRequestSchema` + fail-fast `fflate` zip-bomb/macro filter | `app_runtime` RLS + audit |
+| `POST /api/documents/import/docx` | `jwtMiddleware` | `verifyCookieCsrf` | `apiLimiter` | `document:create` | `importDocxRequestSchema` + fail-fast `fflate` pre-storage validation | `app_runtime` RLS + audit |
 | `POST /api/documents/:id/export/docx` | `jwtMiddleware` | `verifyCookieCsrf` | `apiLimiter` | `export:export` (`viewer` denied `403`) | UUID check + safe `Content-Disposition` | `app_runtime` RLS + audit |
-| `POST /api/documents/:id/export/pdf` | `jwtMiddleware` | `verifyCookieCsrf` | `apiLimiter` | `export:export` (`viewer` denied `403`) | UUID check + CSS/CSP SSRF lockdown | `app_runtime` RLS + audit |
-| `GET /api/documents/:id/audit` | `jwtMiddleware` | N/A (GET) | `apiLimiter` | `audit:read` | UUID format check | `app_runtime` RLS |
-| `POST /api/speech/transcribe` | `jwtMiddleware` | `verifyCookieCsrf` | `apiLimiter` | Authenticated session | `speechTranscribeRequestSchema` | Cloud adapters fail closed `423`; mock `isMock: true` |
+| `POST /api/documents/:id/export/pdf` | `jwtMiddleware` | `verifyCookieCsrf` | `apiLimiter` | `export:export` (`viewer` denied `403`) | UUID check + CSS/CSP SSRF lockdown + opt-in sandbox | `app_runtime` RLS + audit |
+| `GET /api/documents/:id/audit` | `jwtMiddleware` | N/A (GET) | `apiLimiter` | `audit:read` | `paginationQuerySchema` (`limit`/`offset`) + UUID | `app_runtime` RLS |
+| `POST /api/speech/transcribe` | `jwtMiddleware` | `verifyCookieCsrf` | `apiLimiter` | `speech:transcribe` | `speechTranscribeRequestSchema` | `no-store`; cloud adapters fail closed `423`; mock `isMock: true` |
 | `POST /api/data-prep/stage-and-profile` | `jwtMiddleware` | `verifyCookieCsrf` | `apiLimiter` | `document:write` | `dataPrepStageProfileSchema` (5MB, 50k rows cap) | Audited dry-run BigInt pipeline |
 
-All responses carry Helmet CSP (`default-src 'none'; frame-ancestors 'none'`), `Referrer-Policy: no-referrer`, `X-Request-Id`, no `X-Powered-By`, and `Cache-Control: no-store` on `/api/auth`, `/api/documents`, `/api/data-prep`, and `/api/metrics`.
+All responses carry Helmet CSP (`default-src 'none'; frame-ancestors 'none'`), `Referrer-Policy: no-referrer`, `X-Request-Id`, no `X-Powered-By`, and `Cache-Control: no-store` on `/api/auth`, `/api/documents`, `/api/speech`, `/api/data-prep`, and `/api/metrics`.
 
 ---
 

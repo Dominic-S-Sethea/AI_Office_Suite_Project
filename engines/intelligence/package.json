@@ -14,6 +14,7 @@
     "@ai-office-suite/presentation-engine": "*",
     "@ai-office-suite/shared-contracts": "*",
     "@ai-office-suite/validation": "*",
+    "@duckdb/node-api": "1.4.5-r.1",
     "echarts": "^6.1.0"
   }
 }

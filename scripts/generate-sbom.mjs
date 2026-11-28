@@ -72,12 +72,30 @@ export function generateCycloneDxSbom(baseDir = rootDir) {
     if (!name || name.startsWith("@ai-office-suite/")) continue;
 
     const dedupKey = `${name}@${version}`;
-    if (seen.has(dedupKey)) continue;
-
     const licenseStr =
       typeof entry.license === "string" && entry.license.trim() ? entry.license.trim() : undefined;
     const purl = buildPurl(name, version);
     const hashes = parseSriIntegrity(entry.integrity);
+    const scope = entry.dev ? "optional" : "required";
+
+    const existing = seen.get(dedupKey);
+    if (existing) {
+      // Promote dev-marked packages to runtime-required if any production path includes the same version (F-25)
+      if (scope === "required" && existing.scope !== "required") {
+        existing.scope = "required";
+      }
+      if (!existing.licenses && licenseStr) {
+        existing.licenses = [
+          isPermissiveOrDualAllowed(licenseStr)
+            ? { expression: licenseStr }
+            : { license: { name: licenseStr } },
+        ];
+      }
+      if (!existing.hashes && hashes.length > 0) {
+        existing.hashes = hashes;
+      }
+      continue;
+    }
 
     const component = {
       type: "library",
@@ -85,7 +103,7 @@ export function generateCycloneDxSbom(baseDir = rootDir) {
       name,
       version,
       purl,
-      scope: entry.dev ? "optional" : "required",
+      scope,
       ...(licenseStr
         ? {
             licenses: [

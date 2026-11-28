@@ -33,6 +33,11 @@ jobs:
       - name: Check dependency license compliance
         run: npm run lint:licenses
 
+      - name: Generate and verify CycloneDX SBOM
+        run: |
+          npm run sbom
+          node -e "const b = JSON.parse(require('node:fs').readFileSync('coverage/sbom.cdx.json','utf8')); const ms = b.components.find(c => c.name === 'ms' && c.version === '2.1.3'); if (!ms || ms.scope !== 'required') { console.error('Expected ms@2.1.3 scope=required in SBOM', ms); process.exit(1); }"
+
       - name: Typecheck
         run: npm run typecheck
 
@@ -95,6 +100,11 @@ jobs:
           npx vitest run tests/d2-live-postgres16-rls.test.ts --reporter=json --outputFile=/tmp/pg16-rls.json
           node -e 'const r = JSON.parse(require("node:fs").readFileSync("/tmp/pg16-rls.json","utf8")); if (!r.numPassedTests || r.numPendingTests > 0) { console.error("Expected zero skipped PG16 RLS tests", r); process.exit(1); }'
 
+      - name: Run live PostgreSQL 16 Platform Admin (PA-00) suite (must not skip)
+        run: |
+          npx vitest run tests/v13-pa00-platform-admin.test.ts --reporter=json --outputFile=/tmp/pg16-pa00.json
+          node -e 'const r = JSON.parse(require("node:fs").readFileSync("/tmp/pg16-pa00.json","utf8")); if (!r.numPassedTests || r.numPendingTests > 0) { console.error("Expected zero skipped PA-00 tests", r); process.exit(1); }'
+
       - name: Run PostgreSQL 16 + pipeline stress soak suite
         run: npx vitest run tests/stress-load-benchmarks.test.ts
 
@@ -112,10 +122,10 @@ jobs:
           JWT_SECRET: ci_smoke_jwt_secret_must_be_at_least_32_characters_long
         run: docker compose config --quiet
 
-      - name: Build production API image and verify config boot import
+      - name: Build production API image and verify runtime /api/health & bundled fonts
         run: |
           docker build -f docker/Dockerfile.api -t aios-api:ci-smoke .
-          docker run --rm aios-api:ci-smoke node -e "import('./apps/api/src/config.ts').then(m => { const c = m.loadApiServerConfig({ AUTH_MODE: 'provisional-local', HOST: '127.0.0.1', NODE_ENV: 'development' }); if (c.port !== 4100) process.exit(1); console.log('API image config OK'); })"
+          docker run --rm aios-api:ci-smoke node --input-type=module -e "import { existsSync } from 'node:fs'; import { createApiApp } from './apps/api/src/app.ts'; import { loadApiServerConfig } from './apps/api/src/config.ts'; const c = loadApiServerConfig({ AUTH_MODE: 'provisional-local', HOST: '127.0.0.1', NODE_ENV: 'development' }); if (c.port !== 4100) process.exit(1); if (!existsSync('node_modules/@fontsource/inter/files/inter-latin-400-normal.woff2') || !existsSync('node_modules/@fontsource/noto-sans-khmer/files/noto-sans-khmer-khmer-400-normal.woff2')) { console.error('Missing @fontsource runtime assets'); process.exit(1); } const app = createApiApp({ inMemory: true, rateLimit: { enabled: false } }); const srv = app.listen(0, '127.0.0.1'); try { await new Promise((r) => srv.once('listening', r)); const { port } = srv.address(); const res = await fetch(\`http://127.0.0.1:\${port}/api/health\`); if (res.status !== 200) process.exit(1); console.log('API image runtime health OK'); } finally { srv.close(); }"
 
       - name: Build production Web image and validate nginx.conf
         run: |

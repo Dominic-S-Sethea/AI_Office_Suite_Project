@@ -10,6 +10,9 @@
     "@ai-office-suite/shared-contracts": "*",
     "@ai-office-suite/document-engine": "*",
     "@ai-office-suite/validation": "*",
+    "@fontsource/inter": "^5.2.6",
+    "@fontsource/kantumruy-pro": "^5.2.6",
+    "@fontsource/noto-sans-khmer": "^5.2.6",
     "docx": "^9.5.1",
     "mammoth": "^1.9.0"
   }
