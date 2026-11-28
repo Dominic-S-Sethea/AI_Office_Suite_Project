@@ -32,6 +32,7 @@ interface WorkspaceSubPanelProps {
   onLogout: (revokeAll: boolean) => Promise<void>;
   onLayoutChange: (layout: PageLayoutConfig) => void;
   onLanguageChange: (lang: StudioDocument["language"]) => void;
+  onUnauthorized?: () => void;
 }
 
 const SAMPLE_STAGE_CSV = [
@@ -92,6 +93,7 @@ function WorkspaceSubPanelInner({
   onLogout,
   onLayoutChange,
   onLanguageChange,
+  onUnauthorized,
 }: WorkspaceSubPanelProps) {
   const [csvText, setCsvText] = useState(SAMPLE_STAGE_CSV);
   const [profileResult, setProfileResult] = useState<string | null>(null);
@@ -141,6 +143,11 @@ function WorkspaceSubPanelInner({
         }),
       });
       if (seq !== profileSeqRef.current) return;
+      if (res.status === 401) {
+        onUnauthorized?.();
+        setProfileError("Session expired. Please sign in again.");
+        return;
+      }
       const data = await safeReadJson(res);
       if (seq !== profileSeqRef.current) return;
       if (!res.ok) {

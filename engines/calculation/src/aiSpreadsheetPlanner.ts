@@ -153,21 +153,32 @@ export function planSpreadsheetCommand(params: {
     /\bsum\b/i.test(lower) ||
     command.includes("ផលបូក")
   ) {
-    const formula = `=SUM(${targetRange})`;
+    const { r1, r2, c1, c2 } = parseBoundedTargetRange(targetRange);
+    const destRange =
+      r1 === r2 && c2 > c1
+        ? `${colIndexToLetters(c2 + 1)}${r1}`
+        : c2 > c1
+          ? `${colIndexToLetters(c1)}${r2 + 1}:${colIndexToLetters(c2)}${r2 + 1}`
+          : `${colIndexToLetters(c1)}${r2 + 1}`;
+    const formulaSource =
+      c2 > c1 && r2 > r1
+        ? `${colIndexToLetters(c1)}${r1}:${colIndexToLetters(c1)}${r2}`
+        : targetRange;
+    const formula = `=SUM(${formulaSource})`;
     return {
       operationId: `sop_${randomUUID()}`,
       workbookId: workbook.workbookId,
       expectedRevision: workbook.revision,
       sheetName,
-      targetRange,
+      targetRange: destRange,
       action: "set_range_formula",
       formula,
-      fillMode: "fixed",
+      fillMode: c2 > c1 && r2 > r1 ? "adjust_relative_references" : "fixed",
       requiresApproval: true,
       inputLanguage,
       source,
       originalCommand: command,
-      explanation: `Generate editable SUM formula ${formula}.`,
+      explanation: `Insert editable SUM formula ${formula} into ${destRange}.`,
     };
   }
 

@@ -258,7 +258,17 @@ function renderBlockHtml(block: DocumentBlock): string {
         .map((row, idx) => {
           const cellTag = block.hasHeaderRow && idx === 0 ? "th" : "td";
           const cells = row
-            .map((cell) => `<${cellTag}>${renderRunsHtml(cell.runs) || "&nbsp;"}</${cellTag}>`)
+            .map((cell) => {
+              const colspan =
+                typeof cell.colspan === "number" && Number.isFinite(cell.colspan) && cell.colspan > 1
+                  ? ` colspan="${Math.min(20, Math.max(2, Math.trunc(cell.colspan)))}"`
+                  : "";
+              const rowspan =
+                typeof cell.rowspan === "number" && Number.isFinite(cell.rowspan) && cell.rowspan > 1
+                  ? ` rowspan="${Math.min(20, Math.max(2, Math.trunc(cell.rowspan)))}"`
+                  : "";
+              return `<${cellTag}${colspan}${rowspan}>${renderRunsHtml(cell.runs) || "&nbsp;"}</${cellTag}>`;
+            })
             .join("");
           return `<tr>${cells}</tr>`;
         })

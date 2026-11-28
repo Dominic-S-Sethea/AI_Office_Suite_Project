@@ -43,7 +43,17 @@ export interface ToolDefinition<
   ): ToolExecutionVerification;
 }
 
-function scanObjectStringsForInjection(value: unknown, path = "params"): string[] {
+const MAX_SCAN_DEPTH = 12;
+
+function scanObjectStringsForInjection(
+  value: unknown,
+  path = "params",
+  depth = 0,
+  seen = new WeakSet<object>(),
+): string[] {
+  if (depth > MAX_SCAN_DEPTH) {
+    return [`Parameter nesting exceeds safety limit (${MAX_SCAN_DEPTH}) at '${path}'.`];
+  }
   const errors: string[] = [];
   if (typeof value === "string") {
     const scan = scanForPromptInjection(value);
@@ -53,12 +63,22 @@ function scanObjectStringsForInjection(value: unknown, path = "params"): string[
     return errors;
   }
   if (Array.isArray(value)) {
-    value.forEach((item, idx) => errors.push(...scanObjectStringsForInjection(item, `${path}[${idx}]`)));
+    if (seen.has(value)) return errors;
+    seen.add(value);
+    value.forEach((item, idx) =>
+      errors.push(...scanObjectStringsForInjection(item, `${path}[${idx}]`, depth + 1, seen)),
+    );
     return errors;
   }
   if (value && typeof value === "object") {
+    if (seen.has(value)) return errors;
+    seen.add(value);
     for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
-      errors.push(...scanObjectStringsForInjection(v, `${path}.${k}`));
+      const keyScan = scanForPromptInjection(k);
+      if (!keyScan.safe) {
+        errors.push(`Prompt injection detected in key '${path}.${k}': ${keyScan.reasons.join("; ") || "blocked"}`);
+      }
+      errors.push(...scanObjectStringsForInjection(v, `${path}.${k}`, depth + 1, seen));
     }
   }
   return errors;

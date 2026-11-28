@@ -116,11 +116,22 @@ function computeFiscalYtdStart(anchorDate: string, fiscalYearStartMonth = 1): st
   return `${fyStartYear}-${String(fiscalYearStartMonth).padStart(2, "0")}-01`;
 }
 
+function computeQuarterStart(anchorDate: string): string {
+  const year = Number.parseInt(anchorDate.slice(0, 4), 10);
+  const month = Number.parseInt(anchorDate.slice(5, 7), 10);
+  const qStartMonth = Math.floor((Math.max(1, month) - 1) / 3) * 3 + 1;
+  return `${year}-${String(qStartMonth).padStart(2, "0")}-01`;
+}
+
 function shiftMonthRange(start: string, endExclusive: string, monthsDelta: number): { start: string; endExclusive: string } {
   const shiftDate = (iso: string): string => {
     const [yStr = "2026", mStr = "1", dStr = "1"] = iso.split("-");
-    const date = new Date(Date.UTC(Number(yStr), Number(mStr) - 1 + monthsDelta, Number(dStr)));
-    return date.toISOString().slice(0, 10);
+    const targetMonthStart = new Date(Date.UTC(Number(yStr), Number(mStr) - 1 + monthsDelta, 1));
+    const targetYear = targetMonthStart.getUTCFullYear();
+    const targetMonth0 = targetMonthStart.getUTCMonth();
+    const lastDay = new Date(Date.UTC(targetYear, targetMonth0 + 1, 0)).getUTCDate();
+    const clampedDay = Math.min(Number(dStr), lastDay);
+    return new Date(Date.UTC(targetYear, targetMonth0, clampedDay)).toISOString().slice(0, 10);
   };
   return {
     start: shiftDate(start),
@@ -153,6 +164,7 @@ export class BusinessAnalysisEngine {
   private readonly resultCache = new Map<string, AnalyticalResult>();
   private readonly idempotencyResults = new Map<string, AnalyticalResult>();
   private readonly publishedSnapshots = new Map<string, PublishedAnalyticalSnapshot>();
+  private readonly publishedByPubKey = new Map<string, PublishedAnalyticalSnapshot>();
   private readonly publicationCountByKey = new Map<string, number>();
   private readonly simulatedFailureTriggered = new Set<string>();
   private readonly audit?: AuditStore;
@@ -220,9 +232,13 @@ export class BusinessAnalysisEngine {
   publishSnapshot(actor: ActorContext, resultId: string, publicationIdempotencyKey?: string): PublishedAnalyticalSnapshot {
     const result = this.getCachedResult(actor, resultId);
     const pubKey = `${actor.tenantId}::${actor.workspaceId}::${publicationIdempotencyKey ?? result.idempotencyKey}`;
-    const existing = Array.from(this.publishedSnapshots.values()).find(
-      (s) => s.tenantId === actor.tenantId && s.workspaceId === actor.workspaceId && s.result.idempotencyKey === result.idempotencyKey,
-    );
+    const existing =
+      this.publishedByPubKey.get(pubKey) ??
+      (!publicationIdempotencyKey
+        ? Array.from(this.publishedSnapshots.values()).find(
+            (s) => s.tenantId === actor.tenantId && s.workspaceId === actor.workspaceId && s.result.idempotencyKey === result.idempotencyKey,
+          )
+        : undefined);
     if (existing) {
       return structuredClone(existing);
     }
@@ -243,6 +259,7 @@ export class BusinessAnalysisEngine {
       },
     };
     setBoundedMapLru(this.publishedSnapshots, snapshot.snapshotId, snapshot, MAX_ANALYTICS_CACHE_ENTRIES);
+    setBoundedMapLru(this.publishedByPubKey, pubKey, snapshot, MAX_ANALYTICS_CACHE_ENTRIES);
     setBoundedMapLru(
       this.publicationCountByKey,
       pubKey,
@@ -322,7 +339,9 @@ export class BusinessAnalysisEngine {
     const effectiveStart =
       query.comparison === "ytd"
         ? computeFiscalYtdStart(query.period.start, query.period.fiscalYearStartMonth ?? 1)
-        : query.period.start;
+        : query.comparison === "qtd"
+          ? computeQuarterStart(query.period.start)
+          : query.period.start;
 
     const instance = await DuckDBInstance.create(":memory:");
     const conn = await instance.connect();
@@ -381,14 +400,28 @@ export class BusinessAnalysisEngine {
 
       if (query.filters) {
         for (const [k, rawVal] of Object.entries(query.filters)) {
-          const mappedCol = DUCKDB_COLUMN_MAP[k];
-          if (!mappedCol) {
+          if (!Object.hasOwn(DUCKDB_COLUMN_MAP, k)) {
             throw new AnalyticsError(400, "INVALID_FILTER_DIMENSION", `Filter dimension '${k}' is not permitted.`);
           }
-          const val = Array.isArray(rawVal) ? (rawVal[0] ?? "") : rawVal;
-          params.push(val);
-          filterSqlClauses.push(`${mappedCol} = $${params.length}`);
-          normalizedFilterContext[k] = val;
+          const mappedCol = DUCKDB_COLUMN_MAP[k]!;
+          if (Array.isArray(rawVal)) {
+            if (rawVal.length === 0) {
+              filterSqlClauses.push("1 = 0");
+              normalizedFilterContext[k] = "";
+            } else {
+              const placeholders: string[] = [];
+              for (const item of rawVal) {
+                params.push(String(item));
+                placeholders.push(`$${params.length}`);
+              }
+              filterSqlClauses.push(`${mappedCol} IN (${placeholders.join(", ")})`);
+              normalizedFilterContext[k] = rawVal.join(",");
+            }
+          } else {
+            params.push(rawVal);
+            filterSqlClauses.push(`${mappedCol} = $${params.length}`);
+            normalizedFilterContext[k] = rawVal;
+          }
         }
       }
 
@@ -473,24 +506,59 @@ export class BusinessAnalysisEngine {
         customers: new Set<string>(),
       });
 
+      const needsGrossSales =
+        query.operation === "budget_vs_actual" ||
+        query.operation === "descriptive_stats" ||
+        query.operation === "historical_trend" ||
+        query.operation === "basic_anomaly" ||
+        definition.metricId === "FIN-GROSS-SALES" ||
+        definition.metricId === "FIN-NET-SALES" ||
+        definition.metricId === "FIN-GROSS-PROFIT" ||
+        definition.metricId === "FIN-GROSS-MARGIN" ||
+        definition.metricId === "FIN-OPERATING-PROFIT" ||
+        definition.metricId === "FIN-OPERATING-MARGIN" ||
+        definition.metricId === "FIN-REVENUE-GROWTH" ||
+        definition.metricId === "FIN-BUDGET-VARIANCE";
+      const needsCogs =
+        query.operation === "budget_vs_actual" ||
+        definition.metricId === "FIN-COGS" ||
+        definition.metricId === "FIN-TOTAL-COSTS" ||
+        definition.metricId === "FIN-GROSS-PROFIT" ||
+        definition.metricId === "FIN-GROSS-MARGIN" ||
+        definition.metricId === "FIN-OPERATING-PROFIT" ||
+        definition.metricId === "FIN-OPERATING-MARGIN" ||
+        definition.metricId === "FIN-BUDGET-VARIANCE";
+      const needsOpex =
+        query.operation === "budget_vs_actual" ||
+        definition.metricId === "FIN-OPEX" ||
+        definition.metricId === "FIN-TOTAL-COSTS" ||
+        definition.metricId === "FIN-OPERATING-PROFIT" ||
+        definition.metricId === "FIN-OPERATING-MARGIN" ||
+        definition.metricId === "FIN-BUDGET-VARIANCE";
+
       const aggregateRowsExact = (rows: AnalyticalFinanceRow[]) => {
         const overall = newAccum();
         const groups = new Map<string, GroupAccum>();
         const lineNetSalesDecimals: Array<string | null> = [];
         for (const r of rows) {
-          const gs = convertRowMinor(r.grossSales, r.currency, r.rowId, "grossSales");
-          const rd = convertRowMinor(r.returnsDiscounts ?? "0", r.currency, r.rowId, "returnsDiscounts");
+          const gs = needsGrossSales ? convertRowMinor(r.grossSales, r.currency, r.rowId, "grossSales") : 0n;
+          const rd = needsGrossSales
+            ? convertRowMinor(r.returnsDiscounts ?? "0", r.currency, r.rowId, "returnsDiscounts")
+            : 0n;
           const ns = subMinorUnits(gs, rd);
-          const cg = convertRowMinor(r.cogs, r.currency, r.rowId, "cogs");
-          const ox = convertRowMinor(r.opex, r.currency, r.rowId, "opex");
-          lineNetSalesDecimals.push(isPresentAmount(r.grossSales) ? formatScaledBigInt(ns, targetScale) : null);
+          const cg = needsCogs ? convertRowMinor(r.cogs, r.currency, r.rowId, "cogs") : 0n;
+          const ox = needsOpex ? convertRowMinor(r.opex, r.currency, r.rowId, "opex") : 0n;
+          lineNetSalesDecimals.push(
+            needsGrossSales && isPresentAmount(r.grossSales) ? formatScaledBigInt(ns, targetScale) : null,
+          );
 
           overall.grossSalesMinor = addMinorUnits(overall.grossSalesMinor, gs);
           overall.returnsMinor = addMinorUnits(overall.returnsMinor, rd);
           overall.netSalesMinor = addMinorUnits(overall.netSalesMinor, ns);
           overall.cogsMinor = addMinorUnits(overall.cogsMinor, cg);
           overall.opexMinor = addMinorUnits(overall.opexMinor, ox);
-          if (r.customerId.trim()) overall.customers.add(r.customerId);
+          const trimmedCust = r.customerId.trim();
+          if (trimmedCust) overall.customers.add(trimmedCust);
 
           if (groupByCols.length > 0) {
             const keyObj: Record<string, string> = {};
@@ -504,7 +572,7 @@ export class BusinessAnalysisEngine {
             gAcc.netSalesMinor = addMinorUnits(gAcc.netSalesMinor, ns);
             gAcc.cogsMinor = addMinorUnits(gAcc.cogsMinor, cg);
             gAcc.opexMinor = addMinorUnits(gAcc.opexMinor, ox);
-            if (r.customerId.trim()) gAcc.customers.add(r.customerId);
+            if (trimmedCust) gAcc.customers.add(trimmedCust);
             groups.set(gKey, gAcc);
           }
         }
@@ -651,27 +719,28 @@ export class BusinessAnalysisEngine {
               unit: "count",
             };
           default:
-            return {
-              status: "available",
-              minorUnits: operatingProfit.toString(),
-              decimalString: formatScaledBigInt(operatingProfit, targetScale),
-              displayValue: formatCurrencyOrRatioDisplay(operatingProfit, targetScale, { currency: query.currency }),
-              unit: "currency",
-              currency: query.currency,
-            };
+            throw new AnalyticsError(400, "UNSUPPORTED_METRIC", `Metric '${metricId}' is not supported by computeFromAccum.`);
         }
       };
 
       let priorOverall: GroupAccum | undefined;
-      if (query.comparison === "previous_month" || definition.metricId === "FIN-REVENUE-GROWTH") {
-        const prevRange = shiftMonthRange(query.period.start, query.period.endExclusive, -1);
+      let priorGroups: Map<string, GroupAccum> | undefined;
+      if (
+        query.comparison === "previous_month" ||
+        query.comparison === "previous_year" ||
+        definition.metricId === "FIN-REVENUE-GROWTH"
+      ) {
+        const monthsDelta = query.comparison === "previous_year" ? -12 : -1;
+        const prevRange = shiftMonthRange(query.period.start, query.period.endExclusive, monthsDelta);
         const priorRows = await fetchPeriodRows(prevRange.start, prevRange.endExclusive);
-        priorOverall = aggregateRowsExact(priorRows).overall;
+        const priorAgg = aggregateRowsExact(priorRows);
+        priorOverall = priorAgg.overall;
+        priorGroups = priorAgg.groups;
       }
 
-      // Verify distinct count parity directly against DuckDB SQL COUNT(DISTINCT customer_id)
+      // Verify distinct count parity directly against DuckDB SQL COUNT(DISTINCT NULLIF(TRIM(customer_id), ''))
       const distinctReader = await conn.prepare(
-        `SELECT COUNT(DISTINCT customer_id)::INTEGER AS cnt FROM sales_lines WHERE ${filterSqlClauses.join(" AND ")}`,
+        `SELECT COUNT(DISTINCT NULLIF(TRIM(customer_id), ''))::INTEGER AS cnt FROM sales_lines WHERE ${filterSqlClauses.join(" AND ")}`,
       );
       for (let idx = 0; idx < params.length; idx++) {
         distinctReader.bindVarchar(idx + 1, params[idx]!);
@@ -698,19 +767,42 @@ export class BusinessAnalysisEngine {
         budgetDatasetUsed = { id: budgetDs.datasetId, version: budgetDs.version };
         assumptions.push("Pre-aggregated invoice_line actuals to (reporting_month, department) before 1:1 budget join to prevent budget multiplication.");
 
-        // Sum budgets once per category across filtered departments/months (guaranteed NO invoice multiplication!)
-        const monthSet = new Set(filteredRows.map((r) => r.reportingMonth));
-        const deptFilter = query.filters?.department
-          ? Array.isArray(query.filters.department)
-            ? query.filters.department[0]
-            : query.filters.department
-          : undefined;
+        // Enumerate eligible YYYY-MM months directly from [effectiveStart, endExclusive) intersected with any reportingMonth filter
+        const periodMonths = new Set<string>();
+        const [startYStr = "2026", startMStr = "1"] = effectiveStart.split("-");
+        let curYear = Number(startYStr);
+        let curMonth = Number(startMStr);
+        while (true) {
+          const monthStart = `${String(curYear).padStart(4, "0")}-${String(curMonth).padStart(2, "0")}-01`;
+          if (monthStart >= query.period.endExclusive) break;
+          periodMonths.add(monthStart.slice(0, 7));
+          curMonth += 1;
+          if (curMonth > 12) {
+            curMonth = 1;
+            curYear += 1;
+          }
+          if (periodMonths.size > 1_200) break;
+        }
+        const rmFilter = query.filters?.reportingMonth;
+        const explicitRmSet = rmFilter
+          ? new Set(Array.isArray(rmFilter) ? rmFilter : [rmFilter])
+          : null;
+        const eligibleMonths = new Set<string>();
+        for (const m of periodMonths) {
+          if (!explicitRmSet || explicitRmSet.has(m)) {
+            eligibleMonths.add(m);
+          }
+        }
+        const deptFilterRaw = query.filters?.department;
+        const deptSet = deptFilterRaw
+          ? new Set(Array.isArray(deptFilterRaw) ? deptFilterRaw : [deptFilterRaw])
+          : null;
         let revBudgetMinor = 0n;
         let costBudgetMinor = 0n;
         let opProfitBudgetMinor = 0n;
         for (const b of budgetDs.rows) {
-          if (monthSet.size > 0 && !monthSet.has(b.reportingMonth)) continue;
-          if (deptFilter && b.department !== deptFilter) continue;
+          if (!eligibleMonths.has(b.reportingMonth)) continue;
+          if (deptSet && !deptSet.has(b.department)) continue;
           const bScale = currencyScaleFor(b.currency);
           const bMinor = convertCurrencyMinorUnits(
             parseDecimalToMinorUnits(b.budgetAmount, bScale, undefined, roundingMode),
@@ -784,7 +876,7 @@ export class BusinessAnalysisEngine {
           const dimensionValues = JSON.parse(keyJson) as Record<string, string>;
           breakdown.push({
             dimensionValues,
-            value: computeFromAccum(gAcc, definition.metricId),
+            value: computeFromAccum(gAcc, definition.metricId, priorGroups?.get(keyJson)),
           });
         }
       }

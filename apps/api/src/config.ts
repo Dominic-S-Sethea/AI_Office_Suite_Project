@@ -64,6 +64,63 @@ const authModeEnvSchema = z
     return z.NEVER;
   });
 
+const rateLimitStoreEnvSchema = z
+  .string()
+  .optional()
+  .transform((raw, ctx): "memory" | "postgres" | "" => {
+    const trimmed = (raw ?? "").trim().toLowerCase();
+    if (!trimmed) return "";
+    if (trimmed === "memory" || trimmed === "postgres") return trimmed;
+    ctx.addIssue({
+      code: "custom",
+      message: `Invalid RATE_LIMIT_STORE '${raw}'. Allowed: memory, postgres.`,
+    });
+    return z.NEVER;
+  });
+
+const optionalBooleanString = (name: string) =>
+  z
+    .string()
+    .optional()
+    .transform((raw, ctx): boolean | undefined => {
+      const trimmed = (raw ?? "").trim().toLowerCase();
+      if (!trimmed) return undefined;
+      if (trimmed === "true") return true;
+      if (trimmed === "false") return false;
+      ctx.addIssue({
+        code: "custom",
+        message: `Invalid ${name} '${raw}'. Allowed: true, false.`,
+      });
+      return z.NEVER;
+    });
+
+const optionalHttpUrlString = (name: string) =>
+  z
+    .string()
+    .optional()
+    .transform((raw, ctx): string | undefined => {
+      const trimmed = (raw ?? "").trim();
+      if (!trimmed) return undefined;
+      let parsedUrl: URL;
+      try {
+        parsedUrl = new URL(trimmed);
+      } catch {
+        ctx.addIssue({
+          code: "custom",
+          message: `Invalid ${name} '${raw}': expected http:// or https:// URL.`,
+        });
+        return z.NEVER;
+      }
+      if (parsedUrl.protocol !== "http:" && parsedUrl.protocol !== "https:") {
+        ctx.addIssue({
+          code: "custom",
+          message: `Invalid ${name} '${raw}': URL protocol must be http: or https:.`,
+        });
+        return z.NEVER;
+      }
+      return trimmed.replace(/\/+$/, "");
+    });
+
 const apiEnvSchema = z.object({
   NODE_ENV: z.string().optional(),
   AUTH_MODE: authModeEnvSchema,
@@ -79,6 +136,7 @@ const apiEnvSchema = z.object({
   ALLOW_SUPERUSER_DB_RUNTIME: z.string().optional(),
   AUTO_MIGRATE_ON_START: z.string().optional(),
   DISABLE_RATE_LIMIT: z.string().optional(),
+  RATE_LIMIT_STORE: rateLimitStoreEnvSchema,
   RATE_LIMIT_LOGIN_MAX: optionalIntString("RATE_LIMIT_LOGIN_MAX", 1, 1000, 15),
   RATE_LIMIT_LOGIN_IP_MAX: optionalIntString("RATE_LIMIT_LOGIN_IP_MAX", 1, 5000, 60),
   RATE_LIMIT_API_MAX: optionalIntString("RATE_LIMIT_API_MAX", 10, 10_000, 300),
@@ -86,6 +144,10 @@ const apiEnvSchema = z.object({
   MAX_CONCURRENT_PDF_EXPORTS: optionalIntString("MAX_CONCURRENT_PDF_EXPORTS", 1, 16, 2),
   MAX_CONCURRENT_DATA_PREP: optionalIntString("MAX_CONCURRENT_DATA_PREP", 1, 16, 2),
   READY_CACHE_TTL_MS: optionalIntString("READY_CACHE_TTL_MS", 0, 60_000, 2_000),
+  ISOLATED_PARSER_WORKERS: optionalBooleanString("ISOLATED_PARSER_WORKERS"),
+  PARSER_WORKER_URL: optionalHttpUrlString("PARSER_WORKER_URL"),
+  WORKER_TIMEOUT_MS: optionalIntString("WORKER_TIMEOUT_MS", 1_000, 120_000, 30_000),
+  WORKER_MAX_OLD_SPACE_MB: optionalIntString("WORKER_MAX_OLD_SPACE_MB", 64, 2_048, 256),
 });
 
 export interface ApiServerConfig {
@@ -103,10 +165,17 @@ export interface ApiServerConfig {
   maxConcurrentDataPrep: number;
   rateLimit: {
     enabled: boolean;
+    store: "memory" | "postgres";
     loginMaxPerWindow: number;
     loginIpMaxPerWindow: number;
     apiMaxPerWindow: number;
     windowMs: number;
+  };
+  workers: {
+    isolatedParsers: boolean;
+    workerUrl?: string;
+    timeoutMs: number;
+    maxOldSpaceMb: number;
   };
 }
 
@@ -169,12 +238,32 @@ export function loadApiServerConfig(
         "PRODUCTION_SECRET_MISSING_OR_WEAK: PII_PSEUDONYMIZATION_KEY must be set to a strong non-placeholder secret (>= 32 chars) in production.",
       );
     }
+    const piiSecret = v.PII_PSEUDONYMIZATION_KEY.trim();
+    if (piiSecret === jwtSecret || piiSecret === proposalSecret) {
+      throw new Error(
+        "PRODUCTION_SECRET_REUSE_FORBIDDEN: PII_PSEUDONYMIZATION_KEY must be distinct from JWT_SECRET and AI_PROPOSAL_SIGNING_SECRET in production.",
+      );
+    }
+    if (v.DISABLE_RATE_LIMIT === "true") {
+      throw new Error(
+        "PRODUCTION_RATE_LIMIT_REQUIRED: DISABLE_RATE_LIMIT=true is prohibited in production.",
+      );
+    }
   }
 
   const pgPoolConfig = authMode === "jwt-pg" ? createPgPoolConfigFromEnv(env, opts) : undefined;
   const requireNonSuperuserDb =
     v.REQUIRE_NON_SUPERUSER_DB === "true" ||
     (nodeEnv === "production" && v.ALLOW_SUPERUSER_DB_RUNTIME !== "true");
+
+  const rateLimitStore: "memory" | "postgres" =
+    v.RATE_LIMIT_STORE || (authMode === "jwt-pg" && nodeEnv === "production" ? "postgres" : "memory");
+  if (rateLimitStore === "postgres" && authMode !== "jwt-pg") {
+    throw new Error(
+      "RATE_LIMIT_POSTGRES_REQUIRES_DB: RATE_LIMIT_STORE=postgres requires AUTH_MODE=jwt-pg and DATABASE_URL.",
+    );
+  }
+  const isolatedParsers = v.ISOLATED_PARSER_WORKERS ?? (nodeEnv === "production" || Boolean(v.PARSER_WORKER_URL));
 
   return {
     nodeEnv,
@@ -191,10 +280,17 @@ export function loadApiServerConfig(
     maxConcurrentDataPrep: v.MAX_CONCURRENT_DATA_PREP,
     rateLimit: {
       enabled: v.DISABLE_RATE_LIMIT !== "true",
+      store: rateLimitStore,
       loginMaxPerWindow: v.RATE_LIMIT_LOGIN_MAX,
       loginIpMaxPerWindow: v.RATE_LIMIT_LOGIN_IP_MAX,
       apiMaxPerWindow: v.RATE_LIMIT_API_MAX,
       windowMs: v.RATE_LIMIT_WINDOW_MS,
+    },
+    workers: {
+      isolatedParsers,
+      ...(v.PARSER_WORKER_URL ? { workerUrl: v.PARSER_WORKER_URL } : {}),
+      timeoutMs: v.WORKER_TIMEOUT_MS,
+      maxOldSpaceMb: v.WORKER_MAX_OLD_SPACE_MB,
     },
   };
 }

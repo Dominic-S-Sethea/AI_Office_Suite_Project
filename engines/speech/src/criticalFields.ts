@@ -64,10 +64,16 @@ export function validateVoiceCriticalFields(
   const clarificationPrompts: string[] = [];
 
   // 1. Format-only vs FX conversion check (VOC-T13)
+  const fxRateSpans: Array<[number, number]> = [];
+  const fxSpanRe = new RegExp(EXPLICIT_FX_RATE_RE.source, "gi");
+  let fxSpanMatch: RegExpExecArray | null;
+  while ((fxSpanMatch = fxSpanRe.exec(normalized)) !== null) {
+    fxRateSpans.push([fxSpanMatch.index, fxSpanMatch.index + fxSpanMatch[0].length]);
+  }
   let currencyActionKind: CriticalFieldValidationResult["currencyActionKind"] = "none";
   if (FX_CONVERSION_RE.test(normalized)) {
     currencyActionKind = "fx_conversion_requires_rate";
-    const hasExplicitRate = EXPLICIT_FX_RATE_RE.test(normalized);
+    const hasExplicitRate = fxRateSpans.length > 0;
     fields.push({
       kind: "currency_intent",
       rawText: normalized.match(FX_CONVERSION_RE)?.[0] ?? "convert currency",
@@ -157,12 +163,13 @@ export function validateVoiceCriticalFields(
   }
 
   // 6. Bare financial numbers without currency -> AMBIGUOUS_CURRENCY (VOC-T12)
-  if (FINANCIAL_INTENT_RE.test(normalized) && !EXPLICIT_FX_RATE_RE.test(normalized)) {
-    const bareNumberRe = /\b(\d{1,3}(?:,\d{3})+|\d{2,}(?:\.\d+)?)\b/g;
+  matchedNumericSpans.push(...fxRateSpans);
+  if (FINANCIAL_INTENT_RE.test(normalized)) {
+    const bareNumberRe = /(?<!\.)\b(\d{1,3}(?:,\d{3})+|\d{2,}(?:\.\d+)?|\d+\.\d+)\b/g;
     while ((match = bareNumberRe.exec(normalized)) !== null) {
       const start = match.index;
       const end = start + match[0].length;
-      const overlapsKnown = matchedNumericSpans.some(([s, e]) => start >= s && end <= e);
+      const overlapsKnown = matchedNumericSpans.some(([s, e]) => start < e && end > s);
       if (overlapsKnown) continue;
       // Ignore 4-digit years 2020-2035
       if (/^20[2-3]\d$/.test(match[1]!)) continue;

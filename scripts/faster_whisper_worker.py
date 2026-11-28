@@ -40,6 +40,12 @@ def load_pcm_wav_16k(path: str):
 
         raw = wf.readframes(n_frames)
 
+    if len(raw) == 0:
+        raise ValueError("WAV file contains empty PCM frame payload")
+    if len(raw) % (sampwidth * channels) != 0:
+        raise ValueError(
+            f"WAV PCM payload length ({len(raw)} bytes) is not aligned to frame size ({sampwidth * channels} bytes)"
+        )
     if len(raw) > MAX_PCM_BYTES:
         raise ValueError(f"WAV PCM data exceeds maximum limit ({MAX_PCM_BYTES} bytes)")
 
@@ -70,7 +76,12 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Local Faster-Whisper speech worker for AI Office Suite")
     parser.add_argument("--audio", required=True, help="Path to local PCM WAV file")
     parser.add_argument("--language", default="en", help="ISO language code (en or km)")
-    parser.add_argument("--model", default="tiny", help="Whisper model size (tiny, base, small)")
+    parser.add_argument(
+        "--model",
+        default="tiny",
+        choices=["tiny", "base", "small", "medium"],
+        help="Whisper model size (tiny, base, small, medium)",
+    )
     args = parser.parse_args()
 
     try:

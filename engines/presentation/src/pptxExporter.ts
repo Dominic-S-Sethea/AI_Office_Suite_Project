@@ -3,7 +3,13 @@ import type { StudioPresentation } from "@ai-office-suite/shared-contracts";
 import type { ExportDisclosurePolicy, ExportDisclosureReport } from "./presentationEngine.ts";
 
 function cleanHex(hex: string | undefined, fallback = "0F172A"): string {
-  return (hex ?? fallback).replace(/^#/, "").slice(0, 6).toUpperCase();
+  const trimmed = (hex ?? "").trim().replace(/^#/, "");
+  if (/^[0-9a-fA-F]{6}$/.test(trimmed)) return trimmed.toUpperCase();
+  if (/^[0-9a-fA-F]{3}$/.test(trimmed)) {
+    const [r, g, b] = trimmed;
+    return `${r}${r}${g}${g}${b}${b}`.toUpperCase();
+  }
+  return fallback;
 }
 
 function hasKhmer(text: string): boolean {
@@ -128,7 +134,10 @@ export async function exportPresentationToPptxBuffer(
         const data = spec.series.map((s) => ({
           name: deck.language === "km" ? s.labelKm : s.labelEn,
           labels: spec.categories,
-          values: s.values.map((v) => v.value ?? 0),
+          values: spec.categories.map((_, ci) => {
+            const val = s.values[ci]?.value;
+            return typeof val === "number" && Number.isFinite(val) ? val : 0;
+          }),
         }));
         slide.addChart(chartType, data, {
           x: xIn,

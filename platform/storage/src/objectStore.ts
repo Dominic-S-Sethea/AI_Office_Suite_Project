@@ -4,6 +4,8 @@ import {
   mkdirSync,
   readFileSync,
   readdirSync,
+  realpathSync,
+  renameSync,
   rmSync,
   statSync,
   writeFileSync,
@@ -108,6 +110,23 @@ export interface PrivateObjectStoreAdapter {
   restoreSnapshot(snapshot: ObjectStoreSnapshot): Promise<{ restoredCount: number; verifiedSha256Count: number }>;
 }
 
+const VALID_PRIVATE_OBJECT_KEY =
+  /^tenants\/[a-zA-Z0-9_-]{1,128}\/workspaces\/[a-zA-Z0-9_-]{1,128}\/(?:objects\/[a-zA-Z0-9_-]{1,128}\/[a-zA-Z0-9._-]{1,180}|staging(?:\/[a-zA-Z0-9._-]{1,180})+)$/;
+
+function isValidPrivateStorageKey(storageKey: string): boolean {
+  if (
+    storageKey.includes("\0") ||
+    storageKey.includes("..") ||
+    storageKey.startsWith("/") ||
+    storageKey.includes("\\") ||
+    !VALID_PRIVATE_OBJECT_KEY.test(storageKey)
+  ) {
+    return false;
+  }
+  return storageKey.split("/").every((seg) => seg !== "" && seg !== "." && seg !== "..");
+}
+const MAX_CONSUMED_NONCES = 50_000;
+
 const SAFE_SEGMENT = /^[a-zA-Z0-9_-]{1,128}$/;
 
 function assertSafeSegment(value: string, label: string): string {
@@ -146,6 +165,23 @@ export class LocalPrivateObjectStore implements PrivateObjectStoreAdapter {
         "PATH_TRAVERSAL_BLOCKED",
         `Storage key escapes private object store root: '${targetPath}'.`,
       );
+    }
+    const realRoot = realpathSync(this.rootDir);
+    let checkPath = resolved;
+    while (!existsSync(checkPath)) {
+      const parent = path.dirname(checkPath);
+      if (parent === checkPath) break;
+      checkPath = parent;
+    }
+    if (existsSync(checkPath)) {
+      const realExisting = realpathSync(checkPath);
+      if (realExisting !== realRoot && !realExisting.startsWith(realRoot + path.sep)) {
+        throw new PrivateObjectStorageError(
+          403,
+          "PATH_TRAVERSAL_BLOCKED",
+          `Storage key resolves via symlink outside private object store root: '${targetPath}'.`,
+        );
+      }
     }
     return resolved;
   }
@@ -245,7 +281,7 @@ export class LocalPrivateObjectStore implements PrivateObjectStoreAdapter {
   }
 
   async deleteBlob(storageKey: string): Promise<boolean> {
-    if (storageKey.includes("..") || storageKey.startsWith("/") || storageKey.includes("\\")) {
+    if (!isValidPrivateStorageKey(storageKey)) {
       throw new PrivateObjectStorageError(403, "PATH_TRAVERSAL_BLOCKED", "Unsafe storage key for deletion.");
     }
     const filePath = this.assertContained(path.join(this.rootDir, storageKey));
@@ -335,6 +371,11 @@ export class LocalPrivateObjectStore implements PrivateObjectStoreAdapter {
           "SIGNED_TOKEN_REPLAYED",
           "Signed object download token has already been used.",
         );
+      }
+      while (this.consumedNonces.size >= MAX_CONSUMED_NONCES) {
+        const oldestKey = this.consumedNonces.keys().next().value;
+        if (!oldestKey) break;
+        this.consumedNonces.delete(oldestKey);
       }
       this.consumedNonces.set(payload.nonce, payload.exp);
     }
@@ -458,13 +499,19 @@ export class LocalPrivateObjectStore implements PrivateObjectStoreAdapter {
   async restoreSnapshot(
     snapshot: ObjectStoreSnapshot,
   ): Promise<{ restoredCount: number; verifiedSha256Count: number }> {
-    let restoredCount = 0;
-    let verifiedSha256Count = 0;
+    const validated: Array<{ storageKey: string; destPath: string; bytes: Buffer }> = [];
     for (const entry of snapshot.entries) {
-      if (entry.storageKey.includes("..") || entry.storageKey.startsWith("/") || entry.storageKey.includes("\\")) {
+      if (!isValidPrivateStorageKey(entry.storageKey)) {
         throw new PrivateObjectStorageError(403, "PATH_TRAVERSAL_BLOCKED", "Unsafe storage key in snapshot.");
       }
       const bytes = Buffer.from(entry.contentBase64, "base64");
+      if (typeof entry.byteSize === "number" && bytes.byteLength !== entry.byteSize) {
+        throw new PrivateObjectStorageError(
+          500,
+          "SNAPSHOT_INTEGRITY_MISMATCH",
+          `Restored blob '${entry.storageKey}' byte size mismatch.`,
+        );
+      }
       const actualSha = createHash("sha256").update(bytes).digest("hex");
       if (actualSha !== entry.sha256) {
         throw new PrivateObjectStorageError(
@@ -473,11 +520,38 @@ export class LocalPrivateObjectStore implements PrivateObjectStoreAdapter {
           `Restored blob '${entry.storageKey}' SHA-256 mismatch.`,
         );
       }
-      const full = this.assertContained(path.join(this.rootDir, entry.storageKey));
-      mkdirSync(path.dirname(full), { recursive: true });
-      writeFileSync(full, bytes);
-      restoredCount += 1;
-      verifiedSha256Count += 1;
+      const keyShaMatch = entry.storageKey.match(/-([0-9a-f]{64})\.bin$/i);
+      if (keyShaMatch && keyShaMatch[1]!.toLowerCase() !== actualSha) {
+        throw new PrivateObjectStorageError(
+          500,
+          "SNAPSHOT_INTEGRITY_MISMATCH",
+          `Restored blob '${entry.storageKey}' filename SHA-256 mismatch.`,
+        );
+      }
+      const destPath = this.assertContained(path.join(this.rootDir, entry.storageKey));
+      validated.push({ storageKey: entry.storageKey, destPath, bytes });
+    }
+
+    const stagingRoot = path.join(this.rootDir, `.restore-tmp-${randomBytes(8).toString("hex")}`);
+    mkdirSync(stagingRoot, { recursive: true });
+    let restoredCount = 0;
+    let verifiedSha256Count = 0;
+    try {
+      const stagedFiles: Array<{ tmpPath: string; destPath: string }> = [];
+      for (let i = 0; i < validated.length; i++) {
+        const item = validated[i]!;
+        const tmpPath = path.join(stagingRoot, `blob-${i}.bin`);
+        writeFileSync(tmpPath, item.bytes, { mode: 0o600 });
+        stagedFiles.push({ tmpPath, destPath: item.destPath });
+      }
+      for (const file of stagedFiles) {
+        mkdirSync(path.dirname(file.destPath), { recursive: true });
+        renameSync(file.tmpPath, file.destPath);
+        restoredCount += 1;
+        verifiedSha256Count += 1;
+      }
+    } finally {
+      rmSync(stagingRoot, { recursive: true, force: true });
     }
     return { restoredCount, verifiedSha256Count };
   }

@@ -51,6 +51,7 @@ describe("WP-4 Frontend, Accessibility, DOCX Fidelity & Khmer Hardening", () => 
   afterEach(() => {
     cleanup();
     vi.restoreAllMocks();
+    vi.unstubAllGlobals();
   });
 
   it("F-17 & F-18: restricts governance roles, cancels stale async responses, resets diff on revision change, enforces maxLength & accessible Planned tab descriptions", async () => {

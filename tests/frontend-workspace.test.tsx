@@ -91,6 +91,7 @@ describe("Wave 1 Frontend & Tiptap Codec Verification (C8 & C9)", () => {
   afterEach(() => {
     cleanup();
     vi.restoreAllMocks();
+    vi.unstubAllGlobals();
   });
 
   it("C8: preserves blockId, atomic linkedMetricPlaceholder, fontSizePt, and colspan even when a new paragraph is inserted above a metric", () => {

@@ -9,6 +9,7 @@ import {
   DatabaseConflictError,
   PostgreSqlDocumentRepository,
   verifyDatabaseRlsReadiness,
+  verifyPaRlsReadiness,
   type DatabaseReadinessReport,
   type PgDatabaseAdapter,
 } from "@ai-office-suite/database";
@@ -17,16 +18,25 @@ import type { AuthenticatedRequest } from "@ai-office-suite/identity/express";
 import {
   InMemoryStorageAdapter,
   LocalFilesystemStorageAdapter,
+  PrivateObjectStorageError,
+  StorageAdapterError,
   type DocumentStorageAdapter,
 } from "@ai-office-suite/storage";
-import { InMemoryAuditStore, LocalJsonlAuditStore, type AuditStore } from "@ai-office-suite/audit";
+import { InMemoryAuditStore, LocalJsonlAuditStore, redactAuditString, type AuditStore } from "@ai-office-suite/audit";
 import { DocumentEngineError } from "@ai-office-suite/document-engine";
 import { DataPrepError } from "@ai-office-suite/data-processing";
 import { DocxImportError, PdfExportError } from "@ai-office-suite/file-conversion";
 import { SpeechProviderError } from "@ai-office-suite/speech-engine";
 import { DocumentService } from "@ai-office-suite/documents-module";
 import { AiDocumentExecutor, AiPlanningError } from "@ai-office-suite/ai-module";
-import { createSlidingWindowRateLimiter } from "./rateLimit.ts";
+import { IsolatedParserWorkerClient, WorkerIsolationError } from "@ai-office-suite/workers";
+import {
+  createPostgresBackedRateLimiter,
+  createSlidingWindowRateLimiter,
+  type RateLimitOptions,
+  type RateLimitStoreMode,
+  type SlidingWindowRateLimiter,
+} from "./rateLimit.ts";
 import { createApiObservability } from "./observability.ts";
 import { LocalDocumentGateway, PgDocumentGateway, type DocumentGateway } from "./documentGateway.ts";
 import { registerAuthAndMetricsRoutes } from "./routes/authRoutes.ts";
@@ -49,10 +59,17 @@ export interface CreateApiAppOptions {
   maxConcurrentDataPrep?: number;
   rateLimit?: {
     enabled?: boolean;
+    store?: RateLimitStoreMode;
     windowMs?: number;
     loginMaxPerWindow?: number;
     loginIpMaxPerWindow?: number;
     apiMaxPerWindow?: number;
+  };
+  workers?: {
+    isolatedParsers?: boolean;
+    workerUrl?: string;
+    timeoutMs?: number;
+    maxOldSpaceMb?: number;
   };
 }
 
@@ -104,12 +121,26 @@ export function createApiApp(options: CreateApiAppOptions = {}): Express {
   const documents = new DocumentService(storage, audit);
   const aiExecutor = new AiDocumentExecutor(documents, audit);
 
+  const parserWorker =
+    options.workers?.isolatedParsers || options.workers?.workerUrl
+      ? new IsolatedParserWorkerClient({
+          ...(options.workers?.workerUrl ? { workerUrl: options.workers.workerUrl } : {}),
+          ...(typeof options.workers?.timeoutMs === "number" ? { timeoutMs: options.workers.timeoutMs } : {}),
+          ...(typeof options.workers?.maxOldSpaceMb === "number"
+            ? { maxOldSpaceMb: options.workers.maxOldSpaceMb }
+            : {}),
+        })
+      : undefined;
+
   // Unified DocumentGateway removes all dual `if (pgRepo)` orchestration branching in routes (H21)
   const gateway: DocumentGateway = options.db
-    ? new PgDocumentGateway(new PostgreSqlDocumentRepository(options.db))
-    : new LocalDocumentGateway(documents, aiExecutor, audit);
+    ? new PgDocumentGateway(new PostgreSqlDocumentRepository(options.db), { parserWorker })
+    : new LocalDocumentGateway(documents, aiExecutor, audit, { storage, parserWorker });
 
-  const allowedOrigins = (process.env.CORS_ORIGIN ?? "http://localhost:5174,http://127.0.0.1:5174")
+  const rawCorsOrigin = process.env.CORS_ORIGIN?.trim();
+  const defaultOrigins =
+    process.env.NODE_ENV === "production" ? "" : "http://localhost:5174,http://127.0.0.1:5174";
+  const allowedOrigins = (rawCorsOrigin || defaultOrigins)
     .split(",")
     .map((s) => s.trim())
     .filter(Boolean);
@@ -129,12 +160,32 @@ export function createApiApp(options: CreateApiAppOptions = {}): Express {
   };
 
   const rateLimitEnabled = options.rateLimit?.enabled ?? process.env.NODE_ENV !== "test";
+  const rateLimitStore: RateLimitStoreMode = options.rateLimit?.store ?? "memory";
+  if (rateLimitStore === "postgres" && !options.db) {
+    throw new Error("RATE_LIMIT_POSTGRES_REQUIRES_DB: PostgreSQL rate limit store requires options.db.");
+  }
+  const makeLimiter = (limiterOpts: RateLimitOptions): SlidingWindowRateLimiter => {
+    if (rateLimitStore === "postgres" && options.db) {
+      return createPostgresBackedRateLimiter({
+        ...limiterOpts,
+        db: options.db,
+        onBackendError: (err, key) => {
+          observability.logEvent("warn", "security.rate_limit_pg_fallback", {
+            bucket: key.split(":")[0],
+            error: redactAuditString(err instanceof Error ? err.message : String(err)),
+          });
+        },
+      });
+    }
+    return createSlidingWindowRateLimiter(limiterOpts);
+  };
+
   const windowMs = options.rateLimit?.windowMs ?? 60_000;
   const loginMax = options.rateLimit?.loginMaxPerWindow ?? 15;
   const apiMax = options.rateLimit?.apiMaxPerWindow ?? 300;
 
   // Pre-parse IP flood shield (H14 — executes BEFORE express.json body parsing)
-  const preParseIpLimiter = createSlidingWindowRateLimiter({
+  const preParseIpLimiter = makeLimiter({
     windowMs,
     maxRequests: Math.max(apiMax * 5, 1_000),
     keyGenerator: (req) => {
@@ -145,7 +196,7 @@ export function createApiApp(options: CreateApiAppOptions = {}): Express {
   });
 
   // Per-IP aggregate login limiter prevents cross-account credential stuffing (H15)
-  const loginIpLimiter = createSlidingWindowRateLimiter({
+  const loginIpLimiter = makeLimiter({
     windowMs,
     maxRequests: options.rateLimit?.loginIpMaxPerWindow ?? Math.max(loginMax * 4, 20),
     keyGenerator: (req) => {
@@ -156,7 +207,7 @@ export function createApiApp(options: CreateApiAppOptions = {}): Express {
   });
 
   // Per-(IP, email) login limiter isolates brute-force attempts on a single account
-  const loginLimiter = createSlidingWindowRateLimiter({
+  const loginLimiter = makeLimiter({
     windowMs,
     maxRequests: loginMax,
     keyGenerator: (req) => {
@@ -170,7 +221,7 @@ export function createApiApp(options: CreateApiAppOptions = {}): Express {
     onLimitExceeded: logRateLimitExceeded,
   });
 
-  const apiLimiter = createSlidingWindowRateLimiter({
+  const apiLimiter = makeLimiter({
     windowMs,
     maxRequests: apiMax,
     keyGenerator: (req) => {
@@ -185,7 +236,7 @@ export function createApiApp(options: CreateApiAppOptions = {}): Express {
   });
 
   // Dedicated readiness probe rate limiter & 2s TTL cache prevents unauthenticated DB-probe floods (H15)
-  const readyLimiter = createSlidingWindowRateLimiter({
+  const readyLimiter = makeLimiter({
     windowMs: 10_000,
     maxRequests: 60,
     keyGenerator: (req) => {
@@ -274,16 +325,25 @@ export function createApiApp(options: CreateApiAppOptions = {}): Express {
 
   app.get("/api/ready", async (req, res) => {
     const requestId = (req as Request & { requestId?: string }).requestId;
+    const isProduction = process.env.NODE_ENV === "production";
     if (options.isShuttingDown?.()) {
-      res.status(503).json({ status: "draining", authMode, requestId });
+      res.status(503).json(
+        isProduction
+          ? { status: "draining", ...(requestId ? { requestId } : {}) }
+          : { status: "draining", authMode, requestId },
+      );
       return;
     }
     if (!useJwtPg || !options.db) {
-      res.json({
-        status: "ready",
-        authMode,
-        checks: { storage: options.inMemory ? "in-memory" : "local-fs" },
-      });
+      res.json(
+        isProduction
+          ? { status: "ready", ...(requestId ? { requestId } : {}) }
+          : {
+              status: "ready",
+              authMode,
+              checks: { storage: options.inMemory ? "in-memory" : "local-fs" },
+            },
+      );
       return;
     }
     try {
@@ -295,9 +355,35 @@ export function createApiApp(options: CreateApiAppOptions = {}): Express {
         report = await verifyDatabaseRlsReadiness(options.db, {
           requireNonSuperuserConnection: Boolean(options.requireNonSuperuserDb),
         });
+        const paReg = await options.db.query<{ present: boolean }>(
+          `SELECT (to_regclass('public.pa_jobs') IS NOT NULL) AS present`,
+        );
+        if (paReg.rows[0]?.present) {
+          const paReady = await verifyPaRlsReadiness(options.db);
+          if (!paReady.paForceRlsEnabled) {
+            report = {
+              ...report,
+              ready: false,
+              checks: {
+                ...report.checks,
+                coreForceRlsEnabled: false,
+                missingForceRlsTables: Array.from(
+                  new Set([...report.checks.missingForceRlsTables, ...paReady.missingTables]),
+                ),
+              },
+            };
+          }
+        }
         if (readyCacheTtlMs > 0 && report.ready) {
           readyCache = { expiresAt: now + readyCacheTtlMs, report };
         }
+      }
+      if (isProduction) {
+        res.status(report.ready ? 200 : 503).json({
+          status: report.ready ? "ready" : "degraded",
+          ...(requestId ? { requestId } : {}),
+        });
+        return;
       }
       res.status(report.ready ? 200 : 503).json({
         status: report.ready ? "ready" : "degraded",
@@ -309,15 +395,19 @@ export function createApiApp(options: CreateApiAppOptions = {}): Express {
       readyCache = null;
       observability.logEvent("error", "readiness.probe_failed", {
         requestId,
-        error: err instanceof Error ? err.message : "UnknownError",
+        error: redactAuditString(err instanceof Error ? err.message : "UnknownError"),
       });
-      res.status(503).json({
-        status: "degraded",
-        authMode,
-        error: "Readiness probe failed",
-        code: "READINESS_ERROR",
-        requestId,
-      });
+      res.status(503).json(
+        isProduction
+          ? { status: "degraded", code: "READINESS_ERROR", ...(requestId ? { requestId } : {}) }
+          : {
+              status: "degraded",
+              authMode,
+              error: "Readiness probe failed",
+              code: "READINESS_ERROR",
+              requestId,
+            },
+      );
     }
   });
 
@@ -327,6 +417,7 @@ export function createApiApp(options: CreateApiAppOptions = {}): Express {
     db: options.db,
     allowedOrigins,
     rateLimitEnabled,
+    rateLimitStore,
     loginLimiter,
     loginIpLimiter,
     apiLimiter,
@@ -364,12 +455,15 @@ export function createApiApp(options: CreateApiAppOptions = {}): Express {
       err instanceof AuthenticationError ||
       err instanceof AuthorizationError ||
       err instanceof DatabaseConflictError ||
+      err instanceof StorageAdapterError ||
+      err instanceof PrivateObjectStorageError ||
       err instanceof DocumentEngineError ||
       err instanceof DataPrepError ||
       err instanceof DocxImportError ||
       err instanceof PdfExportError ||
       err instanceof SpeechProviderError ||
-      err instanceof AiPlanningError
+      err instanceof AiPlanningError ||
+      err instanceof WorkerIsolationError
     ) {
       res.status(err.statusCode).json({
         error: err.message,
@@ -405,8 +499,8 @@ export function createApiApp(options: CreateApiAppOptions = {}): Express {
       path: req.path,
       tenantId: authReq.actor?.tenantId,
       errName: err instanceof Error ? err.name : "UnknownError",
-      errMessage: err instanceof Error ? err.message : String(err),
-      stack: err instanceof Error ? err.stack?.slice(0, 1500) : undefined,
+      errMessage: redactAuditString(err instanceof Error ? err.message : String(err)),
+      stack: err instanceof Error && err.stack ? redactAuditString(err.stack.slice(0, 1500)) : undefined,
     });
     res.status(500).json({
       error: "Internal server error",

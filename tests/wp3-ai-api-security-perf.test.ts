@@ -488,9 +488,10 @@ describe("WP-3 AI, API, Security & Performance Remediation", () => {
 
     // Setup PG + API server with tight rate limit to exercise F-02, F-06, F-07, F-12
     const db = new PgliteDatabaseAdapter();
-    await initializePostgreSqlSchema(db);
-    const pw = await hashPassword("Wp3ApiSecret!2026");
-    await setupPgUsers(db, pw);
+    try {
+      await initializePostgreSqlSchema(db);
+      const pw = await hashPassword("Wp3ApiSecret!2026");
+      await setupPgUsers(db, pw);
 
     const apiStorageDir = mkdtempSync(path.join(os.tmpdir(), "wp3-api-"));
     tempDirs.push(apiStorageDir);
@@ -711,6 +712,9 @@ describe("WP-3 AI, API, Security & Performance Remediation", () => {
       expect(limitedLogout.status).toBe(429);
     } finally {
       await new Promise<void>((resolve) => strictServer.close(() => resolve()));
+    }
+    } finally {
+      await db.close();
     }
   });
 

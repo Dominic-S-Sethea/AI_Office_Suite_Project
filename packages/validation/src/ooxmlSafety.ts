@@ -92,6 +92,16 @@ function validateZipEntryName(
     );
   }
   const normalizedName = entryName.replace(/\\/g, "/").toLowerCase();
+  if (
+    normalizedName
+      .split("/")
+      .some((seg) => seg === "__proto__" || seg === "constructor" || seg === "prototype")
+  ) {
+    throw new InternalOoxmlAbort(
+      "ZIP_PATH_TRAVERSAL_BLOCKED",
+      `${label} archive contains reserved prototype-polluting entry name '${entryName}'.`,
+    );
+  }
   if (seenNormalized.has(normalizedName)) {
     throw new InternalOoxmlAbort(
       "DUPLICATE_ARCHIVE_ENTRY",
@@ -273,7 +283,7 @@ export function inspectAndExtractOoxmlZip(
   }
 
   // Stage 2: Chunked streaming Unzip with mid-stream actual byte enforcement
-  const entries: Record<string, Uint8Array> = {};
+  const entries: Record<string, Uint8Array> = Object.create(null);
   const lfhNormalizedNames = new Set<string>();
   let lfhEntryCount = 0;
   let actualTotalBytes = 0;

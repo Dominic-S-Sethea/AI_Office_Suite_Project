@@ -82,6 +82,11 @@ export function compileChartSpecToEChartsOption(
     data: ser.values.map((v) => v.value),
   }));
 
+  const allFiniteValues = spec.series
+    .flatMap((s) => s.values.map((v) => v.value))
+    .filter((v): v is number => typeof v === "number" && Number.isFinite(v));
+  const hasNegative = allFiniteValues.some((v) => v < 0);
+
   const isHorizontal = spec.kind === "bar";
   const categoryAxis = {
     type: "category",
@@ -90,7 +95,7 @@ export function compileChartSpecToEChartsOption(
   };
   const valueAxis = {
     type: "value",
-    min: spec.yAxisStartsAtZero ? 0 : undefined,
+    min: spec.yAxisStartsAtZero && !hasNegative ? 0 : undefined,
     axisLabel: { color: "#334155" },
   };
 
@@ -140,12 +145,14 @@ export function renderChartSpecToSvg(
   height = 360,
   language: "en" | "km" = "en",
 ): { svg: string; accessibleTableHtml: string } {
+  const safeW = Math.max(100, Math.min(4096, Math.trunc(Number.isFinite(width) ? width : 680)));
+  const safeH = Math.max(100, Math.min(4096, Math.trunc(Number.isFinite(height) ? height : 360)));
   const option = compileChartSpecToEChartsOption(spec, language);
   const chart = echarts.init(null, undefined, {
     renderer: "svg",
     ssr: true,
-    width,
-    height,
+    width: safeW,
+    height: safeH,
   });
   try {
     chart.setOption(option);
@@ -221,7 +228,9 @@ export async function renderChartSpecPngViaEdge(
   if (!browserPath) {
     throw new PdfExportError(503, "PDF_RENDERER_UNAVAILABLE", "No Chromium/Edge binary detected.");
   }
-  const { svg } = renderChartSpecToSvg(spec, width, height, language);
+  const safeW = Number.isFinite(width) ? Math.min(4096, Math.max(100, Math.round(width))) : 760;
+  const safeH = Number.isFinite(height) ? Math.min(4096, Math.max(100, Math.round(height))) : 420;
+  const { svg } = renderChartSpecToSvg(spec, safeW, safeH, language);
   const fontCss = resolveLocalFontFacesCss();
   const tmpDir = mkdtempSync(path.join(os.tmpdir(), "ai-office-bi-chart-"));
   const userDataDir = path.join(tmpDir, "profile");
@@ -237,13 +246,20 @@ export async function renderChartSpecPngViaEdge(
       [
         ...buildHardenedChromiumArgs(),
         `--user-data-dir=${userDataDir}`,
-        `--window-size=${width + 40},${height + 40}`,
+        `--window-size=${safeW + 40},${safeH + 40}`,
         `--screenshot=${path.resolve(outputPngPath)}`,
         pathToFileURL(htmlPath).href,
       ],
       { timeout: 25_000, windowsHide: true, env: buildSanitizedSubprocessEnv(tmpDir) },
     );
     return { pngPath: outputPngPath, byteLength: readFileSync(outputPngPath).byteLength };
+  } catch (err) {
+    if (err instanceof PdfExportError) throw err;
+    throw new PdfExportError(
+      500,
+      "CHART_PNG_RENDER_FAILED",
+      err instanceof Error ? err.message : String(err),
+    );
   } finally {
     cleanupTempDirBestEffort(tmpDir);
   }

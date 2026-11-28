@@ -103,12 +103,13 @@ export class TerminologyRegistry {
 
     for (const entry of dict.entries) {
       for (const alias of entry.aliases) {
+        if (!alias.trim()) continue;
         const isAscii = /^[\x00-\x7F]+$/.test(alias);
         const pattern = isAscii
           ? new RegExp(`\\b${escapeRegex(alias)}\\b`, "gi")
           : new RegExp(escapeRegex(alias), "g");
         if (pattern.test(text)) {
-          text = text.replace(pattern, entry.canonical);
+          text = text.replace(pattern, () => entry.canonical);
           appliedTerms.push({ matchedAlias: alias, canonical: entry.canonical });
         }
       }

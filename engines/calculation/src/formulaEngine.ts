@@ -133,14 +133,49 @@ export function expandRange(rangeStr: string, defaultSheet: string): Array<{ she
  */
 export function shiftFormulaReferences(formula: string, deltaCol: number, deltaRow: number): string {
   if (!formula.startsWith("=")) return formula;
-  return formula.replace(
-    /('[^']+'!|[A-Za-z0-9_]+!)?(\$?)([A-Z]{1,3})(\$?)(\d+)/g,
-    (_full, sheetPrefix: string | undefined, absCol: string, colStr: string, absRow: string, rowStr: string) => {
-      const nextCol = absCol === "$" ? colLettersToIndex(colStr) : Math.max(1, colLettersToIndex(colStr) + deltaCol);
-      const nextRow = absRow === "$" ? Number(rowStr) : Math.max(1, Number(rowStr) + deltaRow);
-      return `${sheetPrefix ?? ""}${absCol}${colIndexToLetters(nextCol)}${absRow}${nextRow}`;
-    },
-  );
+  let result = "";
+  let i = 0;
+  while (i < formula.length) {
+    if (formula[i] === '"') {
+      const start = i;
+      i++;
+      while (i < formula.length) {
+        if (formula[i] === '"') {
+          if (formula[i + 1] === '"') {
+            i += 2;
+            continue;
+          }
+          i++;
+          break;
+        }
+        i++;
+      }
+      result += formula.slice(start, i);
+      continue;
+    }
+
+    const nextQuote = formula.indexOf('"', i);
+    const end = nextQuote === -1 ? formula.length : nextQuote;
+    const segment = formula.slice(i, end);
+    result += segment.replace(
+      /('[^']+'!|[A-Za-z0-9_]+!)?(\$?)([A-Za-z]{1,3})(\$?)(\d+)/g,
+      (full, sheetPrefix: string | undefined, absCol: string, colStr: string, absRow: string, rowStr: string, offset: number, str: string) => {
+        if (!sheetPrefix && offset > 0 && /[A-Za-z0-9_.]/.test(str[offset - 1]!)) {
+          return full;
+        }
+        const afterIdx = offset + full.length;
+        if (afterIdx < str.length && /[A-Za-z0-9_(]/.test(str[afterIdx]!)) {
+          return full;
+        }
+        const colIdx = colLettersToIndex(colStr.toUpperCase());
+        const nextCol = absCol === "$" ? colIdx : Math.max(1, colIdx + deltaCol);
+        const nextRow = absRow === "$" ? Number(rowStr) : Math.max(1, Number(rowStr) + deltaRow);
+        return `${sheetPrefix ?? ""}${absCol}${colIndexToLetters(nextCol)}${absRow}${nextRow}`;
+      },
+    );
+    i = end;
+  }
+  return result;
 }
 
 function splitTopLevelArgs(argStr: string): string[] {
@@ -187,13 +222,13 @@ function evaluateCriteria(
 ): boolean {
   if (isExcelError(val)) return false;
   const cleaned = unquote ? criteriaRaw.replace(/^"|"$/g, "") : criteriaRaw;
-  const cmp = cleaned.match(/^(<=|>=|<>|<|>|=)(.*)$/);
+    const cmp = cleaned.match(/^(<=|>=|<>|<|>|=)(.*)$/);
   if (cmp) {
     const op = cmp[1]!;
     const rhsRaw = cmp[2]!.trim();
     const rhsNum = Number(rhsRaw);
     const lhsNum = typeof val === "number" ? val : Number(val);
-    if (Number.isFinite(rhsNum) && val !== null && val !== "" && Number.isFinite(lhsNum)) {
+    if (rhsRaw.length > 0 && Number.isFinite(rhsNum) && val !== null && val !== "" && Number.isFinite(lhsNum)) {
       if (op === "<") return lhsNum < rhsNum;
       if (op === "<=") return lhsNum <= rhsNum;
       if (op === ">") return lhsNum > rhsNum;
@@ -404,6 +439,7 @@ export function recalculateWorkbook(workbook: SpreadsheetWorkbook): {
             const targetCell = sumCells[i];
             if (targetCell) {
               const targetVal = evalCell(targetCell.sheet, targetCell.addr, stack);
+              if (isExcelError(targetVal)) return targetVal;
               if (typeof targetVal === "number") total += targetVal;
             }
           }
@@ -536,8 +572,8 @@ export function recalculateWorkbook(workbook: SpreadsheetWorkbook): {
     const expr = exprRaw.trim();
     if (!expr) return null;
 
-    if (expr.startsWith('"') && expr.endsWith('"') && !expr.slice(1, -1).includes('"')) {
-      return expr.slice(1, -1);
+    if (/^"(?:[^"]|"")*"$/.test(expr)) {
+      return expr.slice(1, -1).replace(/""/g, '"');
     }
     if (/^(TRUE|FALSE)$/i.test(expr)) {
       return expr.toUpperCase() === "TRUE";
@@ -598,7 +634,8 @@ export function recalculateWorkbook(workbook: SpreadsheetWorkbook): {
       const right = toNumber(evalExpr(addSplit.right, sheetName, stack, _originKey, depth + 1));
       if (typeof left !== "number") return left;
       if (typeof right !== "number") return right;
-      return addSplit.op === "+" ? left + right : left - right;
+      const result = addSplit.op === "+" ? left + right : left - right;
+      return Number.isFinite(result) ? result : { error: "#NUM!" };
     }
 
     // Multiplication / Division at top level
@@ -609,9 +646,12 @@ export function recalculateWorkbook(workbook: SpreadsheetWorkbook): {
       if (typeof left !== "number") return left;
       if (typeof right !== "number") return right;
       if (mulSplit.op === "/") {
-        return right === 0 ? { error: "#DIV/0!" } : left / right;
+        if (right === 0) return { error: "#DIV/0!" };
+        const quot = left / right;
+        return Number.isFinite(quot) ? quot : { error: "#NUM!" };
       }
-      return left * right;
+      const prod = left * right;
+      return Number.isFinite(prod) ? prod : { error: "#NUM!" };
     }
 
     // Exponentiation
@@ -621,7 +661,8 @@ export function recalculateWorkbook(workbook: SpreadsheetWorkbook): {
       const right = toNumber(evalExpr(powSplit.right, sheetName, stack, _originKey, depth + 1));
       if (typeof left !== "number") return left;
       if (typeof right !== "number") return right;
-      return left ** right;
+      const pow = left ** right;
+      return Number.isFinite(pow) ? pow : { error: "#NUM!" };
     }
 
     // Unary +/- applied to cell references, functions, or parenthesized sub-expressions (F-20)

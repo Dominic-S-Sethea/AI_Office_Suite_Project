@@ -381,6 +381,9 @@ describe("Wave 2 — Security & Auth Remediation (H1-H5, M11-M13)", () => {
       }
     });
     if (!pythonCmd) {
+      if (process.env.CI === "true") {
+        throw new Error("CI=true requires Python to verify faster_whisper_worker.py WAV sample-rate bounds.");
+      }
       console.warn("DISCLOSURE: Skipping faster_whisper_worker Python WAV check — no Python binary found on host.");
     } else {
       const pyCheck = await execFileAsync(pythonCmd, [

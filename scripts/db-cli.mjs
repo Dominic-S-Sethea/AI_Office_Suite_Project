@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import {
   createPgPoolConfigFromEnv,
@@ -168,7 +168,14 @@ async function cmdBackup(db, outPath) {
   const coreSnap = "coreAndXi" in snapshot ? snapshot.coreAndXi : snapshot;
   const serialized = JSON.stringify(snapshot, null, 2);
   const resolved = path.resolve(outPath);
-  writeFileSync(resolved, serialized, "utf8");
+  const tempPath = `${resolved}.tmp-${process.pid}-${Date.now()}`;
+  writeFileSync(tempPath, serialized, { encoding: "utf8", mode: 0o600 });
+  try {
+    chmodSync(tempPath, 0o600);
+  } catch {
+    // Ignore chmod limitations on filesystems without POSIX mode bits.
+  }
+  renameSync(tempPath, resolved);
   const sha256 = createHash("sha256").update(serialized, "utf8").digest("hex");
   console.log(
     JSON.stringify({

@@ -25,7 +25,26 @@ export function formatApiErrorMessage(
     const retryAfter = res.headers.get("retry-after") ?? String(data.retryAfterSeconds ?? "2");
     return `Service is currently at capacity — please retry in ${retryAfter}s.`;
   }
-  return String(data.error ?? fallback);
+  const base = String(data.error ?? fallback);
+  if (Array.isArray(data.issues) && data.issues.length > 0) {
+    const first = data.issues[0] as { path?: unknown; message?: unknown } | undefined;
+    if (first && typeof first.message === "string" && first.message.trim()) {
+      const pathStr = Array.isArray(first.path) && first.path.length > 0 ? `${first.path.join(".")}: ` : "";
+      return `${base} (${pathStr}${first.message.trim()})`;
+    }
+  }
+  const details = data.details as { fieldErrors?: Record<string, unknown>; formErrors?: unknown[] } | undefined;
+  if (details?.fieldErrors && typeof details.fieldErrors === "object") {
+    for (const [field, errs] of Object.entries(details.fieldErrors)) {
+      if (Array.isArray(errs) && typeof errs[0] === "string" && errs[0].trim()) {
+        return `${base} (${field}: ${errs[0].trim()})`;
+      }
+    }
+  }
+  if (Array.isArray(details?.formErrors) && typeof details.formErrors[0] === "string" && details.formErrors[0].trim()) {
+    return `${base} (${details.formErrors[0].trim()})`;
+  }
+  return base;
 }
 
 export function arrayBufferToBase64(buffer: ArrayBuffer): string {

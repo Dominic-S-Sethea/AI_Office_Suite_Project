@@ -28,18 +28,21 @@ export default defineConfig({
       "@ai-office-suite/speech-engine": path.resolve(__dirname, "engines/speech/src/index.ts"),
       "@ai-office-suite/documents-module": path.resolve(__dirname, "modules/documents/src/index.ts"),
       "@ai-office-suite/ai-module": path.resolve(__dirname, "modules/ai/src/index.ts"),
+      "@ai-office-suite/workers": path.resolve(__dirname, "apps/workers/src/index.ts"),
     },
   },
   test: {
     environment: "node",
     include: ["tests/**/*.test.ts", "tests/**/*.test.tsx"],
-    testTimeout: 60000,
+    maxWorkers: 4,
+    testTimeout: 120000,
     hookTimeout: 60000,
     coverage: {
       provider: "v8",
       reporter: ["text", "json-summary"],
       include: [
         "apps/api/src/**/*.ts",
+        "apps/workers/src/**/*.ts",
         "apps/web/src/**/*.{ts,tsx}",
         "engines/*/src/**/*.ts",
         "modules/*/src/**/*.ts",

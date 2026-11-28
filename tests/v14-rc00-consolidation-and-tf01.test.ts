@@ -10,6 +10,7 @@ import type {
   StudioPresentation,
   TenantSubscription,
 } from "@ai-office-suite/shared-contracts";
+import { PLANNED_FUTURE_STUDIOS } from "@ai-office-suite/shared-contracts";
 import { InMemoryAuditStore } from "@ai-office-suite/audit";
 import { AuthorizationError } from "@ai-office-suite/authorization";
 import { InMemoryStorageAdapter, LocalPrivateObjectStore } from "@ai-office-suite/storage";
@@ -24,7 +25,12 @@ import {
 import { hashPassword } from "@ai-office-suite/identity";
 import { DocumentService } from "@ai-office-suite/documents-module";
 import { getBlockPlainText } from "@ai-office-suite/document-engine";
-import { recalculateWorkbook } from "@ai-office-suite/calculation-engine";
+import {
+  applySpreadsheetProposal,
+  planSpreadsheetCommand,
+  recalculateWorkbook,
+  SpreadsheetAiError,
+} from "@ai-office-suite/calculation-engine";
 import { profileDataset, stageCsvSource } from "@ai-office-suite/data-processing";
 import { computeDescriptiveStatistics } from "@ai-office-suite/analytics-engine";
 import {
@@ -738,14 +744,18 @@ describe("V1.4 TF-01 — RC-T01..RC-T08 Consolidation, RC-P1-01..05 Gates & Miss
   });
 
   it("RC-P1-01..RC-P1-05: P1 expansion contracts remain explicitly gated fail-closed (including all 7 VOC-03 423 gates)", () => {
-    const p1PlannedContracts = [
-      { id: "RC-P1-01", parent: "DOC-05", status: "PLANNED_P1", productionAuthorized: false },
-      { id: "RC-P1-02", parent: "SHT-06", status: "PLANNED_P1", productionAuthorized: false },
-      { id: "RC-P1-03", parent: "ANA-04", status: "PLANNED_P1", productionAuthorized: false },
-      { id: "RC-P1-04", parent: "INT-04", status: "PLANNED_P1", productionAuthorized: false },
-      { id: "RC-P1-05", parent: "VOC-03", status: "VERIFIED_FAIL_CLOSED", productionAuthorized: false },
-    ];
-    expect(p1PlannedContracts.every((p) => p.productionAuthorized === false)).toBe(true);
+    expect(PLANNED_FUTURE_STUDIOS.map((s) => s.studioId)).toEqual(["spreadsheets", "presentations", "analytics"]);
+    expect(PLANNED_FUTURE_STUDIOS.every((s) => s.status === "planned_future_phase")).toBe(true);
+    expect(() =>
+      planSpreadsheetCommand({
+        workbook: makePnlWorkbook(),
+        sheetName: "Missing",
+        targetRange: "B1",
+        command: "sum B1:B3",
+        inputLanguage: "en",
+        source: "typed_ai",
+      }),
+    ).toThrowError(SpreadsheetAiError);
 
     // RC-P1-05 (VOC-03): all 7 P1 voice features MUST fail closed with HTTP 423
     const vocP1Features: Array<[P1VoiceFeatureId, string]> = [
@@ -865,18 +875,36 @@ describe("V1.4 TF-01 — RC-T01..RC-T08 Consolidation, RC-P1-01..05 Gates & Miss
   });
 
   it("SHT-T11, SHT-T12, SHT-T15, SHT-T16: closes missing Spreadsheet Studio local edge assertions", async () => {
-    // SHT-T11: Cancel bulk operation before commit leaves original workbook cells & formulas intact
+    // SHT-T11: Cancel/unapproved/stale/protected proposal before commit leaves original workbook cells & formulas intact
     const original = recalculateWorkbook(makePnlWorkbook()).workbook;
-    const staging = structuredClone(original);
-    let canceledBeforeCommit = true;
-    staging.sheets[0]!.cells.B1!.value = 999999;
-    const committed = canceledBeforeCommit ? original : recalculateWorkbook(staging).workbook;
-    expect(committed.sheets[0]!.cells.B1?.value).toBe(150000);
-    expect(committed.sheets[0]!.cells.B4?.evaluatedValue).toBe(40000);
+    const sumProposal = planSpreadsheetCommand({
+      workbook: original,
+      sheetName: original.sheets[0]!.name,
+      targetRange: "B1:B3",
+      command: "sum B1:B3",
+      inputLanguage: "en",
+      source: "typed_ai",
+    });
+    expect(() => applySpreadsheetProposal(original, sumProposal, false)).toThrowError(SpreadsheetAiError);
+    expect(() =>
+      applySpreadsheetProposal(original, { ...sumProposal, expectedRevision: original.revision + 5 }, true),
+    ).toThrowError(SpreadsheetAiError);
+    expect(() =>
+      applySpreadsheetProposal(original, { ...sumProposal, targetRange: "B4", formula: "=0" }, true),
+    ).toThrowError(/protected/i);
+    expect(original.sheets[0]!.cells.B1?.value).toBe(150000);
+    expect(original.sheets[0]!.cells.B4?.evaluatedValue).toBe(40000);
+    expect(original.sheets[0]!.cells.B4?.formula).toBe("=B1-B2-B3");
+
+    const committed = applySpreadsheetProposal(original, { ...sumProposal, targetRange: "B6" }, true);
+    expect(committed.revision).toBe(original.revision + 1);
+    expect(committed.sheets[0]!.cells.B6?.formula).toBe("=SUM(B1:B3)");
+    expect(original.sheets[0]!.cells.B6).toBeUndefined();
+    expect(original.sheets[0]!.cells.B5?.formula).toBe("=B4/B1");
 
     // SHT-T12: Undo AI spreadsheet change restores original values, formulas, and metadata
-    const snapshotBeforeAi = structuredClone(committed);
-    const afterAi = structuredClone(committed);
+    const snapshotBeforeAi = structuredClone(original);
+    const afterAi = structuredClone(original);
     afterAi.sheets[0]!.cells.B3!.value = 10000;
     const recalcAfterAi = recalculateWorkbook(afterAi).workbook;
     expect(recalcAfterAi.sheets[0]!.cells.B4?.evaluatedValue).toBe(50000);

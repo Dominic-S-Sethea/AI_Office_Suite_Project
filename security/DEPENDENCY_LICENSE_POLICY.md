@@ -1,6 +1,6 @@
 # Dependency & License Policy — AI Office Suite
 
-**Governance Scope:** All `20` monorepo workspaces (`packages/*`, `platform/*`, `engines/*`, `modules/*`, `apps/*`)  
+**Governance Scope:** All `21` monorepo workspaces (`packages/*`, `platform/*`, `engines/*`, `modules/*`, `apps/*`)  
 **Status:** Active
 
 ## 1. Purpose
@@ -21,6 +21,6 @@ AI Office Suite is planned as a **commercial SaaS and future enterprise/self-hos
 
 ## 4. Automated Enforcement & Supply-Chain Verification
 
-- Run `npm run lint:licenses` (executed via `scripts/check-licenses.mjs` across all 20 workspaces and root `node_modules`) on every dependency change and in CI.
+- Run `npm run lint:licenses` (executed via `scripts/check-licenses.mjs` across all 21 workspaces and root `node_modules`) on every dependency change and in CI.
 - Run `npm run sbom` (`scripts/generate-sbom.mjs`) to generate the CycloneDX 1.5 JSON SBOM (`coverage/sbom.cdx.json`) with automatic runtime scope promotion (`"required"`) for packages appearing in both dev and production graphs.
 - Run `npm audit --omit=dev --audit-level=high` in CI to catch high/critical runtime vulnerabilities.

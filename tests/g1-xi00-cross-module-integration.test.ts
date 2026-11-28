@@ -73,6 +73,17 @@ const POLICY_ALL_V1: DataScopePolicy = {
   canPublish: true,
 };
 
+const POLICY_EDITOR_ALL_V1: DataScopePolicy = {
+  policyId: "pol_editor_all",
+  policyVersion: 1,
+  tenantId: TENANT_ALPHA,
+  principalRole: "editor",
+  allowedDepartments: "ALL",
+  allowedColumns: [...STANDARD_FINANCE_COLUMNS],
+  canExportUnderlyingDetail: false,
+  canPublish: false,
+};
+
 const POLICY_SALES_SCOPED_V1: DataScopePolicy = {
   policyId: "pol_sales_only",
   policyVersion: 1,
@@ -530,7 +541,7 @@ describe("FR-08 XI-00 — Cross-Module Integration Feasibility (INT-T01 .. INT-T
       userId: REVOKABLE_EDITOR_ID,
       role: "editor",
     };
-    const wfRevokePaused = await engine.startMonthlyReportingWorkflow(revActor, POLICY_ALL_V1, {
+    const wfRevokePaused = await engine.startMonthlyReportingWorkflow(revActor, POLICY_EDITOR_ALL_V1, {
       idempotencyKey: "wf_revoke_midrun_1",
       context: {
         tenantId: TENANT_ALPHA,
@@ -548,7 +559,7 @@ describe("FR-08 XI-00 — Cross-Module Integration Feasibility (INT-T01 .. INT-T
       pauseAfterStep: "stage_document",
     });
     engine.revokePrincipal(TENANT_ALPHA, REVOKABLE_EDITOR_ID);
-    await expect(engine.resumeWorkflow(revActor, POLICY_ALL_V1, wfRevokePaused.run.runId)).rejects.toThrowError(/revoked/i);
+    await expect(engine.resumeWorkflow(revActor, POLICY_EDITOR_ALL_V1, wfRevokePaused.run.runId)).rejects.toThrowError(/revoked/i);
 
     // INT-T24: Policy scope reduction invalidates cached results -> never serves leaked prior $150k cache
     engine.setPrincipalPolicy(EDITOR_ID, POLICY_ALL_V1);

@@ -46,6 +46,32 @@ services:
     networks:
       - aios_internal
 
+  workers:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.workers
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      HOST: 0.0.0.0
+      PORT: 4200
+      WORKER_TIMEOUT_MS: ${WORKER_TIMEOUT_MS:-30000}
+      WORKER_MAX_OLD_SPACE_MB: ${WORKER_MAX_OLD_SPACE_MB:-256}
+      MAX_CONCURRENT_WORKER_JOBS: ${MAX_CONCURRENT_WORKER_JOBS:-4}
+      CHROMIUM_NO_SANDBOX: ${CHROMIUM_NO_SANDBOX:-false}
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp:size=256m,nosuid
+    mem_limit: 512m
+    cpus: "1.0"
+    pids_limit: 128
+    networks:
+      - aios_internal
+
   api:
     build:
       context: .
@@ -54,6 +80,8 @@ services:
     depends_on:
       migrate:
         condition: service_completed_successfully
+      workers:
+        condition: service_healthy
     environment:
       NODE_ENV: production
       AUTH_MODE: jwt-pg
@@ -63,13 +91,18 @@ services:
       DATABASE_URL: postgres://${POSTGRES_APP_USER:-aios_app}:${POSTGRES_APP_PASSWORD:?Set a strong >=12-char POSTGRES_APP_PASSWORD in .env}@postgres:5432/${POSTGRES_DB:-aios_suite}
       REQUIRE_NON_SUPERUSER_DB: "true"
       JWT_SECRET: ${JWT_SECRET:?Set a strong >=32-char JWT_SECRET in .env}
-      PII_PSEUDONYMIZATION_KEY: ${PII_PSEUDONYMIZATION_KEY:-}
-      AI_PROPOSAL_SIGNING_SECRET: ${AI_PROPOSAL_SIGNING_SECRET:-}
+      PII_PSEUDONYMIZATION_KEY: ${PII_PSEUDONYMIZATION_KEY:?Set a strong >=32-char PII_PSEUDONYMIZATION_KEY in .env}
+      AI_PROPOSAL_SIGNING_SECRET: ${AI_PROPOSAL_SIGNING_SECRET:?Set a strong >=32-char AI_PROPOSAL_SIGNING_SECRET in .env}
       CORS_ORIGIN: ${CORS_ORIGIN:-http://localhost:8080,http://127.0.0.1:8080}
       AUTO_MIGRATE_ON_START: "false"
       PG_POOL_MAX: ${PG_POOL_MAX:-10}
       PG_STATEMENT_TIMEOUT_MS: ${PG_STATEMENT_TIMEOUT_MS:-15000}
       PG_SSL_MODE: ${PG_SSL_MODE:-disable}
+      RATE_LIMIT_STORE: ${RATE_LIMIT_STORE:-postgres}
+      ISOLATED_PARSER_WORKERS: ${ISOLATED_PARSER_WORKERS:-true}
+      PARSER_WORKER_URL: ${PARSER_WORKER_URL:-http://workers:4200}
+      WORKER_TIMEOUT_MS: ${WORKER_TIMEOUT_MS:-30000}
+      WORKER_MAX_OLD_SPACE_MB: ${WORKER_MAX_OLD_SPACE_MB:-256}
       MAX_CONCURRENT_PDF_EXPORTS: ${MAX_CONCURRENT_PDF_EXPORTS:-2}
       MAX_CONCURRENT_DATA_PREP: ${MAX_CONCURRENT_DATA_PREP:-2}
       ALLOW_LIVE_SPEECH_PROVIDERS: "false"

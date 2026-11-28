@@ -11,6 +11,8 @@ export type WorkspaceRole =
 export interface ActorContext {
   tenantId: string;
   workspaceId: string;
+  /** Visibility of the active workspace resolved from DB at auth time (used for restricted content policy). */
+  workspaceVisibility?: "standard" | "restricted";
   userId: string;
   role: WorkspaceRole;
   /** Optional explicit workspace content grant for restricted workspaces (PA-00 / PLT-02). */

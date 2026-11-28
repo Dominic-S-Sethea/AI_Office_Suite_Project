@@ -481,8 +481,10 @@ describe("WP-2 Regression Suite — F-15 Precision, F-20 Calculation, F-11 Isola
       requiredColumns: [...STANDARD_FINANCE_COLUMNS],
     });
 
+    const POLICY_EDITOR_ALL: DataScopePolicy = { ...POLICY_ALL, principalRole: "editor" };
+
     // Dynamic period (2026-10) and dynamic departments (Engineering + Support) propagate end-to-end
-    const bundle = await xi.syncWorkspaceModules(EDITOR_ACTOR, POLICY_ALL, {
+    const bundle = await xi.syncWorkspaceModules(EDITOR_ACTOR, POLICY_EDITOR_ALL, {
       datasetId: "ds_custom_oct",
       datasetVersion: 1,
       periodStart: "2026-10-01",
@@ -495,7 +497,7 @@ describe("WP-2 Regression Suite — F-15 Precision, F-20 Calculation, F-11 Isola
 
     // insertLinkedChartIntoPresentation preserves prior deck revision for undoLast
     const initialSlideCount = bundle.presentation.slides[0]!.elements.length;
-    const inserted = await xi.insertLinkedChartIntoPresentation(EDITOR_ACTOR, POLICY_ALL, {
+    const inserted = await xi.insertLinkedChartIntoPresentation(EDITOR_ACTOR, POLICY_EDITOR_ALL, {
       presentationId: bundle.presentation.presentationId,
       slideId: bundle.presentation.slides[0]!.slideId,
       chartSpec: bundle.evaluatedDashboard.visualResults.vis_chart_dept_revenue!.chartSpec!,
@@ -509,7 +511,7 @@ describe("WP-2 Regression Suite — F-15 Precision, F-20 Calculation, F-11 Isola
     // 100 rapid syncWorkspaceModules calls maintain strictly monotonic interactionSeq without 409
     let prevSeq = bundle.evaluatedDashboard.interactionSeq;
     for (let i = 0; i < 20; i++) {
-      const nextB = await xi.syncWorkspaceModules(EDITOR_ACTOR, POLICY_ALL, {
+      const nextB = await xi.syncWorkspaceModules(EDITOR_ACTOR, POLICY_EDITOR_ALL, {
         datasetId: "ds_custom_oct",
         datasetVersion: 1,
         periodStart: "2026-10-01",
@@ -539,7 +541,7 @@ describe("WP-2 Regression Suite — F-15 Precision, F-20 Calculation, F-11 Isola
       themeId: "theme_corporate_navy",
       themeVersion: 1,
     };
-    const wf = await xi.startMonthlyReportingWorkflow(EDITOR_ACTOR, POLICY_ALL, {
+    const wf = await xi.startMonthlyReportingWorkflow(EDITOR_ACTOR, POLICY_EDITOR_ALL, {
       idempotencyKey: `wf_${randomUUID()}`,
       context: wfCtx,
     });

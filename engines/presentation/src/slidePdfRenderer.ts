@@ -31,15 +31,18 @@ function safeColor(raw: unknown, fallback: string): string {
 
 function renderSimpleChartSvg(spec: ChartSpec, widthPx: number, heightPx: number, lang: "en" | "km" | "bilingual"): string {
   const cats = spec.categories;
-  const maxVal = Math.max(
-    1,
-    ...spec.series.flatMap((s) => s.values.map((v) => Math.abs(v.value ?? 0))),
-  );
+  const allVals = spec.series
+    .flatMap((s) => s.values.map((v) => v.value))
+    .filter((v): v is number => typeof v === "number" && Number.isFinite(v));
+  const minVal = Math.min(0, ...allVals);
+  const maxVal = Math.max(0, ...allVals);
+  const span = Math.max(1, maxVal - minVal);
   const padL = 70;
   const padB = 45;
   const padT = 56;
   const plotW = Math.max(120, widthPx - padL - 30);
   const plotH = Math.max(100, heightPx - padT - padB);
+  const zeroY = padT + (maxVal / span) * plotH;
   const colors = ["#2563EB", "#94A3B8", "#0EA5E9"];
 
   const groupW = cats.length > 0 ? plotW / cats.length : plotW;
@@ -51,13 +54,15 @@ function renderSimpleChartSvg(spec: ChartSpec, widthPx: number, heightPx: number
     const gx = padL + ci * groupW + (groupW - barW * seriesCount) / 2;
     spec.series.forEach((ser, si) => {
       const pt = ser.values[ci];
-      const val = pt?.value ?? 0;
-      const h = (Math.abs(val) / maxVal) * plotH;
+      const rawVal = pt?.value;
+      const val = typeof rawVal === "number" && Number.isFinite(rawVal) ? rawVal : 0;
+      const h = (Math.abs(val) / span) * plotH;
       const bx = gx + si * (barW + 4);
-      const by = padT + plotH - h;
+      const by = val >= 0 ? zeroY - h : zeroY;
+      const labelY = val >= 0 ? by - 8 : zeroY + h + 13;
       const color = colors[si % colors.length]!;
       bars.push(`<rect x="${bx.toFixed(1)}" y="${by.toFixed(1)}" width="${barW.toFixed(1)}" height="${h.toFixed(1)}" fill="${color}" rx="3" />`);
-      bars.push(`<text x="${(bx + barW / 2).toFixed(1)}" y="${(by - 8).toFixed(1)}" text-anchor="middle" font-size="11" fill="#0F172A">${esc(pt?.formatted ?? "")}</text>`);
+      bars.push(`<text x="${(bx + barW / 2).toFixed(1)}" y="${labelY.toFixed(1)}" text-anchor="middle" font-size="11" fill="#0F172A">${esc(pt?.formatted ?? "")}</text>`);
     });
     bars.push(`<text x="${(padL + ci * groupW + groupW / 2).toFixed(1)}" y="${(padT + plotH + 22).toFixed(1)}" text-anchor="middle" font-size="13" fill="#334155">${esc(cat)}</text>`);
   });
@@ -66,7 +71,7 @@ function renderSimpleChartSvg(spec: ChartSpec, widthPx: number, heightPx: number
   return `<svg xmlns="http://www.w3.org/2000/svg" width="${widthPx}" height="${heightPx}" viewBox="0 0 ${widthPx} ${heightPx}">
     <rect width="100%" height="100%" fill="#FFFFFF" stroke="#E2E8F0" rx="8" />
     <text x="${padL}" y="24" font-size="15" font-weight="700" fill="#0F172A">${esc(title)}</text>
-    <line x1="${padL}" y1="${padT + plotH}" x2="${padL + plotW}" y2="${padT + plotH}" stroke="#94A3B8" stroke-width="1.5" />
+    <line x1="${padL}" y1="${zeroY.toFixed(1)}" x2="${padL + plotW}" y2="${zeroY.toFixed(1)}" stroke="#94A3B8" stroke-width="1.5" />
     ${bars.join("\n")}
   </svg>`;
 }
@@ -135,7 +140,9 @@ function renderSlideHtml(slide: PresentationSlide, deck: StudioPresentation): st
 export function buildPresentationHtml(deck: StudioPresentation, slideIndex?: number): string {
   const fontCss = resolveLocalFontFacesCss();
   const targetSlides =
-    slideIndex !== undefined && deck.slides[slideIndex] ? [deck.slides[slideIndex]!] : deck.slides;
+    slideIndex !== undefined && deck.slides[slideIndex]
+      ? [deck.slides[slideIndex]!]
+      : deck.slides.filter((s) => !s.hidden);
   return `<!DOCTYPE html>
 <html lang="km">
 <head>
@@ -168,18 +175,29 @@ export async function exportPresentationPdf(deck: StudioPresentation): Promise<{
   try {
     writeFileSync(htmlPath, buildPresentationHtml(deck), "utf8");
     const fileUrl = pathToFileURL(htmlPath).href;
-    await execFileAsync(
-      browserPath,
-      [
-        ...buildHardenedChromiumArgs(),
-        `--user-data-dir=${userDataDir}`,
-        "--no-pdf-header-footer",
-        `--print-to-pdf=${pdfPath}`,
-        fileUrl,
-      ],
-      { timeout: 25_000, windowsHide: true, env: buildSanitizedSubprocessEnv(tmpDir) },
-    );
+    try {
+      await execFileAsync(
+        browserPath,
+        [
+          ...buildHardenedChromiumArgs(),
+          `--user-data-dir=${userDataDir}`,
+          "--no-pdf-header-footer",
+          `--print-to-pdf=${pdfPath}`,
+          fileUrl,
+        ],
+        { timeout: 25_000, windowsHide: true, env: buildSanitizedSubprocessEnv(tmpDir) },
+      );
+    } catch (err) {
+      throw new PdfExportError(
+        500,
+        "PDF_RENDER_FAILED",
+        `Chromium presentation PDF render failed: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
     const pdfBuffer = readFileSync(pdfPath);
+    if (pdfBuffer.byteLength < 5 || pdfBuffer.subarray(0, 5).toString("ascii") !== "%PDF-") {
+      throw new PdfExportError(500, "INVALID_PDF_OUTPUT", "Rendered presentation PDF output lacked valid %PDF- header.");
+    }
     return { pdfBuffer, pageCount: countPdfPages(pdfBuffer), engine: "chromium-harfbuzz" };
   } finally {
     cleanupTempDirBestEffort(tmpDir);
@@ -201,17 +219,25 @@ export async function renderPresentationSlideScreenshot(
   try {
     writeFileSync(htmlPath, buildPresentationHtml(deck, slideIndex), "utf8");
     const fileUrl = pathToFileURL(htmlPath).href;
-    await execFileAsync(
-      browserPath,
-      [
-        ...buildHardenedChromiumArgs(),
-        `--user-data-dir=${userDataDir}`,
-        "--window-size=1280,720",
-        `--screenshot=${path.resolve(outputPngPath)}`,
-        fileUrl,
-      ],
-      { timeout: 25_000, windowsHide: true, env: buildSanitizedSubprocessEnv(tmpDir) },
-    );
+    try {
+      await execFileAsync(
+        browserPath,
+        [
+          ...buildHardenedChromiumArgs(),
+          `--user-data-dir=${userDataDir}`,
+          "--window-size=1280,720",
+          `--screenshot=${path.resolve(outputPngPath)}`,
+          fileUrl,
+        ],
+        { timeout: 25_000, windowsHide: true, env: buildSanitizedSubprocessEnv(tmpDir) },
+      );
+    } catch (err) {
+      throw new PdfExportError(
+        500,
+        "SLIDE_SCREENSHOT_FAILED",
+        `Chromium slide screenshot render failed: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
     return { pngPath: outputPngPath, byteLength: readFileSync(outputPngPath).byteLength };
   } finally {
     cleanupTempDirBestEffort(tmpDir);

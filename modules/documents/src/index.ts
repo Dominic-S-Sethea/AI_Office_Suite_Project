@@ -8,7 +8,7 @@ import type {
   PageLayoutConfig,
   StudioDocument,
 } from "@ai-office-suite/shared-contracts";
-import { assertCanPerform, assertTenantWorkspaceAccess } from "@ai-office-suite/authorization";
+import { assertCanPerform, assertPolicyAllowed, assertTenantWorkspaceAccess } from "@ai-office-suite/authorization";
 import type { AuditStore } from "@ai-office-suite/audit";
 import type { DocumentStorageAdapter } from "@ai-office-suite/storage";
 import {
@@ -151,7 +151,15 @@ export class DocumentService {
       blocks?: DocumentBlock[];
     },
   ): Promise<StudioDocument> {
-    assertCanPerform(actor, "document", "create");
+    assertPolicyAllowed({
+      actor,
+      resourceTenantId: actor.tenantId,
+      resourceWorkspaceId: actor.workspaceId,
+      resource: "document",
+      action: "create",
+      source: "manual",
+      ...(actor.workspaceVisibility ? { workspaceVisibility: actor.workspaceVisibility } : {}),
+    });
     const doc = createEmptyDocument({
       tenantId: actor.tenantId,
       workspaceId: actor.workspaceId,
@@ -198,7 +206,15 @@ export class DocumentService {
   }
 
   async listDocuments(actor: ActorContext): Promise<StudioDocument[]> {
-    assertCanPerform(actor, "document", "read");
+    assertPolicyAllowed({
+      actor,
+      resourceTenantId: actor.tenantId,
+      resourceWorkspaceId: actor.workspaceId,
+      resource: "document",
+      action: "read",
+      source: "manual",
+      ...(actor.workspaceVisibility ? { workspaceVisibility: actor.workspaceVisibility } : {}),
+    });
     return this.storage.listDocuments(actor.tenantId, actor.workspaceId);
   }
 
@@ -206,7 +222,15 @@ export class DocumentService {
     actor: ActorContext,
     filter: { q?: string; language?: "en" | "km" | "bilingual"; limit?: number; offset?: number } = {},
   ): Promise<{ documents: StudioDocument[]; total: number; limit: number; offset: number }> {
-    assertCanPerform(actor, "document", "read");
+    assertPolicyAllowed({
+      actor,
+      resourceTenantId: actor.tenantId,
+      resourceWorkspaceId: actor.workspaceId,
+      resource: "document",
+      action: "read",
+      source: "manual",
+      ...(actor.workspaceVisibility ? { workspaceVisibility: actor.workspaceVisibility } : {}),
+    });
     const limit = Math.max(1, Math.min(100, Math.trunc(filter.limit ?? 50)));
     const offset = Math.max(0, Math.trunc(filter.offset ?? 0));
     const qLower = filter.q?.trim().toLowerCase() ?? "";
@@ -226,7 +250,15 @@ export class DocumentService {
   }
 
   async getDocument(actor: ActorContext, documentId: string): Promise<StudioDocument> {
-    assertCanPerform(actor, "document", "read");
+    assertPolicyAllowed({
+      actor,
+      resourceTenantId: actor.tenantId,
+      resourceWorkspaceId: actor.workspaceId,
+      resource: "document",
+      action: "read",
+      source: "manual",
+      ...(actor.workspaceVisibility ? { workspaceVisibility: actor.workspaceVisibility } : {}),
+    });
     const doc = await this.storage.getDocument(documentId);
     if (!doc) {
       throw new DocumentEngineError(404, "DOCUMENT_NOT_FOUND", `Document '${documentId}' was not found.`);
@@ -251,7 +283,15 @@ export class DocumentService {
       restoredFromRevision?: number;
     },
   ): Promise<StudioDocument> {
-    assertCanPerform(actor, "document", "write");
+    assertPolicyAllowed({
+      actor,
+      resourceTenantId: actor.tenantId,
+      resourceWorkspaceId: actor.workspaceId,
+      resource: "document",
+      action: "write",
+      source: input.source ?? "manual",
+      ...(actor.workspaceVisibility ? { workspaceVisibility: actor.workspaceVisibility } : {}),
+    });
     const current = await this.getDocument(actor, documentId);
     if (current.revision !== input.expectedRevision) {
       throw new DocumentEngineError(
@@ -304,21 +344,34 @@ export class DocumentService {
     return updated;
   }
 
-  async listVersions(
+  async listVersionsPage(
     actor: ActorContext,
     documentId: string,
-    options?: { limit?: number; offset?: number },
-  ): Promise<DocumentVersion[]> {
+    options?: { limit?: number; offset?: number; order?: "asc" | "desc" },
+  ): Promise<{ versions: DocumentVersion[]; total: number; hasMore: boolean }> {
     await this.getDocument(actor, documentId);
     const allVersions = await this.storage.listVersions(documentId);
-    if (!options?.limit && !options?.offset) {
-      return allVersions;
-    }
+    const ordered =
+      options?.order === "desc" ? [...allVersions].sort((a, b) => b.revision - a.revision) : allVersions;
     const rawLimit = options?.limit ?? 200;
     const limit = Number.isFinite(rawLimit) ? Math.min(200, Math.max(1, Math.trunc(rawLimit))) : 200;
     const rawOffset = options?.offset ?? 0;
     const offset = Number.isFinite(rawOffset) ? Math.min(100_000, Math.max(0, Math.trunc(rawOffset))) : 0;
-    return allVersions.slice(offset, offset + limit);
+    const versions = ordered.slice(offset, offset + limit);
+    return {
+      versions,
+      total: ordered.length,
+      hasMore: offset + versions.length < ordered.length,
+    };
+  }
+
+  async listVersions(
+    actor: ActorContext,
+    documentId: string,
+    options?: { limit?: number; offset?: number; order?: "asc" | "desc" },
+  ): Promise<DocumentVersion[]> {
+    const page = await this.listVersionsPage(actor, documentId, options);
+    return page.versions;
   }
 
   async getVersion(actor: ActorContext, documentId: string, revision: number): Promise<DocumentVersion | null> {
@@ -332,7 +385,15 @@ export class DocumentService {
     targetRevision: number,
     options?: { expectedRevision?: number },
   ): Promise<StudioDocument> {
-    assertCanPerform(actor, "document", "restore");
+    assertPolicyAllowed({
+      actor,
+      resourceTenantId: actor.tenantId,
+      resourceWorkspaceId: actor.workspaceId,
+      resource: "document",
+      action: "restore",
+      source: "manual",
+      ...(actor.workspaceVisibility ? { workspaceVisibility: actor.workspaceVisibility } : {}),
+    });
     const current = await this.getDocument(actor, documentId);
     if (
       typeof options?.expectedRevision === "number" &&
@@ -390,7 +451,15 @@ export class DocumentService {
   }
 
   async exportDocx(actor: ActorContext, documentId: string): Promise<{ buffer: Buffer; filename: string }> {
-    assertCanPerform(actor, "export", "export");
+    assertPolicyAllowed({
+      actor,
+      resourceTenantId: actor.tenantId,
+      resourceWorkspaceId: actor.workspaceId,
+      resource: "export",
+      action: "export",
+      source: "manual",
+      ...(actor.workspaceVisibility ? { workspaceVisibility: actor.workspaceVisibility } : {}),
+    });
     const doc = await this.getDocument(actor, documentId);
     const buffer = await exportToDocxBuffer(doc);
     this.recordAudit({
@@ -414,7 +483,15 @@ export class DocumentService {
     filename: string,
     buffer: Uint8Array,
   ): Promise<{ document: StudioDocument; diagnostics: ImportDiagnostics }> {
-    assertCanPerform(actor, "document", "create");
+    assertPolicyAllowed({
+      actor,
+      resourceTenantId: actor.tenantId,
+      resourceWorkspaceId: actor.workspaceId,
+      resource: "document",
+      action: "create",
+      source: "manual",
+      ...(actor.workspaceVisibility ? { workspaceVisibility: actor.workspaceVisibility } : {}),
+    });
     const rawSha256 = createHash("sha256").update(buffer).digest("hex");
 
     try {
@@ -475,7 +552,15 @@ export class DocumentService {
   }
 
   async exportPdf(actor: ActorContext, documentId: string): Promise<PdfExportResult & { filename: string }> {
-    assertCanPerform(actor, "export", "export");
+    assertPolicyAllowed({
+      actor,
+      resourceTenantId: actor.tenantId,
+      resourceWorkspaceId: actor.workspaceId,
+      resource: "export",
+      action: "export",
+      source: "manual",
+      ...(actor.workspaceVisibility ? { workspaceVisibility: actor.workspaceVisibility } : {}),
+    });
     const doc = await this.getDocument(actor, documentId);
     const result = await exportToPdfBuffer(doc);
     this.recordAudit({
@@ -494,21 +579,40 @@ export class DocumentService {
     return { ...result, filename: `${doc.documentId}-rev${doc.revision}.pdf` };
   }
 
+  async listAuditEventsPage(
+    actor: ActorContext,
+    documentId: string,
+    options?: { limit?: number; offset?: number },
+  ): Promise<{ events: AuditEvent[]; total: number; hasMore: boolean }> {
+    await this.getDocument(actor, documentId);
+    assertPolicyAllowed({
+      actor,
+      resourceTenantId: actor.tenantId,
+      resourceWorkspaceId: actor.workspaceId,
+      resource: "audit",
+      action: "read",
+      source: "manual",
+      ...(actor.workspaceVisibility ? { workspaceVisibility: actor.workspaceVisibility } : {}),
+    });
+    const allEvents = this.audit.listForDocument(actor.tenantId, actor.workspaceId, documentId);
+    const rawLimit = options?.limit ?? 200;
+    const limit = Number.isFinite(rawLimit) ? Math.min(200, Math.max(1, Math.trunc(rawLimit))) : 200;
+    const rawOffset = options?.offset ?? 0;
+    const offset = Number.isFinite(rawOffset) ? Math.min(100_000, Math.max(0, Math.trunc(rawOffset))) : 0;
+    const events = allEvents.slice(offset, offset + limit);
+    return {
+      events,
+      total: allEvents.length,
+      hasMore: offset + events.length < allEvents.length,
+    };
+  }
+
   async listAuditEvents(
     actor: ActorContext,
     documentId: string,
     options?: { limit?: number; offset?: number },
   ): Promise<AuditEvent[]> {
-    await this.getDocument(actor, documentId);
-    assertCanPerform(actor, "audit", "read");
-    const events = this.audit.listForDocument(actor.tenantId, actor.workspaceId, documentId);
-    if (!options?.limit && !options?.offset) {
-      return events;
-    }
-    const rawLimit = options?.limit ?? 200;
-    const limit = Number.isFinite(rawLimit) ? Math.min(200, Math.max(1, Math.trunc(rawLimit))) : 200;
-    const rawOffset = options?.offset ?? 0;
-    const offset = Number.isFinite(rawOffset) ? Math.min(100_000, Math.max(0, Math.trunc(rawOffset))) : 0;
-    return events.slice(offset, offset + limit);
+    const page = await this.listAuditEventsPage(actor, documentId, options);
+    return page.events;
   }
 }

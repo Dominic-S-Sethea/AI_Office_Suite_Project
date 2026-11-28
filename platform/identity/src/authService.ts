@@ -1,4 +1,4 @@
-import { randomBytes, randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import bcrypt from "bcryptjs";
 import jwt, { type JwtPayload, type SignOptions } from "jsonwebtoken";
 import type { ActorContext, WorkspaceRole } from "@ai-office-suite/shared-contracts";
@@ -46,11 +46,23 @@ export function getJwtSecret(): string {
   throw new Error("JWT_SECRET (>= 32 chars) is required outside tests.");
 }
 
+const BCRYPT_SHA256_PREFIX = "$sha256$";
+
+function prehashPasswordForBcrypt(password: string): string {
+  // Pre-hash UTF-8 passwords before bcrypt so passwords > 72 bytes keep full entropy without truncation.
+  return createHash("sha256").update(password, "utf8").digest("base64url");
+}
+
 export async function hashPassword(password: string): Promise<string> {
-  return bcrypt.hash(password, 10);
+  const bcryptHash = await bcrypt.hash(prehashPasswordForBcrypt(password), 10);
+  return `${BCRYPT_SHA256_PREFIX}${bcryptHash}`;
 }
 
 export async function verifyPassword(password: string, passwordHash: string): Promise<boolean> {
+  if (passwordHash.startsWith(BCRYPT_SHA256_PREFIX)) {
+    const rawBcrypt = passwordHash.slice(BCRYPT_SHA256_PREFIX.length);
+    return bcrypt.compare(prehashPasswordForBcrypt(password), rawBcrypt);
+  }
   return bcrypt.compare(password, passwordHash);
 }
 
@@ -82,6 +94,8 @@ export interface SessionTokenClaims {
   workspaceId: string;
   role: WorkspaceRole;
   tv: number;
+  me?: number;
+  expiresAtIso?: string;
   mfaVerifiedAt?: string;
   jti?: string;
 }
@@ -98,6 +112,7 @@ export function signSessionToken(
       workspace_id: claims.workspaceId,
       role: claims.role,
       tv: claims.tv,
+      ...(typeof claims.me === "number" ? { me: claims.me } : {}),
       ...(claims.mfaVerifiedAt ? { mfa_verified_at: claims.mfaVerifiedAt } : {}),
     },
     getJwtSecret(),
@@ -153,6 +168,10 @@ export function verifySessionToken(token: string): SessionTokenClaims | null {
       workspaceId: p.workspace_id,
       role: p.role,
       tv: p.tv,
+      ...(typeof p.me === "number" && Number.isInteger(p.me) ? { me: p.me } : {}),
+      ...(typeof p.exp === "number" && Number.isFinite(p.exp)
+        ? { expiresAtIso: new Date(p.exp * 1000).toISOString() }
+        : {}),
       ...(mfaVerifiedAt ? { mfaVerifiedAt } : {}),
       jti: p.jti,
     };
@@ -196,14 +215,20 @@ export async function authenticateUserWithPassword(params: {
     throw new AuthenticationError(401, "INVALID_CREDENTIALS", "Invalid email or password.");
   }
 
-  const membership = await withTenantTransaction(
+  const memRes = await withTenantTransaction(
     params.db,
     params.tenantId,
     async (tx) => {
-      const memRes = await tx.query<{ role: string; content_access: boolean }>(
-        `SELECT m.role, m.content_access
+      const res = await tx.query<{
+        role: string;
+        content_access: boolean;
+        revocation_epoch: number;
+        visibility: "standard" | "restricted";
+      }>(
+        `SELECT m.role, m.content_access, m.revocation_epoch, w.visibility
          FROM memberships m
          JOIN organizations o ON o.tenant_id = m.tenant_id
+         JOIN workspaces w ON w.tenant_id = m.tenant_id AND w.workspace_id = m.workspace_id
          WHERE m.tenant_id = $1::uuid
            AND m.workspace_id = $2::uuid
            AND m.user_id = $3::uuid
@@ -211,11 +236,11 @@ export async function authenticateUserWithPassword(params: {
            AND o.status = 'active'`,
         [params.tenantId, params.workspaceId, user.user_id],
       );
-      return memRes.rows[0] ?? null;
+      return res.rows[0] ?? null;
     },
     params.workspaceId,
   );
-  if (!membership || !isWorkspaceRole(membership.role)) {
+  if (!memRes || !isWorkspaceRole(memRes.role)) {
     // Uniform 401 prevents workspace/tenant membership enumeration (H4)
     throw new AuthenticationError(401, "INVALID_CREDENTIALS", "Invalid email or password.");
   }
@@ -223,9 +248,10 @@ export async function authenticateUserWithPassword(params: {
   const actor: ActorContext = {
     tenantId: params.tenantId,
     workspaceId: params.workspaceId,
+    workspaceVisibility: memRes.visibility,
     userId: user.user_id,
-    role: membership.role,
-    workspaceContentGrant: Boolean(membership.content_access),
+    role: memRes.role,
+    workspaceContentGrant: Boolean(memRes.content_access),
     ...(params.mfaVerifiedAt ? { mfaVerifiedAt: params.mfaVerifiedAt } : {}),
   };
   const token = signSessionToken(
@@ -233,11 +259,27 @@ export async function authenticateUserWithPassword(params: {
       ...actor,
       email: user.email,
       tv: user.token_version,
+      me: Number(memRes.revocation_epoch ?? 1),
       ...(params.mfaVerifiedAt ? { mfaVerifiedAt: params.mfaVerifiedAt } : {}),
     },
     params.tokenExpiresIn ? { expiresIn: params.tokenExpiresIn } : undefined,
   );
   return { token, actor };
+}
+
+export async function revokeSessionByJti(
+  db: PgDatabaseAdapter,
+  params: { jti: string; userId: string; expiresAtIso?: string },
+): Promise<boolean> {
+  if (!params.jti || !UUID_PATTERN.test(params.userId)) {
+    return false;
+  }
+  const expiresAt = params.expiresAtIso ?? new Date(Date.now() + 12 * 3_600_000).toISOString();
+  const res = await db.query<{ revoked: boolean }>(
+    "SELECT COALESCE(auth_revoke_session_jti($1, $2::uuid, $3::timestamptz), false) AS revoked",
+    [params.jti, params.userId, expiresAt],
+  );
+  return Boolean(res.rows[0]?.revoked);
 }
 
 export async function revokeUserSessions(db: PgDatabaseAdapter, userId: string): Promise<number> {

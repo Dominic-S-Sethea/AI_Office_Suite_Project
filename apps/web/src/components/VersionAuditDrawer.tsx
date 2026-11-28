@@ -57,6 +57,15 @@ interface VersionAuditDrawerProps {
   effectiveRole?: WorkspaceRole;
   isLoading?: boolean;
   restoringRevision?: number | null;
+  versionsTotal?: number;
+  versionsHasMore?: boolean;
+  isLoadingMoreVersions?: boolean;
+  onLoadMoreVersions?: () => void;
+  auditTotal?: number;
+  auditHasMore?: boolean;
+  isLoadingMoreAudit?: boolean;
+  onLoadMoreAudit?: () => void;
+  restoreFocusElRef?: { current: HTMLElement | null };
   onRestore: (revision: number) => Promise<void>;
   onCompareRevision?: (fromRevision: number, toRevision: number) => Promise<RevisionDiffPayload | null>;
   onClose: () => void;
@@ -73,6 +82,15 @@ function VersionAuditDrawerInner({
   effectiveRole,
   isLoading = false,
   restoringRevision = null,
+  versionsTotal,
+  versionsHasMore = false,
+  isLoadingMoreVersions = false,
+  onLoadMoreVersions,
+  auditTotal,
+  auditHasMore = false,
+  isLoadingMoreAudit = false,
+  onLoadMoreAudit,
+  restoreFocusElRef,
   onRestore,
   onCompareRevision,
   onClose,
@@ -106,7 +124,9 @@ function VersionAuditDrawerInner({
   }, [readOnly, currentRevision]);
 
   useEffect(() => {
-    const previouslyFocused = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    const previouslyFocused =
+      restoreFocusElRef?.current ??
+      (document.activeElement instanceof HTMLElement ? document.activeElement : null);
     closeBtnRef.current?.focus();
 
     const onKeyDown = (e: KeyboardEvent) => {
@@ -124,18 +144,21 @@ function VersionAuditDrawerInner({
     window.addEventListener("keydown", onKeyDown);
     return () => {
       window.removeEventListener("keydown", onKeyDown);
+      const focusTarget = restoreFocusElRef?.current ?? previouslyFocused;
+      if (restoreFocusElRef) restoreFocusElRef.current = null;
       if (
-        previouslyFocused &&
-        document.contains(previouslyFocused) &&
-        previouslyFocused.tabIndex >= 0 &&
-        previouslyFocused.offsetParent !== null
+        focusTarget &&
+        document.contains(focusTarget) &&
+        focusTarget.tabIndex >= 0 &&
+        focusTarget.offsetParent !== null &&
+        !(focusTarget as HTMLButtonElement).disabled
       ) {
-        previouslyFocused.focus();
+        focusTarget.focus();
       } else {
         document.querySelector<HTMLElement>(".fixed-header-btn, .topbar-role-pill, main button")?.focus();
       }
     };
-  }, [onClose]);
+  }, [onClose, restoreFocusElRef]);
 
   function handleTabListKeyDown(e: ReactKeyboardEvent<HTMLDivElement>) {
     const currentIdx = HISTORY_TABS.findIndex(([id]) => id === activeTab);
@@ -264,6 +287,7 @@ function VersionAuditDrawerInner({
                   : ""}{" "}
                 · {diffResult.summary.unchanged} unchanged
                 {diffResult.metadataChanged.titleChanged ? " · Title changed" : ""}
+                {diffResult.metadataChanged.languageChanged ? " · Language changed" : ""}
                 {diffResult.metadataChanged.layoutChanged ? " · Layout changed" : ""}
               </div>
               {diffResult.blocks.length === 0 ? (
@@ -296,14 +320,22 @@ function VersionAuditDrawerInner({
             <>
               {showVersions && (
                 <section>
-                  <h3 className="drawer-section-heading">Immutable Versions ({versions.length})</h3>
+                  <h3 className="drawer-section-heading">
+                    Immutable Versions (
+                    {versionsTotal !== undefined && versionsTotal > versions.length
+                      ? `${versions.length} of ${versionsTotal}`
+                      : versions.length}
+                    )
+                  </h3>
                   {versions.length === 0 ? (
                     <div className="preview-card muted-text">
                       No saved revisions recorded for this document yet.
                     </div>
                   ) : (
                     <div className="stack-sm">
-                      {[...versions].reverse().map((v) => {
+                      {[...versions]
+                        .sort((a, b) => b.revision - a.revision)
+                        .map((v) => {
                         const isCurrent = currentRevision !== undefined && v.revision === currentRevision;
                         const isRestoringThis = restoringRevision === v.revision;
                         const isDiffLoading = diffLoadingRev === v.revision;
@@ -393,12 +425,34 @@ function VersionAuditDrawerInner({
                       })}
                     </div>
                   )}
+                  {versionsHasMore && onLoadMoreVersions && (
+                    <div className="row-actions" style={{ marginTop: "8px" }}>
+                      <span className="meta-caption">
+                        Showing newest {versions.length}
+                        {versionsTotal !== undefined ? ` of ${versionsTotal}` : ""} revisions.
+                      </span>
+                      <button
+                        type="button"
+                        className="btn btn-compact"
+                        disabled={isLoadingMoreVersions}
+                        onClick={onLoadMoreVersions}
+                      >
+                        {isLoadingMoreVersions ? "Loading..." : "Load older revisions"}
+                      </button>
+                    </div>
+                  )}
                 </section>
               )}
 
               {showAudit && (
                 <section>
-                  <h3 className="drawer-section-heading">Append-Only Audit Log ({auditEvents.length})</h3>
+                  <h3 className="drawer-section-heading">
+                    Append-Only Audit Log (
+                    {auditTotal !== undefined && auditTotal > auditEvents.length
+                      ? `${auditEvents.length} of ${auditTotal}`
+                      : auditEvents.length}
+                    )
+                  </h3>
                   {!canReadAudit ? (
                     <div className="notice-readonly" role="status">
                       Audit log inspection requires Reviewer, Editor, Auditor, or Owner permission (<code>audit:read</code>).
@@ -429,6 +483,22 @@ function VersionAuditDrawerInner({
                           </div>
                         );
                       })}
+                    </div>
+                  )}
+                  {auditHasMore && onLoadMoreAudit && (
+                    <div className="row-actions" style={{ marginTop: "8px" }}>
+                      <span className="meta-caption">
+                        Showing newest {auditEvents.length}
+                        {auditTotal !== undefined ? ` of ${auditTotal}` : ""} events.
+                      </span>
+                      <button
+                        type="button"
+                        className="btn btn-compact"
+                        disabled={isLoadingMoreAudit}
+                        onClick={onLoadMoreAudit}
+                      >
+                        {isLoadingMoreAudit ? "Loading..." : "Load older events"}
+                      </button>
                     </div>
                   )}
                 </section>

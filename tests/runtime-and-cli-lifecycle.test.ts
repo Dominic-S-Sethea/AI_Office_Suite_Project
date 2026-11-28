@@ -110,46 +110,56 @@ describe("Wave 1 Server Lifecycle & CLI Governance Suite (C9)", () => {
       });
     });
 
-    await started;
-    const health = await fetch(`http://127.0.0.1:${port}/api/health`);
-    expect(health.status).toBe(200);
+    try {
+      await started;
+      const health = await fetch(`http://127.0.0.1:${port}/api/health`);
+      expect(health.status).toBe(200);
 
-    if (process.platform === "win32") {
-      await new Promise<void>((resolve) => {
-        child.once("exit", () => resolve());
-        child.kill();
-      });
-      const http = await import("node:http");
-      const { createGracefulShutdown } = await import("../apps/api/src/server.ts");
-      const dummyServer = http.createServer((_req, res) => res.end("ok"));
-      await new Promise<void>((resolve) => dummyServer.listen(0, "127.0.0.1", () => resolve()));
-      let dbClosed = false;
-      let shutdownLogs = "";
-      const exitCode = await new Promise<number>((resolve) => {
-        const shutdown = createGracefulShutdown({
-          server: dummyServer,
-          db: {
-            close: async () => {
-              dbClosed = true;
-            },
-          },
-          writeStdout: (line) => {
-            shutdownLogs += line;
-          },
-          exitFn: (code) => resolve(code),
+      if (process.platform === "win32") {
+        await new Promise<void>((resolve) => {
+          child.once("exit", () => resolve());
+          child.kill();
         });
-        shutdown("SIGTERM");
-      });
-      expect(exitCode).toBe(0);
-      expect(dbClosed).toBe(true);
-      expect(shutdownLogs).toContain("server.shutdown_initiated");
-    } else {
-      const exitCode = await new Promise<number | null>((resolve) => {
-        child.once("exit", (code) => resolve(code));
-        child.kill("SIGTERM");
-      });
-      expect(exitCode).toBe(0);
-      expect(stdoutBuf).toContain("server.shutdown_initiated");
+        const http = await import("node:http");
+        const { createGracefulShutdown } = await import("../apps/api/src/server.ts");
+        const dummyServer = http.createServer((_req, res) => res.end("ok"));
+        await new Promise<void>((resolve) => dummyServer.listen(0, "127.0.0.1", () => resolve()));
+        let dbClosed = false;
+        let shutdownLogs = "";
+        const exitCode = await new Promise<number>((resolve) => {
+          const shutdown = createGracefulShutdown({
+            server: dummyServer,
+            db: {
+              close: async () => {
+                dbClosed = true;
+              },
+            },
+            writeStdout: (line) => {
+              shutdownLogs += line;
+            },
+            exitFn: (code) => resolve(code),
+          });
+          shutdown("SIGTERM");
+        });
+        expect(exitCode).toBe(0);
+        expect(dbClosed).toBe(true);
+        expect(shutdownLogs).toContain("server.shutdown_initiated");
+      } else {
+        const exitCode = await new Promise<number | null>((resolve) => {
+          child.once("exit", (code) => resolve(code));
+          child.kill("SIGTERM");
+        });
+        expect(exitCode).toBe(0);
+        expect(stdoutBuf).toContain("server.shutdown_initiated");
+      }
+    } finally {
+      if (child.exitCode === null && child.signalCode === null) {
+        try {
+          child.kill("SIGTERM");
+        } catch {
+          // process already exited
+        }
+      }
     }
   }, 60_000);
 

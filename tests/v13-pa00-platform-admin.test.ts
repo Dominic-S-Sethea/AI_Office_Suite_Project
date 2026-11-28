@@ -572,11 +572,28 @@ describe("V1.4 Aligned PA-00 — Shared Platform Administration Feasibility (PLT
 
     // Live PostgreSQL 16 Docker verification using real non-superuser NOBYPASSRLS login role
     const livePgUrl = process.env.TEST_POSTGRES_URL?.trim();
+    if (process.env.REQUIRE_LIVE_PG === "true" && !livePgUrl) {
+      throw new Error("REQUIRE_LIVE_PG=true requires TEST_POSTGRES_URL for PLT-T08 live PostgreSQL 16 RLS check.");
+    }
     if (livePgUrl) {
       const adminPg = new NodePgDatabaseAdapter(livePgUrl);
       try {
         await initializePostgreSqlSchema(adminPg, { force: true });
         await initializePaGovernanceSchema(adminPg, { force: true });
+        await adminPg.query(
+          `INSERT INTO organizations (tenant_id, name, status) VALUES ($1::uuid, 'Live PG Org A', 'active'), ($2::uuid, 'Live PG Org B', 'active') ON CONFLICT (tenant_id) DO NOTHING`,
+          [TENANT_A, TENANT_B],
+        );
+        await adminPg.query(
+          `INSERT INTO pa_tenant_subscriptions (
+             subscription_id, tenant_id, plan_id, plan_version, status,
+             billing_period_start, billing_period_end, seats_limit, storage_limit_bytes, monthly_token_limit, monthly_voice_seconds_limit
+           ) VALUES
+             ('11111111-1111-4111-8111-1111111111a1'::uuid, $1::uuid, 'starter', 1, 'active', '2026-11-01T00:00:00Z', '2026-12-01T00:00:00Z', 10, 1000000, 10000, 600),
+             ('22222222-2222-4222-8222-2222222222b2'::uuid, $2::uuid, 'starter', 1, 'active', '2026-11-01T00:00:00Z', '2026-12-01T00:00:00Z', 10, 1000000, 10000, 600)
+           ON CONFLICT (tenant_id) DO NOTHING`,
+          [TENANT_A, TENANT_B],
+        );
         await provisionAppRuntimeLoginRole(adminPg, {
           roleName: "aios_pa00_app",
           password: "Pa00AppRoleStrong#2026!",
@@ -591,12 +608,46 @@ describe("V1.4 Aligned PA-00 — Shared Platform Administration Feasibility (PLT
           );
           expect(priv.rows[0]?.rolsuper).toBe(false);
           expect(priv.rows[0]?.rolbypassrls).toBe(false);
+
+          // Unset tenant context must see 0 rows even with Tenant A + Tenant B rows present
           const leaked = await appPg.query<{ cnt: string }>("SELECT COUNT(*) AS cnt FROM pa_tenant_subscriptions");
           expect(Number(leaked.rows[0]?.cnt ?? 0)).toBe(0);
+
+          // Tenant A context sees ONLY Tenant A's subscription
+          const scopedRows = await withTenantTransaction(appPg, TENANT_A, async (tx) => {
+            const res = await tx.query<{ tenant_id: string }>("SELECT tenant_id FROM pa_tenant_subscriptions");
+            return res.rows;
+          });
+          expect(scopedRows).toHaveLength(1);
+          expect(scopedRows[0]?.tenant_id).toBe(TENANT_A);
+
+          // Cross-tenant write rejected by RLS
+          await expect(
+            withTenantTransaction(appPg, TENANT_A, async (tx) => {
+              await tx.query(
+                "UPDATE pa_tenant_subscriptions SET status = 'suspended' WHERE tenant_id = $1::uuid",
+                [TENANT_B],
+              );
+              await tx.query(
+                `INSERT INTO pa_tenant_subscriptions (
+                   subscription_id, tenant_id, plan_id, plan_version, status,
+                   billing_period_start, billing_period_end, seats_limit, storage_limit_bytes, monthly_token_limit, monthly_voice_seconds_limit
+                 ) VALUES ('33333333-3333-4333-8333-3333333333c3'::uuid, $1::uuid, 'starter', 1, 'active', '2026-11-01T00:00:00Z', '2026-12-01T00:00:00Z', 5, 1000, 100, 10)`,
+                [TENANT_B],
+              );
+            }),
+          ).rejects.toThrow(/row-level security|violates|unique/i);
         } finally {
           await appPg.close();
         }
       } finally {
+        try {
+          await adminPg.exec(
+            "REVOKE ALL ON ALL TABLES IN SCHEMA public FROM aios_pa00_app; REVOKE ALL ON SCHEMA public FROM aios_pa00_app; DROP ROLE IF EXISTS aios_pa00_app;",
+          );
+        } catch {
+          // best-effort test role cleanup
+        }
         await adminPg.close();
       }
     }

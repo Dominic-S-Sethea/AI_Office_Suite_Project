@@ -216,12 +216,20 @@ export class ModelRoutingPolicyEngine {
     classification: ArtifactClassification;
     requiredCapabilities: readonly AIModelCapability[];
     unhealthyModelIds?: ReadonlySet<string>;
+    expectedTenantId?: string;
   }): ModelRoutingDecision {
     if (!params.policy || !Array.isArray(params.policy.rules) || params.policy.rules.length === 0) {
       throw new AIProviderError(
         403,
         "MISSING_MODEL_ROUTING_POLICY",
         "Fail-closed: no tenant ModelRoutingPolicy is configured for AI execution.",
+      );
+    }
+    if (params.expectedTenantId && params.policy.tenantId !== params.expectedTenantId) {
+      throw new AIProviderError(
+        403,
+        "TENANT_POLICY_MISMATCH",
+        `ModelRoutingPolicy tenant '${params.policy.tenantId}' does not match actor tenant '${params.expectedTenantId}'.`,
       );
     }
 

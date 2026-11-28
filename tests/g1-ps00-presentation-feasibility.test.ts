@@ -402,6 +402,9 @@ describe("FR-06 PS-00 — Presentation Studio Feasibility, PPTX/PDF Round-Trip &
       expect(shot1.byteLength).toBeGreaterThan(5_000);
       expect(shot2.byteLength).toBeGreaterThan(5_000);
     } else {
+      if (process.env.REQUIRE_CHROMIUM === "true") {
+        throw new Error("REQUIRE_CHROMIUM=true but no Chromium/Chrome/Edge binary was detected for PS-00 PDF/PNG render.");
+      }
       console.warn("DISCLOSURE: Skipping presentation HarfBuzz PDF/PNG render — no Chromium/Chrome/Edge binary detected on host.");
       await expect(exportPresentationPdf(sanitizedDeck)).rejects.toMatchObject({ code: "PDF_RENDERER_UNAVAILABLE" });
     }

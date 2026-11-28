@@ -8,12 +8,12 @@ Bilingual (English / ខ្មែរ) modular document, spreadsheet, presentatio
 - **PostgreSQL:** `16+` (for `jwt-pg` multi-tenant Row-Level Security mode)
 - **Optional:** Docker Engine `24+` + Docker Compose v2+ for containerized full-stack runs, Chromium/Edge for HarfBuzz PDF rendering
 
-## Workspace Architecture (`20` Workspaces)
+## Workspace Architecture (`21` Workspaces)
 
 - **Packages:** `packages/shared-contracts`, `packages/validation`
 - **Platform:** `platform/audit`, `platform/authorization`, `platform/database`, `platform/identity`, `platform/storage`
 - **Engines:** `engines/analytics`, `engines/calculation`, `engines/data-processing`, `engines/document`, `engines/file-conversion`, `engines/intelligence`, `engines/presentation`, `engines/speech`
-- **Modules & Apps:** `modules/ai`, `modules/documents`, `apps/api`, `apps/web`
+- **Modules & Apps:** `modules/ai`, `modules/documents`, `apps/api`, `apps/workers`, `apps/web`
 
 ## Quick-Start
 
@@ -35,7 +35,7 @@ See [`documentation/DEVOPS_RUNBOOK.md`](documentation/DEVOPS_RUNBOOK.md) for req
 | Script | Purpose |
 | :--- | :--- |
 | `npm run typecheck` | Workspace-wide TypeScript check (`tsconfig.typecheck.json`) |
-| `npm run build` | Build API + Vite Web bundle |
+| `npm run build` | Build API, isolated Workers & Vite Web bundle |
 | `npm test` | Run full Vitest test suite |
 | `npm run bench:check` | Verify performance regression budgets |
 | `npm run lint:hygiene` | Check tracked files, secret patterns & speech gate invariants |

@@ -10,8 +10,20 @@ import type {
   WorkflowRun,
 } from "@ai-office-suite/shared-contracts";
 
-export const XI_SCHEMA_VERSION = "2026.11.v2-xi";
+export const XI_SCHEMA_VERSION = "2026.11.v3-xi";
 const XI_SCHEMA_LOCK_KEY = 84102002;
+
+export class IntegrationPersistenceError extends Error {
+  readonly statusCode: number;
+  readonly code: string;
+
+  constructor(statusCode: number, code: string, message: string) {
+    super(message);
+    this.name = "IntegrationPersistenceError";
+    this.statusCode = statusCode;
+    this.code = code;
+  }
+}
 
 export const XI00_INTEGRATION_SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS xi_artifacts (
@@ -32,6 +44,7 @@ CREATE TABLE IF NOT EXISTS xi_artifacts (
 
 CREATE TABLE IF NOT EXISTS xi_artifact_revisions (
   tenant_id               UUID NOT NULL,
+  workspace_id            UUID NULL,
   artifact_id             TEXT NOT NULL,
   revision                INTEGER NOT NULL CHECK (revision >= 1),
   kind                    TEXT NOT NULL,
@@ -85,6 +98,7 @@ CREATE TABLE IF NOT EXISTS xi_reporting_packages (
 
 CREATE TABLE IF NOT EXISTS xi_package_approvals (
   tenant_id               UUID NOT NULL,
+  workspace_id            UUID NULL,
   approval_id             TEXT NOT NULL,
   package_id              TEXT NOT NULL,
   package_version         INTEGER NOT NULL,
@@ -99,6 +113,7 @@ CREATE TABLE IF NOT EXISTS xi_package_approvals (
 
 CREATE TABLE IF NOT EXISTS xi_outbox_events (
   tenant_id        UUID NOT NULL REFERENCES organizations(tenant_id),
+  workspace_id     UUID NULL,
   event_id         UUID NOT NULL,
   event_type       TEXT NOT NULL,
   aggregate_type   TEXT NOT NULL,
@@ -111,8 +126,13 @@ CREATE TABLE IF NOT EXISTS xi_outbox_events (
   UNIQUE (tenant_id, idempotency_key)
 );
 
+ALTER TABLE xi_artifact_revisions ADD COLUMN IF NOT EXISTS workspace_id UUID NULL;
+ALTER TABLE xi_package_approvals ADD COLUMN IF NOT EXISTS workspace_id UUID NULL;
+ALTER TABLE xi_outbox_events ADD COLUMN IF NOT EXISTS workspace_id UUID NULL;
+
 -- Secondary indexes for XI tables (H6)
 CREATE INDEX IF NOT EXISTS xi_artifacts_tenant_ws_updated_idx ON xi_artifacts (tenant_id, workspace_id, updated_at DESC);
+CREATE INDEX IF NOT EXISTS xi_revisions_tenant_ws_idx ON xi_artifact_revisions (tenant_id, workspace_id);
 CREATE INDEX IF NOT EXISTS xi_edges_src_idx ON xi_dependency_edges (tenant_id, source_id);
 CREATE INDEX IF NOT EXISTS xi_edges_tgt_idx ON xi_dependency_edges (tenant_id, target_id);
 CREATE INDEX IF NOT EXISTS xi_approvals_pkg_idx ON xi_package_approvals (tenant_id, package_id, package_version, approved_at DESC);
@@ -163,8 +183,22 @@ ALTER TABLE xi_artifact_revisions ENABLE ROW LEVEL SECURITY;
 ALTER TABLE xi_artifact_revisions FORCE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS tenant_isolation_xi_artifact_revisions ON xi_artifact_revisions;
 CREATE POLICY tenant_isolation_xi_artifact_revisions ON xi_artifact_revisions
-  USING (tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')::uuid)
-  WITH CHECK (tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')::uuid);
+  USING (
+    tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')::uuid
+    AND (
+      NULLIF(current_setting('app.current_workspace_id', true), '') IS NULL
+      OR workspace_id IS NULL
+      OR workspace_id = NULLIF(current_setting('app.current_workspace_id', true), '')::uuid
+    )
+  )
+  WITH CHECK (
+    tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')::uuid
+    AND (
+      NULLIF(current_setting('app.current_workspace_id', true), '') IS NULL
+      OR workspace_id IS NULL
+      OR workspace_id = NULLIF(current_setting('app.current_workspace_id', true), '')::uuid
+    )
+  );
 
 ALTER TABLE xi_dependency_edges ENABLE ROW LEVEL SECURITY;
 ALTER TABLE xi_dependency_edges FORCE ROW LEVEL SECURITY;
@@ -227,15 +261,43 @@ ALTER TABLE xi_package_approvals ENABLE ROW LEVEL SECURITY;
 ALTER TABLE xi_package_approvals FORCE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS tenant_isolation_xi_package_approvals ON xi_package_approvals;
 CREATE POLICY tenant_isolation_xi_package_approvals ON xi_package_approvals
-  USING (tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')::uuid)
-  WITH CHECK (tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')::uuid);
+  USING (
+    tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')::uuid
+    AND (
+      NULLIF(current_setting('app.current_workspace_id', true), '') IS NULL
+      OR workspace_id IS NULL
+      OR workspace_id = NULLIF(current_setting('app.current_workspace_id', true), '')::uuid
+    )
+  )
+  WITH CHECK (
+    tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')::uuid
+    AND (
+      NULLIF(current_setting('app.current_workspace_id', true), '') IS NULL
+      OR workspace_id IS NULL
+      OR workspace_id = NULLIF(current_setting('app.current_workspace_id', true), '')::uuid
+    )
+  );
 
 ALTER TABLE xi_outbox_events ENABLE ROW LEVEL SECURITY;
 ALTER TABLE xi_outbox_events FORCE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS tenant_isolation_xi_outbox_events ON xi_outbox_events;
 CREATE POLICY tenant_isolation_xi_outbox_events ON xi_outbox_events
-  USING (tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')::uuid)
-  WITH CHECK (tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')::uuid);
+  USING (
+    tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')::uuid
+    AND (
+      NULLIF(current_setting('app.current_workspace_id', true), '') IS NULL
+      OR workspace_id IS NULL
+      OR workspace_id = NULLIF(current_setting('app.current_workspace_id', true), '')::uuid
+    )
+  )
+  WITH CHECK (
+    tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')::uuid
+    AND (
+      NULLIF(current_setting('app.current_workspace_id', true), '') IS NULL
+      OR workspace_id IS NULL
+      OR workspace_id = NULLIF(current_setting('app.current_workspace_id', true), '')::uuid
+    )
+  );
 `;
 
 export async function initializeIntegrationSchema(
@@ -310,25 +372,32 @@ export async function persistRevisionRow(
   db: PgDatabaseAdapter,
   tenantId: string,
   rev: ArtifactRevisionReference,
+  workspaceId?: string,
 ): Promise<void> {
-  await withTenantTransaction(db, tenantId, async (tx) => {
-    await tx.query(
-      `INSERT INTO xi_artifact_revisions
-        (tenant_id, artifact_id, revision, kind, content_sha256, restored_from_revision, created_by, created_at)
-       VALUES ($1::uuid, $2, $3, $4, $5, $6, $7::uuid, $8::timestamptz)
-       ON CONFLICT (tenant_id, artifact_id, revision) DO NOTHING`,
-      [
-        tenantId,
-        rev.artifactId,
-        rev.revision,
-        rev.kind,
-        rev.contentSha256,
-        rev.restoredFromRevision ?? null,
-        rev.createdBy,
-        rev.createdAt,
-      ],
-    );
-  });
+  await withTenantTransaction(
+    db,
+    tenantId,
+    async (tx) => {
+      await tx.query(
+        `INSERT INTO xi_artifact_revisions
+          (tenant_id, workspace_id, artifact_id, revision, kind, content_sha256, restored_from_revision, created_by, created_at)
+         VALUES ($1::uuid, $2::uuid, $3, $4, $5, $6, $7, $8::uuid, $9::timestamptz)
+         ON CONFLICT (tenant_id, artifact_id, revision) DO NOTHING`,
+        [
+          tenantId,
+          workspaceId ?? null,
+          rev.artifactId,
+          rev.revision,
+          rev.kind,
+          rev.contentSha256,
+          rev.restoredFromRevision ?? null,
+          rev.createdBy,
+          rev.createdAt,
+        ],
+      );
+    },
+    workspaceId,
+  );
 }
 
 export async function persistDependencyEdgeRow(
@@ -456,26 +525,34 @@ export async function persistApprovalRow(
   db: PgDatabaseAdapter,
   tenantId: string,
   approval: PublicationApproval,
+  workspaceId?: string,
 ): Promise<void> {
-  await withTenantTransaction(db, tenantId, async (tx) => {
-    await tx.query(
-      `INSERT INTO xi_package_approvals
-        (tenant_id, approval_id, package_id, package_version, manifest_digest_sha256, approver_id, status, approved_at)
-       VALUES ($1::uuid, $2, $3, $4, $5, $6::uuid, $7, $8::timestamptz)
-       ON CONFLICT (tenant_id, approval_id) DO UPDATE SET
-         status = EXCLUDED.status`,
-      [
-        tenantId,
-        approval.approvalId,
-        approval.packageId,
-        approval.packageVersion,
-        approval.manifestDigestSha256,
-        approval.approverId,
-        approval.status,
-        approval.approvedAt,
-      ],
-    );
-  });
+  await withTenantTransaction(
+    db,
+    tenantId,
+    async (tx) => {
+      await tx.query(
+        `INSERT INTO xi_package_approvals
+          (tenant_id, workspace_id, approval_id, package_id, package_version, manifest_digest_sha256, approver_id, status, approved_at)
+         VALUES ($1::uuid, $2::uuid, $3, $4, $5, $6, $7::uuid, $8, $9::timestamptz)
+         ON CONFLICT (tenant_id, approval_id) DO UPDATE SET
+           status = EXCLUDED.status,
+           workspace_id = COALESCE(xi_package_approvals.workspace_id, EXCLUDED.workspace_id)`,
+        [
+          tenantId,
+          workspaceId ?? null,
+          approval.approvalId,
+          approval.packageId,
+          approval.packageVersion,
+          approval.manifestDigestSha256,
+          approval.approverId,
+          approval.status,
+          approval.approvedAt,
+        ],
+      );
+    },
+    workspaceId,
+  );
 }
 
 export async function commitPackagePublicationTx(
@@ -513,15 +590,39 @@ export async function commitPackagePublicationTx(
       }
 
       // Check idempotent replay AFTER locking the package row
-      const existingOutbox = await tx.query<{ event_id: string }>(
-        `SELECT event_id::text
+      const existingOutbox = await tx.query<{
+        event_id: string;
+        aggregate_id: string;
+        payload_json: { packageId?: string; packageVersion?: number; manifestDigestSha256?: string } | null;
+      }>(
+        `SELECT event_id::text, aggregate_id, payload_json
          FROM xi_outbox_events
          WHERE tenant_id = $1::uuid AND idempotency_key = $2`,
         [params.tenantId, params.idempotencyKey],
       );
       if (existingOutbox.rows[0]?.event_id) {
-        outboxEventId = existingOutbox.rows[0].event_id;
+        const existing = existingOutbox.rows[0];
+        if (
+          existing.aggregate_id !== params.manifest.packageId ||
+          Number(existing.payload_json?.packageVersion) !== params.manifest.packageVersion ||
+          existing.payload_json?.manifestDigestSha256 !== params.manifest.manifestDigestSha256
+        ) {
+          throw new IntegrationPersistenceError(
+            409,
+            "IDEMPOTENCY_CONFLICT",
+            `Idempotency key '${params.idempotencyKey}' already bound to package '${existing.aggregate_id}' v${existing.payload_json?.packageVersion ?? "unknown"}.`,
+          );
+        }
+        outboxEventId = existing.event_id;
         return;
+      }
+
+      if (pkgRow.manifest_digest_sha256 !== params.manifest.manifestDigestSha256) {
+        throw new IntegrationPersistenceError(
+          409,
+          "STAGED_MANIFEST_DIGEST_MISMATCH",
+          `Staged package '${params.manifest.packageId}' v${params.manifest.packageVersion} digest '${pkgRow.manifest_digest_sha256}' does not match publication manifest '${params.manifest.manifestDigestSha256}'.`,
+        );
       }
 
       if (pkgRow.lifecycle_status === "published") {
@@ -531,10 +632,13 @@ export async function commitPackagePublicationTx(
       const appRes = await tx.query<{ status: string; manifest_digest_sha256: string }>(
         `SELECT status, manifest_digest_sha256
          FROM xi_package_approvals
-         WHERE tenant_id = $1::uuid AND package_id = $2 AND package_version = $3
+         WHERE tenant_id = $1::uuid
+           AND package_id = $2
+           AND package_version = $3
+           AND (workspace_id IS NULL OR workspace_id = $4::uuid)
          ORDER BY approved_at DESC
          LIMIT 1`,
-        [params.tenantId, params.manifest.packageId, params.manifest.packageVersion],
+        [params.tenantId, params.manifest.packageId, params.manifest.packageVersion, params.workspaceId],
       );
       const appRow = appRes.rows[0];
       if (!appRow || appRow.status !== "approved" || appRow.manifest_digest_sha256 !== params.manifest.manifestDigestSha256) {
@@ -611,13 +715,15 @@ export async function commitPackagePublicationTx(
         ],
       );
 
-      await tx.query(
+      const outboxRes = await tx.query<{ event_id: string }>(
         `INSERT INTO xi_outbox_events
-          (tenant_id, event_id, event_type, aggregate_type, aggregate_id, payload_json, idempotency_key, status)
-         VALUES ($1::uuid, $2::uuid, 'reporting_package.published', 'reporting_package', $3, $4::jsonb, $5, 'pending')
-         ON CONFLICT (tenant_id, idempotency_key) DO NOTHING`,
+          (tenant_id, workspace_id, event_id, event_type, aggregate_type, aggregate_id, payload_json, idempotency_key, status)
+         VALUES ($1::uuid, $2::uuid, $3::uuid, 'reporting_package.published', 'reporting_package', $4, $5::jsonb, $6, 'pending')
+         ON CONFLICT (tenant_id, idempotency_key) DO NOTHING
+         RETURNING event_id::text`,
         [
           params.tenantId,
+          params.workspaceId,
           outboxEventId,
           params.manifest.packageId,
           JSON.stringify({
@@ -628,6 +734,13 @@ export async function commitPackagePublicationTx(
           params.idempotencyKey,
         ],
       );
+      if (outboxRes.rowCount !== 1) {
+        throw new IntegrationPersistenceError(
+          409,
+          "IDEMPOTENCY_CONFLICT",
+          `Concurrent idempotency conflict for key '${params.idempotencyKey}'.`,
+        );
+      }
     },
     params.workspaceId,
   );

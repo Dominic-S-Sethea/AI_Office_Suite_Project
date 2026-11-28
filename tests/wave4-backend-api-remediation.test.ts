@@ -362,6 +362,7 @@ describe("Wave 4 — Backend & API Remediation (H13-H18, M8-M10)", () => {
     const server: Server = await new Promise((resolve) => {
       const s = app.listen(0, "127.0.0.1", () => resolve(s));
     });
+    let pdfSpy: { mockRestore: () => void } | null = null;
     try {
       const baseUrl = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
       const headers = { "Content-Type": "application/json", "x-workspace-role": "editor" };
@@ -373,7 +374,7 @@ describe("Wave 4 — Backend & API Remediation (H13-H18, M8-M10)", () => {
       expect(createRes.status).toBe(201);
       const { document: created } = (await createRes.json()) as { document: StudioDocument };
 
-      const pdfSpy = detectChromiumBinary()
+      pdfSpy = detectChromiumBinary()
         ? null
         : vi.spyOn(LocalDocumentGateway.prototype, "exportPdf").mockImplementation(async () => {
             await new Promise((r) => setTimeout(r, 150));
@@ -392,7 +393,6 @@ describe("Wave 4 — Backend & API Remediation (H13-H18, M8-M10)", () => {
           }),
         ),
       );
-      pdfSpy?.mockRestore();
       const statuses = responses.map((r) => r.status);
       expect(statuses).toContain(200);
       expect(statuses).toContain(503);
@@ -401,6 +401,7 @@ describe("Wave 4 — Backend & API Remediation (H13-H18, M8-M10)", () => {
       const body = (await busy.json()) as { code: string };
       expect(body.code).toBe("SERVICE_BUSY");
     } finally {
+      pdfSpy?.mockRestore();
       server.close();
     }
   });

@@ -15,6 +15,12 @@ const LOOPBACK_HOST_PATTERN = /^(?:127\.0\.0\.1|localhost)(?::\d{1,5})?$/i;
 export interface AuthenticatedRequest extends Request {
   actor?: ActorContext;
   authSource?: "bearer" | "cookie";
+  sessionClaims?: {
+    jti: string;
+    tv: number;
+    me?: number;
+    expiresAtIso?: string;
+  };
   requestId?: string;
 }
 
@@ -171,14 +177,20 @@ export function createJwtAuthMiddleware(
             role: string;
             membership_status: string;
             content_access: boolean;
+            revocation_epoch: number;
+            visibility: "standard" | "restricted";
             org_status: string;
+            jti_revoked: boolean;
           }>(
-            `SELECT u.status, u.token_version, m.role, m.status AS membership_status, m.content_access, o.status AS org_status
+            `SELECT u.status, u.token_version, m.role, m.status AS membership_status, m.content_access,
+                    m.revocation_epoch, w.visibility, o.status AS org_status,
+                    auth_is_session_jti_revoked($4) AS jti_revoked
              FROM users u
              JOIN memberships m ON m.user_id = u.user_id
              JOIN organizations o ON o.tenant_id = m.tenant_id
+             JOIN workspaces w ON w.tenant_id = m.tenant_id AND w.workspace_id = m.workspace_id
              WHERE u.user_id = $1::uuid AND m.tenant_id = $2::uuid AND m.workspace_id = $3::uuid`,
-            [claims.userId, claims.tenantId, claims.workspaceId],
+            [claims.userId, claims.tenantId, claims.workspaceId, claims.jti ?? ""],
           );
           return liveRes.rows[0] ?? null;
         },
@@ -200,7 +212,11 @@ export function createJwtAuthMiddleware(
         res.status(403).json({ error: "Account or workspace membership revoked", code: "ACCOUNT_REVOKED" });
         return;
       }
-      if (claims.tv !== live.token_version) {
+      if (
+        live.jti_revoked ||
+        claims.tv !== live.token_version ||
+        (typeof claims.me === "number" && claims.me !== Number(live.revocation_epoch ?? 1))
+      ) {
         res.status(401).json({ error: "Session revoked; please sign in again", code: "TOKEN_REVOKED" });
         return;
       }
@@ -212,12 +228,19 @@ export function createJwtAuthMiddleware(
       req.actor = {
         tenantId: claims.tenantId,
         workspaceId: claims.workspaceId,
+        workspaceVisibility: live.visibility,
         userId: claims.userId,
         role: live.role,
         workspaceContentGrant: Boolean(live.content_access),
         ...(claims.mfaVerifiedAt ? { mfaVerifiedAt: claims.mfaVerifiedAt } : {}),
       };
       req.authSource = authSource;
+      req.sessionClaims = {
+        jti: claims.jti ?? "",
+        tv: claims.tv,
+        ...(typeof claims.me === "number" ? { me: claims.me } : {}),
+        ...(claims.expiresAtIso ? { expiresAtIso: claims.expiresAtIso } : {}),
+      };
       next();
     } catch (err) {
       const requestId = req.requestId;

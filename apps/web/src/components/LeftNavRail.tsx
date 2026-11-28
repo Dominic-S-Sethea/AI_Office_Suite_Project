@@ -263,8 +263,8 @@ function LeftNavRailInner({
                 inert={!isOpen ? true : undefined}
                 className={`vertical-dropdown-wrap ${isOpen ? "is-open" : ""}`}
               >
-                <div className="vertical-dropdown-inner">
-                  <div className="vertical-subheaders-list">
+                <div className="vertical-dropdown-inner" role="none">
+                  <div className="vertical-subheaders-list" role="none">
                     {group.subHeaders.map((sub, idx) => (
                       <div
                         key={sub.id}
@@ -278,6 +278,7 @@ function LeftNavRailInner({
                           tabIndex={isOpen ? 0 : -1}
                           disabled={sub.disabled}
                           title={sub.title}
+                          aria-current={sub.active ? "true" : undefined}
                           className={`vertical-subheader-btn ${sub.active ? "is-active" : ""}`}
                           onClick={() => sub.onSelect()}
                           onKeyDown={(e) => handleSubHeaderKeyDown(e, group.id)}

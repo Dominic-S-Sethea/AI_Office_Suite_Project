@@ -303,9 +303,9 @@ const INJECTION_PATTERNS: ReadonlyArray<{ id: string; pattern: RegExp; reason: s
 ];
 
 function normalizeForPromptScan(raw: string): string {
-  // Remove zero-width, soft-hyphen, and bidirectional override characters before NFKC folding
+  // Remove invisible formatting/control characters (Cf), combining grapheme joiner (U+034F), and variation selectors before NFKC folding
   return raw
-    .replace(/[\u00AD\u200B-\u200F\u202A-\u202E\u2060-\u206F\uFEFF]/g, "")
+    .replace(/[\p{Cf}\u034F\uFE00-\uFE0F]/gu, "")
     .normalize("NFKC");
 }
 
@@ -483,7 +483,11 @@ export function validateReportingManifestSafety(manifest: ReportingPackageManife
   if (Object.keys(manifest.fileChecksums).length === 0) {
     errors.push("Reporting package manifest must include file integrity checksums.");
   }
-  if (manifest.approval && manifest.approval.manifestDigestSha256 !== manifest.manifestDigestSha256) {
+  if (
+    manifest.approval &&
+    manifest.approval.status === "approved" &&
+    manifest.approval.manifestDigestSha256 !== manifest.manifestDigestSha256
+  ) {
     errors.push("Publication approval digest does not match current manifest digest.");
   }
   return {
@@ -502,6 +506,7 @@ export const listDocumentsQuerySchema = z.object({
 export const paginationQuerySchema = z.object({
   limit: z.coerce.number().int().min(1).max(200).optional(),
   offset: z.coerce.number().int().min(0).max(100_000).optional(),
+  order: z.enum(["asc", "desc"]).optional(),
 });
 
 export const restoreVersionRequestSchema = z.object({

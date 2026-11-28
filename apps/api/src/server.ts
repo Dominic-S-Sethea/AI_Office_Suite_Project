@@ -8,6 +8,7 @@ import {
   type PgDatabaseAdapter,
 } from "@ai-office-suite/database";
 import { getJwtSecret } from "@ai-office-suite/identity";
+import { redactAuditString } from "@ai-office-suite/audit";
 import { createApiApp } from "./app.ts";
 import { loadApiServerConfig } from "./config.ts";
 
@@ -57,12 +58,35 @@ export function createGracefulShutdown(options: GracefulShutdownOptions): (signa
     }, timeoutMs);
     forceTimer.unref?.();
 
-    server.close(async () => {
+    server.close(async (closeErr) => {
+      let exitCode = closeErr || signal === "uncaughtException" || signal === "unhandledRejection" ? 1 : 0;
+      if (closeErr) {
+        process.stderr.write(
+          `${JSON.stringify({
+            ts: new Date().toISOString(),
+            level: "error",
+            service: "ai-office-suite-api",
+            event: "server.close_error",
+            error: redactAuditString(closeErr instanceof Error ? closeErr.message : String(closeErr)),
+          })}\n`,
+        );
+      }
       try {
         if (db) await db.close();
+      } catch (dbCloseErr) {
+        exitCode = 1;
+        process.stderr.write(
+          `${JSON.stringify({
+            ts: new Date().toISOString(),
+            level: "error",
+            service: "ai-office-suite-api",
+            event: "db.close_error",
+            error: redactAuditString(dbCloseErr instanceof Error ? dbCloseErr.message : String(dbCloseErr)),
+          })}\n`,
+        );
       } finally {
         clearTimeout(forceTimer);
-        exitFn(0);
+        exitFn(exitCode);
       }
     });
     if (typeof server.closeIdleConnections === "function") {
@@ -98,6 +122,7 @@ async function startServer(): Promise<void> {
     maxConcurrentPdfExports: config.maxConcurrentPdfExports,
     maxConcurrentDataPrep: config.maxConcurrentDataPrep,
     rateLimit: config.rateLimit,
+    workers: config.workers,
   });
 
   const server = app.listen(config.port, config.host, () => {
@@ -116,6 +141,8 @@ async function startServer(): Promise<void> {
         host: config.host,
         port: config.port,
         trustProxy: config.trustProxy,
+        rateLimitStore: config.rateLimit.store,
+        isolatedParsers: config.workers.isolatedParsers,
       })}\n`,
     );
   });
@@ -140,7 +167,7 @@ async function startServer(): Promise<void> {
         level: "error",
         service: "ai-office-suite-api",
         event: "process.unhandled_rejection",
-        error: reason instanceof Error ? reason.message : String(reason),
+        error: redactAuditString(reason instanceof Error ? reason.message : String(reason)),
       })}\n`,
     );
   });
@@ -151,7 +178,7 @@ async function startServer(): Promise<void> {
         level: "error",
         service: "ai-office-suite-api",
         event: "process.uncaught_exception",
-        error: err.message,
+        error: redactAuditString(err.message),
       })}\n`,
     );
     shutdown("uncaughtException");
@@ -176,7 +203,7 @@ if (isEntrypointModule()) {
         level: "error",
         service: "ai-office-suite-api",
         event: "server.startup_failed",
-        error: err instanceof Error ? err.message : String(err),
+        error: redactAuditString(err instanceof Error ? err.message : String(err)),
       })}\n`,
     );
     process.exit(1);

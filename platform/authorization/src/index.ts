@@ -32,6 +32,17 @@ const ORG_SCOPED_RESOURCES: ReadonlySet<PolicyResourceType> = new Set([
   "audit",
 ]);
 
+const ORG_WIDE_AUDIT_ROLES: ReadonlySet<WorkspaceRole> = new Set([
+  "owner",
+  "administrator",
+  "auditor",
+  "billing_admin",
+]);
+
+export function isOrgWideAuditRole(role: WorkspaceRole): boolean {
+  return ORG_WIDE_AUDIT_ROLES.has(role);
+}
+
 const METERED_ACTIONS: ReadonlySet<`${PolicyResourceType}:${PolicyAction}`> = new Set([
   "ai_assistant:read",
   "ai_assistant:apply_ai",
@@ -437,9 +448,13 @@ export function evaluatePolicyDecision(request: PolicyDecisionRequest): PolicyDe
     };
   }
 
+  const isOrgScopedBypass =
+    ORG_SCOPED_RESOURCES.has(request.resource) &&
+    (request.resource !== "audit" || ORG_WIDE_AUDIT_ROLES.has(request.actor.role));
+
   if (
     request.resourceWorkspaceId &&
-    !ORG_SCOPED_RESOURCES.has(request.resource) &&
+    !isOrgScopedBypass &&
     request.actor.workspaceId !== request.resourceWorkspaceId
   ) {
     return {

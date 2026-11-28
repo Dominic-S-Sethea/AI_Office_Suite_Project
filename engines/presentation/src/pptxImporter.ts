@@ -21,24 +21,51 @@ export class PptxImportError extends Error {
   }
 }
 
+const XML_NAMED_ENTITIES: Record<string, string> = {
+  amp: "&",
+  lt: "<",
+  gt: ">",
+  quot: '"',
+  apos: "'",
+};
+
 function decodeXmlEntities(text: string): string {
-  return text
-    .replace(/&amp;/g, "&")
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">")
-    .replace(/&quot;/g, '"')
-    .replace(/&apos;/g, "'");
+  return text.replace(/&(?:(amp|lt|gt|quot|apos)|#(\d+)|#x([0-9a-fA-F]+));/g, (full, named, dec, hex) => {
+    if (named && Object.hasOwn(XML_NAMED_ENTITIES, named)) {
+      return XML_NAMED_ENTITIES[named]!;
+    }
+    const cp = dec ? Number.parseInt(dec, 10) : hex ? Number.parseInt(hex, 16) : NaN;
+    if (Number.isInteger(cp) && cp >= 0x20 && cp <= 0x10ffff) {
+      return String.fromCodePoint(cp);
+    }
+    return full;
+  });
 }
 
 function extractTextRunsFromXml(xml: string): string[] {
   const shapes: string[] = [];
   const spMatches = xml.match(/<p:sp\b[\s\S]*?<\/p:sp>/g) ?? [];
   for (const sp of spMatches) {
-    const tMatches = sp.match(/<a:t\b[^>]*>([\s\S]*?)<\/a:t>/g) ?? [];
-    const text = tMatches
-      .map((tag) => decodeXmlEntities(tag.replace(/<[^>]+>/g, "")))
-      .join(" ")
-      .trim();
+    const pMatches = sp.match(/<a:p\b[\s\S]*?<\/a:p>/g);
+    let text: string;
+    if (pMatches && pMatches.length > 0) {
+      text = pMatches
+        .map((pXml) => {
+          const tMatches = pXml.match(/<a:t\b[^>]*>([\s\S]*?)<\/a:t>/g) ?? [];
+          return tMatches
+            .map((tag) => decodeXmlEntities(tag.replace(/<[^>]+>/g, "")))
+            .join("");
+        })
+        .filter((line) => line.trim().length > 0)
+        .join("\n")
+        .trim();
+    } else {
+      const tMatches = sp.match(/<a:t\b[^>]*>([\s\S]*?)<\/a:t>/g) ?? [];
+      text = tMatches
+        .map((tag) => decodeXmlEntities(tag.replace(/<[^>]+>/g, "")))
+        .join("")
+        .trim();
+    }
     if (text) shapes.push(normalizeDocumentText(text));
   }
   return shapes;

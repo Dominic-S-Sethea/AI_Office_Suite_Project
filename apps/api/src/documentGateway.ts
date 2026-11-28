@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type {
   ActorContext,
   AuditEvent,
@@ -8,8 +8,9 @@ import type {
   StudioDocument,
 } from "@ai-office-suite/shared-contracts";
 import type { AuditStore } from "@ai-office-suite/audit";
-import { assertCanPerform } from "@ai-office-suite/authorization";
+import { assertCanPerform, assertPolicyAllowed } from "@ai-office-suite/authorization";
 import { PostgreSqlDocumentRepository } from "@ai-office-suite/database";
+import type { DocumentStorageAdapter } from "@ai-office-suite/storage";
 import {
   createEmptyDocument,
   normalizeDocumentText,
@@ -32,6 +33,7 @@ import {
   type ApplyProposalResult,
   type PlanCommandInput,
 } from "@ai-office-suite/ai-module";
+import type { IsolatedParserWorkerClient } from "@ai-office-suite/workers";
 
 export type ListDocumentsFilter = Parameters<PostgreSqlDocumentRepository["listDocumentsFiltered"]>[1];
 export type ListDocumentsPage = Awaited<ReturnType<PostgreSqlDocumentRepository["listDocumentsFiltered"]>>;
@@ -76,7 +78,12 @@ export interface DocumentGateway {
   seedBilingualFixture(actor: ActorContext): Promise<StudioDocument>;
   getDocument(actor: ActorContext, documentId: string): Promise<StudioDocument>;
   updateDocument(actor: ActorContext, documentId: string, input: UpdateDocumentGatewayInput): Promise<StudioDocument>;
-  listVersions(actor: ActorContext, documentId: string, options?: { limit?: number; offset?: number }): Promise<DocumentVersion[]>;
+  listVersions(actor: ActorContext, documentId: string, options?: { limit?: number; offset?: number; order?: "asc" | "desc" }): Promise<DocumentVersion[]>;
+  listVersionsPage(
+    actor: ActorContext,
+    documentId: string,
+    options?: { limit?: number; offset?: number; order?: "asc" | "desc" },
+  ): Promise<{ versions: DocumentVersion[]; total: number; hasMore: boolean }>;
   getVersionsForDiff(
     actor: ActorContext,
     documentId: string,
@@ -104,14 +111,24 @@ export interface DocumentGateway {
   exportDocx(actor: ActorContext, documentId: string): Promise<{ buffer: Buffer; filename: string }>;
   exportPdf(actor: ActorContext, documentId: string): Promise<{ pdfBuffer: Buffer; filename: string; engine: string }>;
   listAuditEvents(actor: ActorContext, documentId: string, options?: { limit?: number; offset?: number }): Promise<AuditEvent[]>;
+  listAuditEventsPage(
+    actor: ActorContext,
+    documentId: string,
+    options?: { limit?: number; offset?: number },
+  ): Promise<{ events: AuditEvent[]; total: number; hasMore: boolean }>;
   recordAudit(actor: ActorContext, entry: DocumentGatewayAuditInput): Promise<void>;
 }
 
 export class PgDocumentGateway implements DocumentGateway {
   private readonly pgRepo: PostgreSqlDocumentRepository;
+  private readonly parserWorker?: IsolatedParserWorkerClient;
 
-  constructor(pgRepo: PostgreSqlDocumentRepository) {
+  constructor(
+    pgRepo: PostgreSqlDocumentRepository,
+    options?: { parserWorker?: IsolatedParserWorkerClient },
+  ) {
     this.pgRepo = pgRepo;
+    this.parserWorker = options?.parserWorker;
   }
 
   listDocuments(actor: ActorContext, filter: ListDocumentsFilter): Promise<ListDocumentsPage> {
@@ -170,8 +187,16 @@ export class PgDocumentGateway implements DocumentGateway {
     );
   }
 
-  listVersions(actor: ActorContext, documentId: string, options?: { limit?: number; offset?: number }): Promise<DocumentVersion[]> {
+  listVersions(actor: ActorContext, documentId: string, options?: { limit?: number; offset?: number; order?: "asc" | "desc" }): Promise<DocumentVersion[]> {
     return this.pgRepo.listVersions(actor, documentId, options);
+  }
+
+  listVersionsPage(
+    actor: ActorContext,
+    documentId: string,
+    options?: { limit?: number; offset?: number; order?: "asc" | "desc" },
+  ): Promise<{ versions: DocumentVersion[]; total: number; hasMore: boolean }> {
+    return this.pgRepo.listVersionsPage(actor, documentId, options);
   }
 
   getVersionsForDiff(
@@ -318,13 +343,21 @@ export class PgDocumentGateway implements DocumentGateway {
     assertCanPerform(actor, "document", "create");
     let importedResult: Awaited<ReturnType<typeof importFromDocxBuffer>>;
     try {
-      importedResult = await importFromDocxBuffer({
-        buffer,
-        filename,
-        tenantId: actor.tenantId,
-        workspaceId: actor.workspaceId,
-        actorId: actor.userId,
-      });
+      importedResult = this.parserWorker
+        ? await this.parserWorker.parseDocx({
+            buffer,
+            filename,
+            tenantId: actor.tenantId,
+            workspaceId: actor.workspaceId,
+            actorId: actor.userId,
+          })
+        : await importFromDocxBuffer({
+            buffer,
+            filename,
+            tenantId: actor.tenantId,
+            workspaceId: actor.workspaceId,
+            actorId: actor.userId,
+          });
     } catch (importErr) {
       if (importErr instanceof DocxImportError) {
         await this.pgRepo.recordAudit(actor, {
@@ -378,7 +411,9 @@ export class PgDocumentGateway implements DocumentGateway {
   ): Promise<{ pdfBuffer: Buffer; filename: string; engine: string }> {
     assertCanPerform(actor, "export", "export");
     const doc = await this.pgRepo.getDocument(actor, documentId);
-    const result = await exportToPdfBuffer(doc);
+    const result = this.parserWorker
+      ? await this.parserWorker.renderPdf(doc)
+      : await exportToPdfBuffer(doc);
     await this.pgRepo.recordAudit(actor, {
       tenantId: actor.tenantId,
       workspaceId: actor.workspaceId,
@@ -401,6 +436,14 @@ export class PgDocumentGateway implements DocumentGateway {
 
   listAuditEvents(actor: ActorContext, documentId: string, options?: { limit?: number; offset?: number }): Promise<AuditEvent[]> {
     return this.pgRepo.listAuditEvents(actor, documentId, options);
+  }
+
+  listAuditEventsPage(
+    actor: ActorContext,
+    documentId: string,
+    options?: { limit?: number; offset?: number },
+  ): Promise<{ events: AuditEvent[]; total: number; hasMore: boolean }> {
+    return this.pgRepo.listAuditEventsPage(actor, documentId, options);
   }
 
   async recordAudit(actor: ActorContext, entry: DocumentGatewayAuditInput): Promise<void> {
@@ -427,11 +470,23 @@ export class LocalDocumentGateway implements DocumentGateway {
   private readonly documents: DocumentService;
   private readonly aiExecutor: AiDocumentExecutor;
   private readonly audit: AuditStore;
+  private readonly storage?: DocumentStorageAdapter;
+  private readonly parserWorker?: IsolatedParserWorkerClient;
 
-  constructor(documents: DocumentService, aiExecutor: AiDocumentExecutor, audit: AuditStore) {
+  constructor(
+    documents: DocumentService,
+    aiExecutor: AiDocumentExecutor,
+    audit: AuditStore,
+    options?: {
+      storage?: DocumentStorageAdapter;
+      parserWorker?: IsolatedParserWorkerClient;
+    },
+  ) {
     this.documents = documents;
     this.aiExecutor = aiExecutor;
     this.audit = audit;
+    this.storage = options?.storage;
+    this.parserWorker = options?.parserWorker;
   }
 
   listDocuments(actor: ActorContext, filter: ListDocumentsFilter): Promise<ListDocumentsPage> {
@@ -454,8 +509,16 @@ export class LocalDocumentGateway implements DocumentGateway {
     return this.documents.updateDocument(actor, documentId, input);
   }
 
-  listVersions(actor: ActorContext, documentId: string, options?: { limit?: number; offset?: number }): Promise<DocumentVersion[]> {
+  listVersions(actor: ActorContext, documentId: string, options?: { limit?: number; offset?: number; order?: "asc" | "desc" }): Promise<DocumentVersion[]> {
     return this.documents.listVersions(actor, documentId, options);
+  }
+
+  listVersionsPage(
+    actor: ActorContext,
+    documentId: string,
+    options?: { limit?: number; offset?: number; order?: "asc" | "desc" },
+  ): Promise<{ versions: DocumentVersion[]; total: number; hasMore: boolean }> {
+    return this.documents.listVersionsPage(actor, documentId, options);
   }
 
   async getVersionsForDiff(
@@ -514,27 +577,129 @@ export class LocalDocumentGateway implements DocumentGateway {
     return this.aiExecutor.applyProposal({ actor, proposal, approved });
   }
 
-  importDocx(
+  async importDocx(
     actor: ActorContext,
     filename: string,
     buffer: Buffer,
   ): Promise<{ document: StudioDocument; diagnostics: ImportDiagnostics }> {
-    return this.documents.importDocx(actor, filename, buffer);
+    if (!this.parserWorker || !this.storage) {
+      return this.documents.importDocx(actor, filename, buffer);
+    }
+    assertPolicyAllowed({
+      actor,
+      resourceTenantId: actor.tenantId,
+      resourceWorkspaceId: actor.workspaceId,
+      resource: "document",
+      action: "create",
+      source: "manual",
+      ...(actor.workspaceVisibility ? { workspaceVisibility: actor.workspaceVisibility } : {}),
+    });
+    const rawSha256 = createHash("sha256").update(buffer).digest("hex");
+    try {
+      const { document, diagnostics } = await this.parserWorker.parseDocx({
+        buffer,
+        filename,
+        tenantId: actor.tenantId,
+        workspaceId: actor.workspaceId,
+        actorId: actor.userId,
+      });
+      const storedOriginal = await this.storage.saveOriginalBinary(buffer, "docx");
+      const version: DocumentVersion = {
+        versionId: `ver_${randomUUID()}`,
+        documentId: document.documentId,
+        revision: 1,
+        snapshot: document,
+        summary: `Imported DOCX '${filename}' (SHA-256 ${storedOriginal.sha256.slice(0, 12)})`,
+        source: "import",
+        actorId: actor.userId,
+        createdAt: document.createdAt,
+      };
+      await this.storage.saveDocumentVersion(version);
+      await this.recordAudit(actor, {
+        tenantId: actor.tenantId,
+        workspaceId: actor.workspaceId,
+        documentId: document.documentId,
+        actorId: actor.userId,
+        actorRole: actor.role,
+        source: "import",
+        action: "document.imported_docx",
+        outcome: "success",
+        revisionAfter: 1,
+        summary: `Imported DOCX '${filename}' with ${diagnostics.unsupportedFeatures.length} unsupported-feature notices.`,
+        metadata: {
+          originalSha256: storedOriginal.sha256,
+          unsupportedFeatures: diagnostics.unsupportedFeatures,
+        },
+      });
+      return { document, diagnostics };
+    } catch (error) {
+      await this.recordAudit(actor, {
+        tenantId: actor.tenantId,
+        workspaceId: actor.workspaceId,
+        actorId: actor.userId,
+        actorRole: actor.role,
+        source: "import",
+        action: "document.import_rejected",
+        outcome: "denied",
+        summary: `Rejected DOCX import '${filename}': ${error instanceof Error ? error.message : "unknown error"}`,
+        metadata: { originalSha256: rawSha256 },
+      });
+      throw error;
+    }
   }
 
   exportDocx(actor: ActorContext, documentId: string): Promise<{ buffer: Buffer; filename: string }> {
     return this.documents.exportDocx(actor, documentId);
   }
 
-  exportPdf(
+  async exportPdf(
     actor: ActorContext,
     documentId: string,
   ): Promise<{ pdfBuffer: Buffer; filename: string; engine: string }> {
-    return this.documents.exportPdf(actor, documentId);
+    if (!this.parserWorker) {
+      return this.documents.exportPdf(actor, documentId);
+    }
+    assertPolicyAllowed({
+      actor,
+      resourceTenantId: actor.tenantId,
+      resourceWorkspaceId: actor.workspaceId,
+      resource: "export",
+      action: "export",
+      source: "manual",
+      ...(actor.workspaceVisibility ? { workspaceVisibility: actor.workspaceVisibility } : {}),
+    });
+    const doc = await this.documents.getDocument(actor, documentId);
+    const result = await this.parserWorker.renderPdf(doc);
+    await this.recordAudit(actor, {
+      tenantId: actor.tenantId,
+      workspaceId: actor.workspaceId,
+      documentId,
+      actorId: actor.userId,
+      actorRole: actor.role,
+      source: "export",
+      action: "document.exported_pdf",
+      outcome: "success",
+      revisionBefore: doc.revision,
+      revisionAfter: doc.revision,
+      summary: `Exported searchable PDF via ${result.engine} (${result.pdfBuffer.byteLength} bytes).`,
+    });
+    return {
+      pdfBuffer: result.pdfBuffer,
+      filename: `${doc.documentId}-rev${doc.revision}.pdf`,
+      engine: result.engine,
+    };
   }
 
   listAuditEvents(actor: ActorContext, documentId: string, options?: { limit?: number; offset?: number }): Promise<AuditEvent[]> {
     return this.documents.listAuditEvents(actor, documentId, options);
+  }
+
+  listAuditEventsPage(
+    actor: ActorContext,
+    documentId: string,
+    options?: { limit?: number; offset?: number },
+  ): Promise<{ events: AuditEvent[]; total: number; hasMore: boolean }> {
+    return this.documents.listAuditEventsPage(actor, documentId, options);
   }
 
   async recordAudit(_actor: ActorContext, entry: DocumentGatewayAuditInput): Promise<void> {

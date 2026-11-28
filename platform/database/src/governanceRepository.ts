@@ -26,7 +26,12 @@ import type {
   WorkspaceVisibility,
 } from "@ai-office-suite/shared-contracts";
 import { redactAuditString, redactAuditValue } from "@ai-office-suite/audit";
-import { assertCanManageTargetRole, assertPolicyAllowed, isWorkspaceRole } from "@ai-office-suite/authorization";
+import {
+  assertCanManageTargetRole,
+  assertPolicyAllowed,
+  isOrgWideAuditRole,
+  isWorkspaceRole,
+} from "@ai-office-suite/authorization";
 import type { PgDatabaseAdapter, PgQueryExecutor } from "./adapter.ts";
 import { verifyDatabaseRlsReadiness, withTenantTransaction } from "./schema.ts";
 
@@ -491,12 +496,14 @@ export class PlatformGovernanceService {
           role: string;
           status: string;
           content_access: boolean;
+          visibility: WorkspaceVisibility;
           org_status: OrganizationStatus;
           user_status: string;
         }>(
-          `SELECT m.role, m.status, m.content_access, o.status AS org_status, u.status AS user_status
+          `SELECT m.role, m.status, m.content_access, w.visibility, o.status AS org_status, u.status AS user_status
            FROM memberships m
            JOIN organizations o ON o.tenant_id = m.tenant_id
+           JOIN workspaces w ON w.tenant_id = m.tenant_id AND w.workspace_id = m.workspace_id
            JOIN users u ON u.user_id = m.user_id
            WHERE m.tenant_id = $1::uuid AND m.workspace_id = $2::uuid AND m.user_id = $3::uuid`,
           [params.targetTenantId, params.targetWorkspaceId, params.userId],
@@ -518,6 +525,7 @@ export class PlatformGovernanceService {
     return {
       tenantId: params.targetTenantId,
       workspaceId: params.targetWorkspaceId,
+      workspaceVisibility: row.visibility,
       userId: params.userId,
       role: row.role,
       workspaceContentGrant: row.content_access,
@@ -605,21 +613,71 @@ export class PlatformGovernanceService {
         const nextStatus = params.mode === "suspend" ? "suspended" : "revoked";
         const upd = scopedWorkspaceId
           ? await tx.query(
-              `UPDATE memberships SET status = $4, content_access = false
+              `UPDATE memberships
+               SET status = $4, content_access = false, revocation_epoch = revocation_epoch + 1
                WHERE tenant_id = $1::uuid AND workspace_id = $2::uuid AND user_id = $3::uuid AND status = 'active'`,
               [params.tenantId, scopedWorkspaceId, params.targetUserId, nextStatus],
             )
           : await tx.query(
-              `UPDATE memberships SET status = $3, content_access = false
+              `UPDATE memberships
+               SET status = $3, content_access = false, revocation_epoch = revocation_epoch + 1
                WHERE tenant_id = $1::uuid AND user_id = $2::uuid AND status = 'active'`,
               [params.tenantId, params.targetUserId, nextStatus],
             );
 
-        // Immediately revoke active sessions via SECURITY DEFINER token_version bump (F-04)
-        const tvRes = await tx.query<{ token_version: number | null }>(
-          `SELECT auth_bump_user_token_version($1::uuid) AS token_version`,
+        // Revoke any pending invitations matching the offboarded user's email inside scope (B3)
+        const targetEmailRes = await tx.query<{ email: string }>(
+          `SELECT email FROM users WHERE user_id = $1::uuid`,
           [params.targetUserId],
         );
+        const targetEmail = targetEmailRes.rows[0]?.email?.trim().toLowerCase();
+        if (targetEmail) {
+          if (scopedWorkspaceId) {
+            await tx.query(
+              `UPDATE pa_invitations
+               SET status = 'revoked', revoked_at = now()
+               WHERE tenant_id = $1::uuid AND workspace_id = $2::uuid
+                 AND lower(email) = $3 AND status = 'pending'`,
+              [params.tenantId, scopedWorkspaceId, targetEmail],
+            );
+          } else {
+            await tx.query(
+              `UPDATE pa_invitations
+               SET status = 'revoked', revoked_at = now()
+               WHERE tenant_id = $1::uuid AND lower(email) = $2 AND status = 'pending'`,
+              [params.tenantId, targetEmail],
+            );
+          }
+        }
+
+        // Preserve sessions in other active tenants/workspaces (using per-membership revocation_epoch)
+        // and only bump global users.token_version when zero active memberships remain across all tenants.
+        const otherTenantRes = await tx.query<{ cnt: number }>(
+          `SELECT auth_count_other_active_tenant_memberships($1::uuid, $2::uuid) AS cnt`,
+          [params.targetUserId, params.tenantId],
+        );
+        const remainingInTenantRes = await tx.query<{ cnt: string | number }>(
+          `SELECT COUNT(*) AS cnt FROM memberships
+           WHERE tenant_id = $1::uuid AND user_id = $2::uuid AND status = 'active'`,
+          [params.tenantId, params.targetUserId],
+        );
+        const hasRemainingActiveMembership =
+          Number(otherTenantRes.rows[0]?.cnt ?? 0) > 0 ||
+          Number(remainingInTenantRes.rows[0]?.cnt ?? 0) > 0;
+        let newTokenVersion = 0;
+        if (!hasRemainingActiveMembership) {
+          const tvRes = await tx.query<{ token_version: number | null }>(
+            `SELECT auth_bump_user_token_version($1::uuid) AS token_version`,
+            [params.targetUserId],
+          );
+          newTokenVersion = tvRes.rows[0]?.token_version ?? 0;
+        } else {
+          const curTvRes = await tx.query<{ token_version: number }>(
+            `SELECT token_version FROM users WHERE user_id = $1::uuid`,
+            [params.targetUserId],
+          );
+          newTokenVersion = curTvRes.rows[0]?.token_version ?? 0;
+        }
 
         await this.appendAuditLogTx(tx, {
           tenantId: params.tenantId,
@@ -640,7 +698,7 @@ export class PlatformGovernanceService {
         });
 
         return {
-          newTokenVersion: tvRes.rows[0]?.token_version ?? 0,
+          newTokenVersion,
           updatedMemberships: upd.rowCount,
         };
       },
@@ -691,17 +749,33 @@ export class PlatformGovernanceService {
         );
       }
 
-      await tx.query(
+      const updTarget = await tx.query(
         `UPDATE memberships SET role = 'owner'
-         WHERE tenant_id = $1::uuid AND workspace_id = $2::uuid AND user_id = $3::uuid`,
+         WHERE tenant_id = $1::uuid AND workspace_id = $2::uuid AND user_id = $3::uuid AND status = 'active'`,
         [params.tenantId, params.workspaceId, params.newOwnerUserId],
       );
+      if (updTarget.rowCount !== 1) {
+        throw new GovernanceError(409, "TRANSFER_TARGET_CONFLICT", "Target owner membership could not be updated.");
+      }
 
       if (params.demoteCurrentOwnerTo) {
         await tx.query(
           `UPDATE memberships SET role = $4
            WHERE tenant_id = $1::uuid AND workspace_id = $2::uuid AND user_id = $3::uuid`,
           [params.tenantId, params.workspaceId, params.actor.userId, params.demoteCurrentOwnerTo],
+        );
+      }
+
+      const ownersAfter = await tx.query<{ cnt: string | number }>(
+        `SELECT COUNT(DISTINCT user_id) AS cnt FROM memberships
+         WHERE tenant_id = $1::uuid AND role = 'owner' AND status = 'active'`,
+        [params.tenantId],
+      );
+      if (Number(ownersAfter.rows[0]?.cnt ?? 0) < 1) {
+        throw new GovernanceError(
+          409,
+          "SOLE_OWNER_CANNOT_BE_REMOVED",
+          "Organization must retain at least one active owner after ownership transfer.",
         );
       }
 
@@ -736,6 +810,15 @@ export class PlatformGovernanceService {
     invitedRole: WorkspaceRole;
     expiresInSeconds?: number;
   }): Promise<{ invitation: InvitationRecord; rawToken: string }> {
+    const normalizedEmail = params.email.trim().toLowerCase();
+    if (!normalizedEmail || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalizedEmail)) {
+      throw new GovernanceError(400, "INVALID_INVITATION_EMAIL", "Invitation email address is invalid.");
+    }
+    const ttlSeconds = params.expiresInSeconds ?? 86_400;
+    if (!Number.isFinite(ttlSeconds) || ttlSeconds < 1 || ttlSeconds > 2_592_000) {
+      throw new GovernanceError(400, "INVALID_INVITATION_TTL", "Invitation expiry must be between 1 and 2592000 seconds.");
+    }
+
     const org = await this.getOrganization(params.tenantId);
     if (!org) throw new GovernanceError(404, "ORG_NOT_FOUND", "Organization not found.");
 
@@ -753,40 +836,79 @@ export class PlatformGovernanceService {
     const invitationId = randomUUID();
     const rawToken = `inv_${randomBytes(24).toString("base64url")}`;
     const tokenSha256 = sha256Hex(rawToken);
-    const expiresAt = new Date(Date.now() + (params.expiresInSeconds ?? 86_400) * 1000).toISOString();
+    const expiresAt = new Date(Date.now() + ttlSeconds * 1000).toISOString();
 
     const invitation = await withTenantTransaction(
       this.db,
       params.tenantId,
       async (tx) => {
-        const res = await tx.query<{
-          invitation_id: string;
-          tenant_id: string;
-          workspace_id: string;
-          email: string;
-          invited_role: WorkspaceRole;
-          invited_by: string;
-          token_sha256: string;
-          status: InvitationRecord["status"];
-          expires_at: Date | string;
-          created_at: Date | string;
-        }>(
-          `INSERT INTO pa_invitations (
-             tenant_id, invitation_id, workspace_id, email, invited_role,
-             invited_by, token_sha256, status, expires_at
-           ) VALUES ($1::uuid, $2::uuid, $3::uuid, $4, $5, $6::uuid, $7, 'pending', $8::timestamptz)
-           RETURNING invitation_id, tenant_id, workspace_id, email, invited_role, invited_by, token_sha256, status, expires_at, created_at`,
-          [
-            params.tenantId,
-            invitationId,
-            params.workspaceId,
-            params.email.trim().toLowerCase(),
-            params.invitedRole,
-            params.actor.userId,
-            tokenSha256,
-            expiresAt,
-          ],
+        // Retire expired pending invitations for this email before enforcing unique active pending invite
+        await tx.query(
+          `UPDATE pa_invitations
+           SET status = 'expired'
+           WHERE tenant_id = $1::uuid AND workspace_id = $2::uuid
+             AND lower(email) = $3 AND status = 'pending' AND expires_at <= now()`,
+          [params.tenantId, params.workspaceId, normalizedEmail],
         );
+
+        const existingPending = await tx.query<{ invitation_id: string }>(
+          `SELECT invitation_id FROM pa_invitations
+           WHERE tenant_id = $1::uuid AND workspace_id = $2::uuid
+             AND lower(email) = $3 AND status = 'pending'`,
+          [params.tenantId, params.workspaceId, normalizedEmail],
+        );
+        if (existingPending.rows.length > 0) {
+          throw new GovernanceError(
+            409,
+            "INVITATION_ALREADY_PENDING",
+            "An active pending invitation already exists for this email in this workspace.",
+          );
+        }
+
+        let res: Awaited<
+          ReturnType<
+            typeof tx.query<{
+              invitation_id: string;
+              tenant_id: string;
+              workspace_id: string;
+              email: string;
+              invited_role: WorkspaceRole;
+              invited_by: string;
+              token_sha256: string;
+              status: InvitationRecord["status"];
+              expires_at: Date | string;
+              created_at: Date | string;
+            }>
+          >
+        >;
+        try {
+          res = await tx.query(
+            `INSERT INTO pa_invitations (
+               tenant_id, invitation_id, workspace_id, email, invited_role,
+               invited_by, token_sha256, status, expires_at
+             ) VALUES ($1::uuid, $2::uuid, $3::uuid, $4, $5, $6::uuid, $7, 'pending', $8::timestamptz)
+             RETURNING invitation_id, tenant_id, workspace_id, email, invited_role, invited_by, token_sha256, status, expires_at, created_at`,
+            [
+              params.tenantId,
+              invitationId,
+              params.workspaceId,
+              normalizedEmail,
+              params.invitedRole,
+              params.actor.userId,
+              tokenSha256,
+              expiresAt,
+            ],
+          );
+        } catch (err) {
+          if ((err as { code?: string }).code === "23505") {
+            throw new GovernanceError(
+              409,
+              "INVITATION_ALREADY_PENDING",
+              "An active pending invitation already exists for this email in this workspace.",
+            );
+          }
+          throw err;
+        }
 
         // Audit NEVER logs rawToken — only invitationId and metadata (redaction enforced)
         await this.appendAuditLogTx(tx, {
@@ -799,8 +921,8 @@ export class PlatformGovernanceService {
           outcome: "success",
           targetType: "invitation",
           targetId: invitationId,
-          summary: `Invitation created for ${params.email.trim().toLowerCase()} as '${params.invitedRole}'.`,
-          metadata: { invitedRole: params.invitedRole, expiresAt, raw_invite_token: rawToken },
+          summary: `Invitation created for ${normalizedEmail} as '${params.invitedRole}'.`,
+          metadata: { invitedRole: params.invitedRole, expiresAt, raw_invite_token: "[REDACTED]" },
         });
 
         const r = res.rows[0]!;
@@ -890,6 +1012,9 @@ export class PlatformGovernanceService {
   }): Promise<{ workspaceId: string; role: WorkspaceRole; invitationId: string }> {
     const tokenHash = sha256Hex(params.rawToken);
     const nowIso = params.nowIso ?? new Date().toISOString();
+    if (!Number.isFinite(Date.parse(nowIso))) {
+      throw new GovernanceError(400, "INVALID_TIMESTAMP", "Invitation acceptance timestamp is invalid.");
+    }
 
     const txOutcome = await withTenantTransaction(
       this.db,
@@ -947,6 +1072,30 @@ export class PlatformGovernanceService {
           throw new GovernanceError(403, "INVITATION_EMAIL_MISMATCH", "Invitation email does not match authenticated user.");
         }
 
+        const orgRes = await tx.query<{ status: OrganizationStatus }>(
+          `SELECT status FROM organizations WHERE tenant_id = $1::uuid`,
+          [params.tenantId],
+        );
+        if (orgRes.rows[0]?.status !== "active") {
+          throw new GovernanceError(403, "ORGANIZATION_SUSPENDED", "Target organization is suspended.");
+        }
+
+        const userRes = await tx.query<{ email: string; status: string }>(
+          `SELECT email, status FROM users WHERE user_id = $1::uuid`,
+          [params.acceptingUserId],
+        );
+        const acceptingUser = userRes.rows[0];
+        if (!acceptingUser || acceptingUser.status !== "active") {
+          throw new GovernanceError(403, "USER_INACTIVE_OR_NOT_FOUND", "Accepting user account is inactive or missing.");
+        }
+        if (acceptingUser.email.trim().toLowerCase() !== inv.email.trim().toLowerCase()) {
+          throw new GovernanceError(
+            403,
+            "INVITATION_EMAIL_MISMATCH",
+            "Authenticated account email does not match invitation.",
+          );
+        }
+
         if (sub) {
           if (sub.status === "suspended" || sub.status === "canceled") {
             throw new GovernanceError(402, "SUBSCRIPTION_INACTIVE", "Tenant subscription is inactive.");
@@ -970,6 +1119,27 @@ export class PlatformGovernanceService {
                 `Tenant seat limit (${sub.seat_limit}) reached; cannot accept invitation.`,
               );
             }
+          }
+        }
+
+        const existingMemRes = await tx.query<{ role: string; status: string }>(
+          `SELECT role, status FROM memberships
+           WHERE tenant_id = $1::uuid AND workspace_id = $2::uuid AND user_id = $3::uuid`,
+          [params.tenantId, inv.workspace_id, params.acceptingUserId],
+        );
+        const existingMem = existingMemRes.rows[0];
+        if (existingMem?.role === "owner" && existingMem.status === "active" && inv.invited_role !== "owner") {
+          const otherOwners = await tx.query<{ cnt: string | number }>(
+            `SELECT COUNT(DISTINCT user_id) AS cnt FROM memberships
+             WHERE tenant_id = $1::uuid AND role = 'owner' AND status = 'active' AND user_id <> $2::uuid`,
+            [params.tenantId, params.acceptingUserId],
+          );
+          if (Number(otherOwners.rows[0]?.cnt ?? 0) === 0) {
+            throw new GovernanceError(
+              409,
+              "SOLE_OWNER_CANNOT_BE_REMOVED",
+              "Cannot demote the sole active owner of an organization via invitation.",
+            );
           }
         }
 
@@ -1239,7 +1409,20 @@ export class PlatformGovernanceService {
       [params.tenantId, params.idempotencyKey],
     );
     if (existingRes.rows[0]) {
-      return this.mapUsageReservationRow(existingRes.rows[0]);
+      const ex = existingRes.rows[0];
+      if (
+        ex.dimension !== params.dimension ||
+        ex.workspace_id !== params.workspaceId ||
+        Number(ex.reserved_units) !== params.requestedUnits ||
+        ex.period_key !== periodKey
+      ) {
+        throw new GovernanceError(
+          409,
+          "IDEMPOTENCY_CONFLICT",
+          `Idempotency key '${params.idempotencyKey}' was already used with different reservation parameters.`,
+        );
+      }
+      return this.mapUsageReservationRow(ex);
     }
 
     if (subRow.status === "suspended" || subRow.status === "canceled" || subRow.status === "past_due") {
@@ -1514,7 +1697,7 @@ export class PlatformGovernanceService {
         is_mock: boolean;
         created_at: Date | string;
       }>(
-        `SELECT * FROM pa_usage_ledger WHERE tenant_id = $1::uuid ORDER BY created_at DESC LIMIT $2 OFFSET $3`,
+        `SELECT * FROM pa_usage_ledger WHERE tenant_id = $1::uuid ORDER BY created_at DESC, ledger_id DESC LIMIT $2 OFFSET $3`,
         [tenantId, limit, offset],
       );
       return res.rows.map((r) => ({
@@ -1732,6 +1915,21 @@ export class PlatformGovernanceService {
     legalHold?: boolean;
     retentionUntil?: string;
   }): Promise<VersionedFileObject> {
+    if (
+      !Number.isInteger(params.version) ||
+      params.version < 1 ||
+      !Number.isSafeInteger(params.byteSize) ||
+      params.byteSize < 0 ||
+      !/^[0-9a-f]{64}$/i.test(params.sha256) ||
+      !params.storageKey ||
+      params.storageKey.length > 512 ||
+      params.storageKey.includes("..") ||
+      params.storageKey.includes("\\") ||
+      params.storageKey.startsWith("/")
+    ) {
+      throw new GovernanceError(400, "INVALID_FILE_METADATA", "Invalid version, size, checksum, or storageKey.");
+    }
+
     assertPolicyAllowed({
       actor: params.actor,
       resourceTenantId: params.actor.tenantId,
@@ -1741,6 +1939,8 @@ export class PlatformGovernanceService {
       source: "manual",
       classification: params.classification,
     });
+
+    const requestedQuarantineState: FileQuarantineState = params.quarantineState ?? "pending_scan";
 
     return withTenantTransaction(
       this.db,
@@ -1761,33 +1961,69 @@ export class PlatformGovernanceService {
           workspaceVisibility,
           classification: params.classification,
         });
+        if (requestedQuarantineState !== "pending_scan") {
+          assertPolicyAllowed({
+            actor: params.actor,
+            resourceTenantId: params.actor.tenantId,
+            resourceWorkspaceId: params.actor.workspaceId,
+            resource: "file",
+            action: "quarantine",
+            source: "manual",
+            workspaceVisibility,
+            classification: params.classification,
+          });
+        }
+        if (params.legalHold === true || (params.retentionUntil && params.retentionUntil.trim().length > 0)) {
+          assertPolicyAllowed({
+            actor: params.actor,
+            resourceTenantId: params.actor.tenantId,
+            resourceWorkspaceId: params.actor.workspaceId,
+            resource: "file",
+            action: "manage",
+            source: "manual",
+            workspaceVisibility,
+            classification: params.classification,
+          });
+        }
 
-        const res = await tx.query<{ created_at: Date | string }>(
-          `INSERT INTO pa_file_objects (
-             tenant_id, workspace_id, object_id, version, storage_key, filename,
-             mime_type, byte_size, sha256, classification, quarantine_state,
-             legal_hold, retention_until, created_by
-           ) VALUES (
-             $1::uuid, $2::uuid, $3, $4, $5, $6,
-             $7, $8, $9, $10, $11, $12, $13::timestamptz, $14::uuid
-           ) RETURNING created_at`,
-          [
-            params.actor.tenantId,
-            params.actor.workspaceId,
-            params.objectId,
-            params.version,
-            params.storageKey,
-            params.filename,
-            params.mimeType,
-            params.byteSize,
-            params.sha256,
-            params.classification,
-            params.quarantineState ?? "pending_scan",
-            params.legalHold ?? false,
-            params.retentionUntil ?? null,
-            params.actor.userId,
-          ],
-        );
+        let res: Awaited<ReturnType<typeof tx.query<{ created_at: Date | string }>>>;
+        try {
+          res = await tx.query<{ created_at: Date | string }>(
+            `INSERT INTO pa_file_objects (
+               tenant_id, workspace_id, object_id, version, storage_key, filename,
+               mime_type, byte_size, sha256, classification, quarantine_state,
+               legal_hold, retention_until, created_by
+             ) VALUES (
+               $1::uuid, $2::uuid, $3, $4, $5, $6,
+               $7, $8, $9, $10, $11, $12, $13::timestamptz, $14::uuid
+             ) RETURNING created_at`,
+            [
+              params.actor.tenantId,
+              params.actor.workspaceId,
+              params.objectId,
+              params.version,
+              params.storageKey,
+              params.filename,
+              params.mimeType,
+              params.byteSize,
+              params.sha256,
+              params.classification,
+              requestedQuarantineState,
+              params.legalHold ?? false,
+              params.retentionUntil ?? null,
+              params.actor.userId,
+            ],
+          );
+        } catch (err) {
+          if ((err as { code?: string }).code === "23505") {
+            throw new GovernanceError(
+              409,
+              "FILE_VERSION_EXISTS",
+              `File object '${params.objectId}' version ${params.version} already exists.`,
+            );
+          }
+          throw err;
+        }
 
         await this.appendAuditLogTx(tx, {
           tenantId: params.actor.tenantId,
@@ -1799,7 +2035,7 @@ export class PlatformGovernanceService {
           outcome: "success",
           targetType: "file",
           targetId: `${params.objectId}@v${params.version}`,
-          summary: `Registered file '${params.filename}' v${params.version} (${params.quarantineState ?? "pending_scan"}).`,
+          summary: `Registered file '${params.filename}' v${params.version} (${requestedQuarantineState}).`,
         });
 
         return {
@@ -2255,7 +2491,35 @@ export class PlatformGovernanceService {
           [params.actor.tenantId, params.actor.workspaceId, params.idempotencyKey],
         );
         if (existingRes.rows[0]) {
-          return { job: this.mapJobRow(existingRes.rows[0]), deduplicated: true };
+          const mapped = this.mapJobRow(existingRes.rows[0]);
+          if (
+            mapped.jobType !== params.jobType ||
+            mapped.workspaceId !== params.actor.workspaceId ||
+            JSON.stringify(mapped.payload) !== JSON.stringify(params.payload)
+          ) {
+            throw new GovernanceError(
+              409,
+              "IDEMPOTENCY_CONFLICT",
+              `Idempotency key '${params.idempotencyKey}' was already used with different job parameters.`,
+            );
+          }
+          return { job: mapped, deduplicated: true };
+        }
+
+        if (sub) {
+          const activeJobsRes = await tx.query<{ cnt: string | number }>(
+            `SELECT COUNT(*) AS cnt FROM pa_jobs
+             WHERE tenant_id = $1::uuid AND state IN ('queued', 'running')`,
+            [params.actor.tenantId],
+          );
+          const activeJobs = Number(activeJobsRes.rows[0]?.cnt ?? 0);
+          if (activeJobs >= sub.entitlements.maxConcurrentJobs) {
+            throw new GovernanceError(
+              402,
+              "QUOTA_EXCEEDED",
+              `Concurrent job limit (${sub.entitlements.maxConcurrentJobs}) reached for tenant.`,
+            );
+          }
         }
 
         let reservationId: string | undefined;
@@ -2680,10 +2944,12 @@ export class PlatformGovernanceService {
       offset?: number;
     },
   ): Promise<AuditEvent[]> {
+    const orgWideAudit = isOrgWideAuditRole(actor.role);
+    const effectiveWorkspaceId = orgWideAudit ? filter.workspaceId : (filter.workspaceId ?? actor.workspaceId);
     assertPolicyAllowed({
       actor,
       resourceTenantId: filter.tenantId,
-      ...(filter.workspaceId ? { resourceWorkspaceId: filter.workspaceId } : {}),
+      ...(effectiveWorkspaceId ? { resourceWorkspaceId: effectiveWorkspaceId } : {}),
       resource: "audit",
       action: "read",
       source: "manual",
@@ -2696,8 +2962,8 @@ export class PlatformGovernanceService {
       async (tx) => {
         const clauses = ["tenant_id = $1::uuid"];
         const params: unknown[] = [filter.tenantId];
-        if (filter.workspaceId) {
-          params.push(filter.workspaceId);
+        if (effectiveWorkspaceId) {
+          params.push(effectiveWorkspaceId);
           clauses.push(`workspace_id = $${params.length}::uuid`);
         }
         if (filter.actorId) {
@@ -2734,7 +3000,7 @@ export class PlatformGovernanceService {
                   action, outcome, target_id, summary, metadata, created_at
            FROM audit_logs
            WHERE ${clauses.join(" AND ")}
-           ORDER BY created_at DESC
+           ORDER BY created_at DESC, audit_id DESC
            LIMIT $${limitIdx} OFFSET $${offsetIdx}`,
           params,
         );
@@ -2871,7 +3137,7 @@ export async function exportPaExtendedLogicalBackup(
 export async function restorePaExtendedLogicalBackup(
   targetDb: PgDatabaseAdapter,
   snapshot: PaExtendedLogicalBackupSnapshot,
-  options: { simulateFailureBeforeCommit?: boolean } = {},
+  options: { simulateFailureBeforeCommit?: boolean; allowNonEmptyMerge?: boolean } = {},
 ): Promise<void> {
   if (!snapshot || typeof snapshot !== "object" || !snapshot.coreAndXi || !snapshot.paTables) {
     throw new Error("INVALID_BACKUP_SNAPSHOT: Extended PA snapshot must contain coreAndXi and paTables.");
@@ -2887,11 +3153,15 @@ export async function restorePaExtendedLogicalBackup(
   if (!snapshot.coreAndXi.integritySha256 || !snapshot.extendedIntegritySha256) {
     throw new Error("BACKUP_INTEGRITY_MISMATCH: Extended PA logical backup SHA-256 digest is missing.");
   }
+  const providedExtHex = String(snapshot.extendedIntegritySha256).trim().toLowerCase();
+  if (!/^[0-9a-f]{64}$/.test(providedExtHex)) {
+    throw new Error("BACKUP_INTEGRITY_MISMATCH: Extended PA logical backup SHA-256 digest is malformed.");
+  }
   const actualExtendedHash = computePaExtendedIntegritySha256(
     snapshot.coreAndXi.integritySha256,
     snapshot.paTables,
   );
-  if (actualExtendedHash !== snapshot.extendedIntegritySha256) {
+  if (!timingSafeEqual(Buffer.from(actualExtendedHash, "hex"), Buffer.from(providedExtHex, "hex"))) {
     throw new Error(
       "BACKUP_INTEGRITY_MISMATCH: Extended PA logical backup SHA-256 digest does not match payload.",
     );
@@ -2900,6 +3170,17 @@ export async function restorePaExtendedLogicalBackup(
   const toJson = (v: unknown) => (v == null ? null : typeof v === "string" ? v : JSON.stringify(v));
 
   await targetDb.withTransaction(async (tx) => {
+    await assertBackupRoleCanBypassRls(tx);
+    if (!options.allowNonEmptyMerge) {
+      const nonEmptyRes = await tx.query<{ non_empty: boolean }>(
+        `SELECT (EXISTS (SELECT 1 FROM organizations) OR EXISTS (SELECT 1 FROM pa_plan_versions)) AS non_empty`,
+      );
+      if (nonEmptyRes.rows[0]?.non_empty) {
+        throw new Error(
+          "RESTORE_REQUIRES_EMPTY_DB: Target database is non-empty; pass allowNonEmptyMerge=true to merge idempotently.",
+        );
+      }
+    }
     await restoreCoreAndXiInTx(tx, snapshot.coreAndXi, { idempotent: true });
 
     for (const r of snapshot.paTables.paPlanVersions) {

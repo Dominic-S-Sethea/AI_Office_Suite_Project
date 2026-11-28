@@ -447,6 +447,11 @@ describe("V1.4 Aligned Integrated Golden Vertical Slice — Cross-Cutting Govern
           byteSize: put.byteSize,
           sha256: put.sha256,
           classification: "confidential",
+        });
+        await gov.updateFileQuarantineState({
+          actor: OWNER_A,
+          objectId: String(p.packageId),
+          version: 1,
           quarantineState: "clean",
         });
         return {
@@ -530,6 +535,7 @@ describe("V1.4 Aligned Integrated Golden Vertical Slice — Cross-Cutting Govern
         },
       ],
     });
+    expect(runRes.run.steps[0]?.error).toBeUndefined();
     expect(runRes.run.state).toBe("completed");
     expect(runRes.run.steps[0]?.verification?.verified).toBe(true);
 

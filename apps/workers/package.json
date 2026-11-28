@@ -1,0 +1,22 @@
+{
+  "name": "@ai-office-suite/workers",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "start": "node src/workerServer.ts"
+  },
+  "dependencies": {
+    "@ai-office-suite/shared-contracts": "*",
+    "@ai-office-suite/validation": "*",
+    "@ai-office-suite/document-engine": "*",
+    "@ai-office-suite/file-conversion": "*",
+    "@ai-office-suite/calculation-engine": "*",
+    "@ai-office-suite/presentation-engine": "*",
+    "@ai-office-suite/data-processing": "*"
+  }
+}

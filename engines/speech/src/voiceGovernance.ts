@@ -50,6 +50,8 @@ export interface ProcessVoiceUtteranceInput {
   durationMs: number;
   simulatedTranscript?: string;
   fixtureId?: string;
+  audioBase64?: string;
+  mimeType?: string;
   overrideConfidence?: number;
   targetResource?: PolicyResourceType;
   targetAction?: PolicyAction;
@@ -117,6 +119,20 @@ export class VoiceGovernancePipeline {
   }
 
   async processUtterance(input: ProcessVoiceUtteranceInput): Promise<ProcessVoiceUtteranceResult> {
+    if (!Number.isFinite(input.durationMs) || input.durationMs < 0) {
+      throw new SpeechProviderError(
+        400,
+        "INVALID_AUDIO_DURATION",
+        `Invalid audio clip duration '${input.durationMs}'. Duration must be a non-negative finite number.`,
+      );
+    }
+    if (input.policy.tenantId !== input.actor.tenantId) {
+      throw new SpeechProviderError(
+        403,
+        "TENANT_POLICY_MISMATCH",
+        `VoicePolicyConfig tenant '${input.policy.tenantId}' does not match actor tenant '${input.actor.tenantId}'.`,
+      );
+    }
     const durationSec = Math.max(1, Math.ceil(input.durationMs / 1000));
 
     // 1. Voice policy checks (language, provider, max clip duration)
@@ -224,6 +240,8 @@ export class VoiceGovernancePipeline {
         durationMs: input.durationMs,
         ...(input.simulatedTranscript !== undefined ? { simulatedTranscript: input.simulatedTranscript } : {}),
         ...(input.fixtureId !== undefined ? { fixtureId: input.fixtureId } : {}),
+        ...(input.audioBase64 !== undefined ? { audioBase64: input.audioBase64 } : {}),
+        ...(input.mimeType !== undefined ? { mimeType: input.mimeType } : {}),
       });
 
       const confidence = input.overrideConfidence ?? asr.confidence;
@@ -437,10 +455,39 @@ export class VoiceGovernancePipeline {
     actor: ActorContext;
     sessionId: string;
     editedTranscript?: string;
+    policy?: VoicePolicyConfig;
     eventId: string;
     eventSeq: number;
   }): { session: VoiceSessionRecord; effectiveCommand: string } {
     this.sessions.assertSessionActorAccess(params.sessionId, params.actor);
+    const initial = this.sessions.getSession(params.sessionId);
+    if (!initial) {
+      throw new SpeechProviderError(404, "VOICE_SESSION_NOT_FOUND", "Voice session not found.");
+    }
+    assertPolicyAllowed({
+      actor: params.actor,
+      resourceTenantId: params.actor.tenantId,
+      resourceWorkspaceId: params.actor.workspaceId,
+      resource: "speech",
+      action: "transcribe",
+      source: "voice_command",
+    });
+    if (params.policy) {
+      if (params.policy.tenantId !== params.actor.tenantId) {
+        throw new SpeechProviderError(
+          403,
+          "TENANT_POLICY_MISMATCH",
+          `VoicePolicyConfig tenant '${params.policy.tenantId}' does not match actor tenant '${params.actor.tenantId}'.`,
+        );
+      }
+      if (!params.policy.allowedLanguages.includes(initial.language)) {
+        throw new SpeechProviderError(
+          403,
+          "VOICE_LANGUAGE_NOT_ALLOWED",
+          `Language '${initial.language}' is disabled by tenant voice policy.`,
+        );
+      }
+    }
     if (params.editedTranscript !== undefined) {
       this.sessions.editTranscriptDuringReview(params.sessionId, params.editedTranscript);
     }
@@ -449,6 +496,13 @@ export class VoiceGovernancePipeline {
       throw new SpeechProviderError(404, "VOICE_SESSION_NOT_FOUND", "Voice session not found.");
     }
     const effective = (current.editedTranscript ?? current.normalizedTranscript ?? "").trim();
+    if (isSilenceOrNoiseUtterance(effective)) {
+      throw new SpeechProviderError(
+        400,
+        "VOICE_SILENCE_OR_NOISE",
+        "Confirmed transcript contains only silence or filler noise.",
+      );
+    }
     const scan = scanForPromptInjection(effective);
     if (!scan.safe) {
       throw new SpeechProviderError(

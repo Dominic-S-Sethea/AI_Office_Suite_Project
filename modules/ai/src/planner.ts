@@ -50,24 +50,46 @@ function resolveProposalHmacKey(): string {
   return EPHEMERAL_PROPOSAL_HMAC_KEY;
 }
 
+function canonicalizeJson(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map((item) => canonicalizeJson(item));
+  }
+  if (value !== null && typeof value === "object") {
+    const sorted: Record<string, unknown> = {};
+    for (const k of Object.keys(value as Record<string, unknown>).sort()) {
+      const v = (value as Record<string, unknown>)[k];
+      if (v !== undefined) {
+        sorted[k] = canonicalizeJson(v);
+      }
+    }
+    return sorted;
+  }
+  return value;
+}
+
 function canonicalProposalSignPayload(actor: ActorContext, proposal: DocumentOperationProposal): string {
-  return JSON.stringify({
-    tenantId: actor.tenantId,
-    workspaceId: actor.workspaceId,
-    userId: actor.userId,
-    operationId: proposal.operationId,
-    documentId: proposal.documentId,
-    expectedRevision: proposal.expectedRevision,
-    selection: proposal.selection ?? null,
-    action: proposal.action,
-    params: proposal.params,
-    requestedBy: proposal.requestedBy,
-    requiresApproval: proposal.requiresApproval,
-    source: proposal.source,
-    inputLanguage: proposal.inputLanguage,
-    outputLanguage: proposal.outputLanguage,
-    createdAt: proposal.createdAt,
-  });
+  return JSON.stringify(
+    canonicalizeJson({
+      tenantId: actor.tenantId,
+      workspaceId: actor.workspaceId,
+      userId: actor.userId,
+      operationId: proposal.operationId,
+      documentId: proposal.documentId,
+      expectedRevision: proposal.expectedRevision,
+      selection: proposal.selection ?? null,
+      action: proposal.action,
+      params: proposal.params,
+      requestedBy: proposal.requestedBy,
+      riskLevel: proposal.riskLevel,
+      requiresApproval: proposal.requiresApproval,
+      source: proposal.source,
+      inputLanguage: proposal.inputLanguage,
+      outputLanguage: proposal.outputLanguage,
+      originalCommand: proposal.originalCommand,
+      previewDiff: proposal.previewDiff ?? null,
+      createdAt: proposal.createdAt,
+    }),
+  );
 }
 
 export function signDocumentProposal(actor: ActorContext, proposal: DocumentOperationProposal): string {
@@ -142,7 +164,7 @@ const DEMO_TRANSLATION_MAP: ReadonlyArray<{ en: string; km: string }> = [
 ];
 
 function extractQuotedText(command: string): string | null {
-  const match = command.match(/["“«](.+?)["”»]/);
+  const match = command.match(/["“«]([\s\S]+?)["”»]/);
   return match?.[1]?.trim() || null;
 }
 

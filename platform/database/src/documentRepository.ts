@@ -3,11 +3,18 @@ import type {
   ActorContext,
   AuditEvent,
   DocumentVersion,
+  PolicyAction,
+  PolicyDecisionRequest,
+  PolicyResourceType,
   StudioDocument,
   WorkspaceRole,
 } from "@ai-office-suite/shared-contracts";
 import { redactAuditEvent, redactAuditString } from "@ai-office-suite/audit";
-import { assertCanPerform, assertTenantWorkspaceAccess, isWorkspaceRole } from "@ai-office-suite/authorization";
+import {
+  assertPolicyAllowed,
+  assertTenantWorkspaceAccess,
+  isWorkspaceRole,
+} from "@ai-office-suite/authorization";
 import type { PgDatabaseAdapter, PgQueryExecutor } from "./adapter.ts";
 import { withTenantTransaction } from "./schema.ts";
 
@@ -41,6 +48,13 @@ function assertValidDocumentUuid(documentId: string): void {
   if (!UUID_PATTERN.test(documentId)) {
     throw new DatabaseConflictError(404, "DOCUMENT_NOT_FOUND", `Document '${documentId}' not found.`);
   }
+}
+
+function toPolicySource(source?: AuditEvent["source"]): PolicyDecisionRequest["source"] {
+  if (source === "typed_ai" || source === "voice_command" || source === "system") {
+    return source;
+  }
+  return "manual";
 }
 
 export class PostgreSqlDocumentRepository {
@@ -95,13 +109,43 @@ export class PostgreSqlDocumentRepository {
     );
   }
 
+  private async enforceWorkspacePolicyTx(
+    tx: PgQueryExecutor,
+    actor: ActorContext,
+    resource: PolicyResourceType,
+    action: PolicyAction,
+    source: AuditEvent["source"] = "manual",
+  ): Promise<void> {
+    const wsRes = await tx.query<{ visibility: "standard" | "restricted" }>(
+      `SELECT visibility FROM workspaces WHERE tenant_id = $1::uuid AND workspace_id = $2::uuid`,
+      [actor.tenantId, actor.workspaceId],
+    );
+    const workspaceVisibility = wsRes.rows[0]?.visibility ?? actor.workspaceVisibility;
+    assertPolicyAllowed({
+      actor,
+      resourceTenantId: actor.tenantId,
+      resourceWorkspaceId: actor.workspaceId,
+      resource,
+      action,
+      source: toPolicySource(source),
+      ...(workspaceVisibility ? { workspaceVisibility } : {}),
+    });
+  }
+
   async createDocument(
     actor: ActorContext,
     doc: StudioDocument,
     auditOpts?: { source?: AuditEvent["source"]; action?: string; summary?: string },
   ): Promise<StudioDocument> {
-    assertCanPerform(actor, "document", "create");
-    assertTenantWorkspaceAccess(actor, doc.tenantId, doc.workspaceId);
+    assertPolicyAllowed({
+      actor,
+      resourceTenantId: doc.tenantId,
+      resourceWorkspaceId: doc.workspaceId,
+      resource: "document",
+      action: "create",
+      source: toPolicySource(auditOpts?.source),
+      ...(actor.workspaceVisibility ? { workspaceVisibility: actor.workspaceVisibility } : {}),
+    });
     assertValidDocumentUuid(doc.documentId);
 
     const source = auditOpts?.source ?? "manual";
@@ -111,6 +155,7 @@ export class PostgreSqlDocumentRepository {
       this.db,
       actor.tenantId,
       async (tx) => {
+        await this.enforceWorkspacePolicyTx(tx, actor, "document", "create", source);
         await tx.query(
           `INSERT INTO documents (
              tenant_id, workspace_id, document_id, title, language, current_revision, status, created_by, created_at, updated_at
@@ -174,7 +219,15 @@ export class PostgreSqlDocumentRepository {
     actor: ActorContext,
     filter: { q?: string; language?: "en" | "km" | "bilingual"; limit?: number; offset?: number } = {},
   ): Promise<{ documents: StudioDocument[]; total: number; limit: number; offset: number }> {
-    assertCanPerform(actor, "document", "read");
+    assertPolicyAllowed({
+      actor,
+      resourceTenantId: actor.tenantId,
+      resourceWorkspaceId: actor.workspaceId,
+      resource: "document",
+      action: "read",
+      source: "manual",
+      ...(actor.workspaceVisibility ? { workspaceVisibility: actor.workspaceVisibility } : {}),
+    });
     const limit = Math.max(1, Math.min(100, Math.trunc(filter.limit ?? 50)));
     const offset = Math.max(0, Math.trunc(filter.offset ?? 0));
     const qTrim = filter.q?.trim();
@@ -198,6 +251,7 @@ export class PostgreSqlDocumentRepository {
           conditions.push(`d.title ILIKE $${params.length} ESCAPE '\\'`);
         }
 
+        await this.enforceWorkspacePolicyTx(tx, actor, "document", "read", "manual");
         const whereSql = conditions.join(" AND ");
         const pageParams = [...params, limit, offset];
         // Single-query pagination using COUNT(*) OVER() (M6)
@@ -207,7 +261,7 @@ export class PostgreSqlDocumentRepository {
            JOIN document_versions v
              ON v.tenant_id = d.tenant_id AND v.document_id = d.document_id AND v.revision = d.current_revision
            WHERE ${whereSql}
-           ORDER BY d.updated_at DESC
+           ORDER BY d.updated_at DESC, d.document_id ASC
            LIMIT $${pageParams.length - 1} OFFSET $${pageParams.length}`,
           pageParams,
         );
@@ -233,12 +287,21 @@ export class PostgreSqlDocumentRepository {
   }
 
   async getDocument(actor: ActorContext, documentId: string): Promise<StudioDocument> {
-    assertCanPerform(actor, "document", "read");
+    assertPolicyAllowed({
+      actor,
+      resourceTenantId: actor.tenantId,
+      resourceWorkspaceId: actor.workspaceId,
+      resource: "document",
+      action: "read",
+      source: "manual",
+      ...(actor.workspaceVisibility ? { workspaceVisibility: actor.workspaceVisibility } : {}),
+    });
     assertValidDocumentUuid(documentId);
     return withTenantTransaction(
       this.db,
       actor.tenantId,
       async (tx) => {
+        await this.enforceWorkspacePolicyTx(tx, actor, "document", "read", "manual");
         const res = await tx.query<{ snapshot_json: StudioDocument | string; workspace_id: string }>(
           `SELECT d.workspace_id::text, v.snapshot_json
            FROM documents d
@@ -257,19 +320,28 @@ export class PostgreSqlDocumentRepository {
     );
   }
 
-  async listVersions(
+  async listVersionsPage(
     actor: ActorContext,
     documentId: string,
-    options?: { limit?: number; offset?: number },
-  ): Promise<DocumentVersion[]> {
-    assertCanPerform(actor, "document", "read");
+    options?: { limit?: number; offset?: number; order?: "asc" | "desc" },
+  ): Promise<{ versions: DocumentVersion[]; total: number; hasMore: boolean }> {
+    assertPolicyAllowed({
+      actor,
+      resourceTenantId: actor.tenantId,
+      resourceWorkspaceId: actor.workspaceId,
+      resource: "document",
+      action: "read",
+      source: "manual",
+      ...(actor.workspaceVisibility ? { workspaceVisibility: actor.workspaceVisibility } : {}),
+    });
     assertValidDocumentUuid(documentId);
     const { limit, offset } = clampListPagination(options);
+    const sortDir = options?.order === "desc" ? "DESC" : "ASC";
     return withTenantTransaction(
       this.db,
       actor.tenantId,
       async (tx) => {
-        // Bounded pagination with workspace verification (H8, M6, F-06)
+        await this.enforceWorkspacePolicyTx(tx, actor, "document", "read", "manual");
         const verRes = await tx.query<{
           revision: number;
           restored_from_revision: number | null;
@@ -278,13 +350,15 @@ export class PostgreSqlDocumentRepository {
           snapshot_json: StudioDocument | string;
           created_by: string;
           created_at: Date | string;
+          total_count: string;
         }>(
-          `SELECT v.revision, v.restored_from_revision, v.source, v.summary, v.snapshot_json, v.created_by::text, v.created_at
+          `SELECT v.revision, v.restored_from_revision, v.source, v.summary, v.snapshot_json,
+                  v.created_by::text, v.created_at, COUNT(*) OVER()::text AS total_count
            FROM documents d
            JOIN document_versions v
              ON v.tenant_id = d.tenant_id AND v.document_id = d.document_id
            WHERE d.document_id = $1::uuid AND d.workspace_id = $2::uuid
-           ORDER BY v.revision ASC
+           ORDER BY v.revision ${sortDir}
            LIMIT $3 OFFSET $4`,
           [documentId, actor.workspaceId, limit, offset],
         );
@@ -298,9 +372,18 @@ export class PostgreSqlDocumentRepository {
           if (existsRes.rows.length === 0) {
             throw new DatabaseConflictError(404, "DOCUMENT_NOT_FOUND", `Document '${documentId}' not found.`);
           }
-          return [];
+          let total = 0;
+          if (offset > 0) {
+            const countRes = await tx.query<{ total: string }>(
+              `SELECT COUNT(*)::text AS total FROM document_versions WHERE tenant_id = $1::uuid AND document_id = $2::uuid`,
+              [actor.tenantId, documentId],
+            );
+            total = Number(countRes.rows[0]?.total ?? 0);
+          }
+          return { versions: [], total, hasMore: false };
         }
-        return verRes.rows.map((r) => {
+        const total = Number(verRes.rows[0]!.total_count);
+        const versions = verRes.rows.map((r) => {
           const fallbackSummary =
             r.restored_from_revision !== null
               ? `Restored revision ${r.restored_from_revision} as revision ${r.revision}`
@@ -320,23 +403,43 @@ export class PostgreSqlDocumentRepository {
             createdAt: r.created_at instanceof Date ? r.created_at.toISOString() : String(r.created_at),
           };
         });
+        return { versions, total, hasMore: offset + versions.length < total };
       },
       actor.workspaceId,
     );
   }
 
+  async listVersions(
+    actor: ActorContext,
+    documentId: string,
+    options?: { limit?: number; offset?: number; order?: "asc" | "desc" },
+  ): Promise<DocumentVersion[]> {
+    const page = await this.listVersionsPage(actor, documentId, options);
+    return page.versions;
+  }
+
   async listVersionMetadata(
     actor: ActorContext,
     documentId: string,
-    options?: { limit?: number; offset?: number },
+    options?: { limit?: number; offset?: number; order?: "asc" | "desc" },
   ): Promise<Array<Omit<DocumentVersion, "snapshot">>> {
-    assertCanPerform(actor, "document", "read");
+    assertPolicyAllowed({
+      actor,
+      resourceTenantId: actor.tenantId,
+      resourceWorkspaceId: actor.workspaceId,
+      resource: "document",
+      action: "read",
+      source: "manual",
+      ...(actor.workspaceVisibility ? { workspaceVisibility: actor.workspaceVisibility } : {}),
+    });
     assertValidDocumentUuid(documentId);
     const { limit, offset } = clampListPagination(options);
+    const sortDir = options?.order === "desc" ? "DESC" : "ASC";
     return withTenantTransaction(
       this.db,
       actor.tenantId,
       async (tx) => {
+        await this.enforceWorkspacePolicyTx(tx, actor, "document", "read", "manual");
         const verRes = await tx.query<{
           revision: number;
           restored_from_revision: number | null;
@@ -350,7 +453,7 @@ export class PostgreSqlDocumentRepository {
            JOIN document_versions v
              ON v.tenant_id = d.tenant_id AND v.document_id = d.document_id
            WHERE d.document_id = $1::uuid AND d.workspace_id = $2::uuid
-           ORDER BY v.revision ASC
+           ORDER BY v.revision ${sortDir}
            LIMIT $3 OFFSET $4`,
           [documentId, actor.workspaceId, limit, offset],
         );
@@ -391,12 +494,21 @@ export class PostgreSqlDocumentRepository {
   }
 
   async getUndoTargetSnapshot(actor: ActorContext, documentId: string): Promise<StudioDocument | null> {
-    assertCanPerform(actor, "document", "read");
+    assertPolicyAllowed({
+      actor,
+      resourceTenantId: actor.tenantId,
+      resourceWorkspaceId: actor.workspaceId,
+      resource: "document",
+      action: "read",
+      source: "manual",
+      ...(actor.workspaceVisibility ? { workspaceVisibility: actor.workspaceVisibility } : {}),
+    });
     assertValidDocumentUuid(documentId);
     return withTenantTransaction(
       this.db,
       actor.tenantId,
       async (tx) => {
+        await this.enforceWorkspacePolicyTx(tx, actor, "document", "read", "manual");
         const curRes = await tx.query<{
           current_revision: number;
           restored_from_revision: number | null;
@@ -438,12 +550,21 @@ export class PostgreSqlDocumentRepository {
   }
 
   async getVersion(actor: ActorContext, documentId: string, revision: number): Promise<DocumentVersion | null> {
-    assertCanPerform(actor, "document", "read");
+    assertPolicyAllowed({
+      actor,
+      resourceTenantId: actor.tenantId,
+      resourceWorkspaceId: actor.workspaceId,
+      resource: "document",
+      action: "read",
+      source: "manual",
+      ...(actor.workspaceVisibility ? { workspaceVisibility: actor.workspaceVisibility } : {}),
+    });
     assertValidDocumentUuid(documentId);
     return withTenantTransaction(
       this.db,
       actor.tenantId,
       async (tx) => {
+        await this.enforceWorkspacePolicyTx(tx, actor, "document", "read", "manual");
         // Single LEFT JOIN distinguishes missing document (404) from missing revision (null) (M6)
         const res = await tx.query<{
           doc_exists: string;
@@ -501,12 +622,21 @@ export class PostgreSqlDocumentRepository {
     fromRevision: number,
     toRevision: number,
   ): Promise<{ fromDoc: StudioDocument | null; toDoc: StudioDocument | null }> {
-    assertCanPerform(actor, "document", "read");
+    assertPolicyAllowed({
+      actor,
+      resourceTenantId: actor.tenantId,
+      resourceWorkspaceId: actor.workspaceId,
+      resource: "document",
+      action: "read",
+      source: "manual",
+      ...(actor.workspaceVisibility ? { workspaceVisibility: actor.workspaceVisibility } : {}),
+    });
     assertValidDocumentUuid(documentId);
     return withTenantTransaction(
       this.db,
       actor.tenantId,
       async (tx) => {
+        await this.enforceWorkspacePolicyTx(tx, actor, "document", "read", "manual");
         const res = await tx.query<{
           revision: number | null;
           snapshot_json: StudioDocument | string | null;
@@ -540,12 +670,21 @@ export class PostgreSqlDocumentRepository {
     targetRevision: number,
     options?: { expectedRevision?: number },
   ): Promise<StudioDocument> {
-    assertCanPerform(actor, "document", "restore");
+    assertPolicyAllowed({
+      actor,
+      resourceTenantId: actor.tenantId,
+      resourceWorkspaceId: actor.workspaceId,
+      resource: "document",
+      action: "restore",
+      source: "manual",
+      ...(actor.workspaceVisibility ? { workspaceVisibility: actor.workspaceVisibility } : {}),
+    });
     assertValidDocumentUuid(documentId);
     return withTenantTransaction(
       this.db,
       actor.tenantId,
       async (tx) => {
+        await this.enforceWorkspacePolicyTx(tx, actor, "document", "restore", "restore");
         const curRes = await tx.query<{ workspace_id: string; current_revision: number }>(
           `SELECT workspace_id::text, current_revision
            FROM documents
@@ -651,81 +790,101 @@ export class PostgreSqlDocumentRepository {
     );
   }
 
-  async listAuditEvents(
+  async listAuditEventsPage(
     actor: ActorContext,
     documentId: string,
     options?: { limit?: number; offset?: number },
-  ): Promise<AuditEvent[]> {
-    assertCanPerform(actor, "audit", "read");
+  ): Promise<{ events: AuditEvent[]; total: number; hasMore: boolean }> {
+    assertPolicyAllowed({
+      actor,
+      resourceTenantId: actor.tenantId,
+      resourceWorkspaceId: actor.workspaceId,
+      resource: "audit",
+      action: "read",
+      source: "manual",
+      ...(actor.workspaceVisibility ? { workspaceVisibility: actor.workspaceVisibility } : {}),
+    });
     assertValidDocumentUuid(documentId);
     const { limit, offset } = clampListPagination(options);
     return withTenantTransaction(
       this.db,
       actor.tenantId,
       async (tx) => {
-        // Bounded query verifying document existence and loading audit rows (M6, F-06)
+        await this.enforceWorkspacePolicyTx(tx, actor, "audit", "read", "manual");
+        const existsRes = await tx.query<{ document_id: string }>(
+          `SELECT document_id::text
+           FROM documents
+           WHERE document_id = $1::uuid AND workspace_id = $2::uuid`,
+          [documentId, actor.workspaceId],
+        );
+        if (existsRes.rows.length === 0) {
+          throw new DatabaseConflictError(404, "DOCUMENT_NOT_FOUND", `Document '${documentId}' not found.`);
+        }
         const res = await tx.query<{
-          audit_id: string | null;
-          tenant_id: string | null;
+          audit_id: string;
+          tenant_id: string;
           workspace_id: string | null;
-          actor_id: string | null;
-          actor_role: string | null;
-          source: string | null;
-          action: string | null;
-          outcome: "success" | "denied" | "failed" | null;
+          actor_id: string;
+          actor_role: string;
+          source: string;
+          action: string;
+          outcome: "success" | "denied" | "failed";
           target_id: string | null;
           revision_before: number | null;
           revision_after: number | null;
-          summary: string | null;
+          summary: string;
           metadata: Record<string, unknown> | string | null;
-          created_at: Date | string | null;
+          created_at: Date | string;
+          total_count: string;
         }>(
           `SELECT a.audit_id::text, a.tenant_id::text, a.workspace_id::text, a.actor_id::text, a.actor_role,
                   a.source, a.action, a.outcome, a.target_id, a.revision_before, a.revision_after,
-                  a.summary, a.metadata, a.created_at
-           FROM documents d
-           LEFT JOIN audit_logs a
-             ON a.tenant_id = d.tenant_id AND a.workspace_id = d.workspace_id AND a.target_id = d.document_id::text
-           WHERE d.document_id = $1::uuid AND d.workspace_id = $2::uuid
-           ORDER BY a.created_at DESC NULLS LAST
-           LIMIT $3 OFFSET $4`,
-          [documentId, actor.workspaceId, limit, offset],
+                  a.summary, a.metadata, a.created_at, COUNT(*) OVER()::text AS total_count
+           FROM audit_logs a
+           WHERE a.tenant_id = $1::uuid AND a.workspace_id = $2::uuid AND a.target_id = $3
+           ORDER BY a.created_at DESC, a.audit_id DESC
+           LIMIT $4 OFFSET $5`,
+          [actor.tenantId, actor.workspaceId, documentId, limit, offset],
         );
-        if (res.rows.length === 0) {
-          const existsRes = await tx.query<{ document_id: string }>(
-            `SELECT document_id::text
-             FROM documents
-             WHERE document_id = $1::uuid AND workspace_id = $2::uuid`,
-            [documentId, actor.workspaceId],
+        let total = res.rows.length > 0 ? Number(res.rows[0]!.total_count) : 0;
+        if (res.rows.length === 0 && offset > 0) {
+          const countRes = await tx.query<{ total: string }>(
+            `SELECT COUNT(*)::text AS total FROM audit_logs WHERE tenant_id = $1::uuid AND workspace_id = $2::uuid AND target_id = $3`,
+            [actor.tenantId, actor.workspaceId, documentId],
           );
-          if (existsRes.rows.length === 0) {
-            throw new DatabaseConflictError(404, "DOCUMENT_NOT_FOUND", `Document '${documentId}' not found.`);
-          }
-          return [];
+          total = Number(countRes.rows[0]?.total ?? 0);
         }
-        return res.rows
-          .filter((r): r is typeof r & { audit_id: string; tenant_id: string; actor_id: string; action: string; outcome: "success" | "denied" | "failed"; summary: string } => r.audit_id !== null)
-          .map((r) => ({
-            auditId: r.audit_id,
-            tenantId: r.tenant_id,
-            workspaceId: r.workspace_id ?? actor.workspaceId,
-            documentId: r.target_id ?? documentId,
-            actorId: r.actor_id,
-            actorRole: (r.actor_role && isWorkspaceRole(r.actor_role) ? r.actor_role : "viewer") as WorkspaceRole,
-            source: (r.source ?? "system") as AuditEvent["source"],
-            action: r.action,
-            outcome: r.outcome,
-            ...(r.revision_before !== null ? { revisionBefore: r.revision_before } : {}),
-            ...(r.revision_after !== null ? { revisionAfter: r.revision_after } : {}),
-            summary: r.summary,
-            ...(r.metadata
-              ? { metadata: typeof r.metadata === "string" ? (JSON.parse(r.metadata) as Record<string, unknown>) : r.metadata }
-              : {}),
-            createdAt: r.created_at instanceof Date ? r.created_at.toISOString() : String(r.created_at),
-          }));
+        const events = res.rows.map((r) => ({
+          auditId: r.audit_id,
+          tenantId: r.tenant_id,
+          workspaceId: r.workspace_id ?? actor.workspaceId,
+          documentId: r.target_id ?? documentId,
+          actorId: r.actor_id,
+          actorRole: (r.actor_role && isWorkspaceRole(r.actor_role) ? r.actor_role : "viewer") as WorkspaceRole,
+          source: (r.source ?? "system") as AuditEvent["source"],
+          action: r.action,
+          outcome: r.outcome,
+          ...(r.revision_before !== null ? { revisionBefore: r.revision_before } : {}),
+          ...(r.revision_after !== null ? { revisionAfter: r.revision_after } : {}),
+          summary: r.summary,
+          ...(r.metadata
+            ? { metadata: typeof r.metadata === "string" ? (JSON.parse(r.metadata) as Record<string, unknown>) : r.metadata }
+            : {}),
+          createdAt: r.created_at instanceof Date ? r.created_at.toISOString() : String(r.created_at),
+        }));
+        return { events, total, hasMore: offset + events.length < total };
       },
       actor.workspaceId,
     );
+  }
+
+  async listAuditEvents(
+    actor: ActorContext,
+    documentId: string,
+    options?: { limit?: number; offset?: number },
+  ): Promise<AuditEvent[]> {
+    const page = await this.listAuditEventsPage(actor, documentId, options);
+    return page.events;
   }
 
   /**
@@ -740,12 +899,27 @@ export class PostgreSqlDocumentRepository {
     buildNext: (current: StudioDocument, nextRevision: number) => StudioDocument,
     auditOpts?: { source?: AuditEvent["source"]; action?: string; summary?: string },
   ): Promise<StudioDocument> {
-    assertCanPerform(actor, "document", "write");
+    assertPolicyAllowed({
+      actor,
+      resourceTenantId: actor.tenantId,
+      resourceWorkspaceId: actor.workspaceId,
+      resource: "document",
+      action: "write",
+      source: toPolicySource(auditOpts?.source),
+      ...(actor.workspaceVisibility ? { workspaceVisibility: actor.workspaceVisibility } : {}),
+    });
     assertValidDocumentUuid(documentId);
     return withTenantTransaction(
       this.db,
       actor.tenantId,
       async (tx) => {
+        await this.enforceWorkspacePolicyTx(
+          tx,
+          actor,
+          "document",
+          "write",
+          auditOpts?.source ?? "manual",
+        );
         // Lock ONLY the documents row first (avoiding READ COMMITTED EvalPlanQual join drops under concurrent updates)
         const curRes = await tx.query<{ workspace_id: string; current_revision: number }>(
           `SELECT workspace_id::text, current_revision
@@ -859,14 +1033,32 @@ export class PostgreSqlDocumentRepository {
     loadPriorForUndo?: boolean;
   }): Promise<{ document: StudioDocument; deduplicated: boolean; appliedOperationId: string }> {
     const { actor, documentId, operationId, expectedRevision, buildNext, source, loadPriorForUndo } = params;
-    assertCanPerform(actor, "ai_assistant", "apply_ai");
-    assertCanPerform(actor, "document", "write");
+    assertPolicyAllowed({
+      actor,
+      resourceTenantId: actor.tenantId,
+      resourceWorkspaceId: actor.workspaceId,
+      resource: "ai_assistant",
+      action: "apply_ai",
+      source,
+      ...(actor.workspaceVisibility ? { workspaceVisibility: actor.workspaceVisibility } : {}),
+    });
+    assertPolicyAllowed({
+      actor,
+      resourceTenantId: actor.tenantId,
+      resourceWorkspaceId: actor.workspaceId,
+      resource: "document",
+      action: "write",
+      source,
+      ...(actor.workspaceVisibility ? { workspaceVisibility: actor.workspaceVisibility } : {}),
+    });
     assertValidDocumentUuid(documentId);
 
     return withTenantTransaction(
       this.db,
       actor.tenantId,
       async (tx) => {
+        await this.enforceWorkspacePolicyTx(tx, actor, "ai_assistant", "apply_ai", source);
+        await this.enforceWorkspacePolicyTx(tx, actor, "document", "write", source);
         // Lock ONLY the documents row first so concurrent identical operationIds serialize without EPQ join drops
         const curRes = await tx.query<{ workspace_id: string; current_revision: number }>(
           `SELECT workspace_id::text, current_revision

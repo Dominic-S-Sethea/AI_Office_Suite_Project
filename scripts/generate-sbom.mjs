@@ -7,6 +7,14 @@ import { isPermissiveOrDualAllowed } from "./check-licenses.mjs";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const rootDir = path.resolve(__dirname, "..");
 
+function toCycloneDxLicenseEntry(licenseStr) {
+  // Emit CycloneDX SPDX `expression` only when free of legacy non-SPDX tokens like MIT/X11 or standalone BSD
+  if (!/\b(?:MIT\/X11|BSD)\b/.test(licenseStr) && isPermissiveOrDualAllowed(licenseStr)) {
+    return { expression: licenseStr };
+  }
+  return { license: { name: licenseStr } };
+}
+
 function parseSriIntegrity(integrity) {
   if (typeof integrity !== "string") return [];
   const parts = integrity.trim().split(/\s+/);
@@ -76,7 +84,7 @@ export function generateCycloneDxSbom(baseDir = rootDir) {
       typeof entry.license === "string" && entry.license.trim() ? entry.license.trim() : undefined;
     const purl = buildPurl(name, version);
     const hashes = parseSriIntegrity(entry.integrity);
-    const scope = entry.dev ? "optional" : "required";
+    const scope = entry.dev || entry.devOptional || entry.optional ? "optional" : "required";
 
     const existing = seen.get(dedupKey);
     if (existing) {
@@ -85,11 +93,7 @@ export function generateCycloneDxSbom(baseDir = rootDir) {
         existing.scope = "required";
       }
       if (!existing.licenses && licenseStr) {
-        existing.licenses = [
-          isPermissiveOrDualAllowed(licenseStr)
-            ? { expression: licenseStr }
-            : { license: { name: licenseStr } },
-        ];
+        existing.licenses = [toCycloneDxLicenseEntry(licenseStr)];
       }
       if (!existing.hashes && hashes.length > 0) {
         existing.hashes = hashes;
@@ -104,15 +108,7 @@ export function generateCycloneDxSbom(baseDir = rootDir) {
       version,
       purl,
       scope,
-      ...(licenseStr
-        ? {
-            licenses: [
-              isPermissiveOrDualAllowed(licenseStr)
-                ? { expression: licenseStr }
-                : { license: { name: licenseStr } },
-            ],
-          }
-        : {}),
+      ...(licenseStr ? { licenses: [toCycloneDxLicenseEntry(licenseStr)] } : {}),
       ...(hashes.length > 0 ? { hashes } : {}),
     };
     seen.set(dedupKey, component);

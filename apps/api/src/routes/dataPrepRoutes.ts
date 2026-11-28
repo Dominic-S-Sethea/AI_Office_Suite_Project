@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { Express, Request } from "express";
 import type { ActorContext } from "@ai-office-suite/shared-contracts";
-import { assertCanPerform } from "@ai-office-suite/authorization";
+import { assertPolicyAllowed } from "@ai-office-suite/authorization";
 import { DataPreparationPipeline, profileDataset, stageCsvSource } from "@ai-office-suite/data-processing";
 import { dataPrepStageProfileSchema } from "@ai-office-suite/validation";
 import type { DocumentGateway } from "../documentGateway.ts";
@@ -29,7 +29,15 @@ export function registerDataPrepRoutes(app: Express, deps: DataPrepRoutesDeps): 
     }
     try {
       const actor = getActor(req);
-      assertCanPerform(actor, "document", "write");
+      assertPolicyAllowed({
+        actor,
+        resourceTenantId: actor.tenantId,
+        resourceWorkspaceId: actor.workspaceId,
+        resource: "document",
+        action: "write",
+        source: "manual",
+        ...(actor.workspaceVisibility ? { workspaceVisibility: actor.workspaceVisibility } : {}),
+      });
       const parsed = dataPrepStageProfileSchema.safeParse(req.body);
       if (!parsed.success) {
         res.status(400).json({ error: "Invalid data-prep staging payload", code: "VALIDATION_ERROR", issues: parsed.error.issues });

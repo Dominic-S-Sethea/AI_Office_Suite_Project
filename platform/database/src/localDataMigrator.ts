@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from "node:crypto";
+import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import path from "node:path";
 import type { StudioDocument } from "@ai-office-suite/shared-contracts";
@@ -401,7 +401,10 @@ async function insertBatched(
   }
 }
 
-export function verifyLogicalBackupSnapshot(snapshot: LogicalBackupSnapshot): void {
+export function verifyLogicalBackupSnapshot(
+  snapshot: LogicalBackupSnapshot,
+  options: { allowLegacyUnsignedV1?: boolean } = {},
+): void {
   if (!snapshot || typeof snapshot !== "object") {
     throw new Error("INVALID_BACKUP_SNAPSHOT: Snapshot must be a JSON object.");
   }
@@ -420,11 +423,22 @@ export function verifyLogicalBackupSnapshot(snapshot: LogicalBackupSnapshot): vo
     }
   }
 
-  if (snapshot.snapshotVersion && snapshot.snapshotVersion >= 2 && !snapshot.integritySha256) {
+  const version = snapshot.snapshotVersion ?? 0;
+  if (version < 2 && !options.allowLegacyUnsignedV1) {
+    throw new Error(
+      "BACKUP_INTEGRITY_MISMATCH: Unsigned or legacy v1 logical backup snapshots require explicit allowLegacyUnsignedV1=true.",
+    );
+  }
+
+  if (version >= 2 && !snapshot.integritySha256) {
     throw new Error("BACKUP_INTEGRITY_MISMATCH: Logical backup snapshot SHA-256 digest is missing.");
   }
 
-  if (snapshot.integritySha256) {
+  if (snapshot.integritySha256 || !options.allowLegacyUnsignedV1) {
+    const providedHex = typeof snapshot.integritySha256 === "string" ? snapshot.integritySha256.trim().toLowerCase() : "";
+    if (!/^[0-9a-f]{64}$/.test(providedHex)) {
+      throw new Error("BACKUP_INTEGRITY_MISMATCH: Logical backup snapshot SHA-256 digest is malformed.");
+    }
     const tables = {
       organizations: snapshot.organizations,
       users: snapshot.users,
@@ -445,7 +459,9 @@ export function verifyLogicalBackupSnapshot(snapshot: LogicalBackupSnapshot): vo
       xiOutboxEvents: snapshot.xiOutboxEvents ?? [],
     };
     const actualHash = computeBackupPayloadSha256(tables);
-    if (actualHash !== snapshot.integritySha256) {
+    const actualBuf = Buffer.from(actualHash, "hex");
+    const providedBuf = Buffer.from(providedHex, "hex");
+    if (actualBuf.length !== providedBuf.length || !timingSafeEqual(actualBuf, providedBuf)) {
       throw new Error("BACKUP_INTEGRITY_MISMATCH: Logical backup snapshot SHA-256 digest does not match payload.");
     }
   }
@@ -472,6 +488,7 @@ export async function restoreCoreAndXiInTx(
   const hasWsVis = hasColumn("workspaces", "visibility");
   const hasMemStatus = hasColumn("memberships", "status");
   const hasMemContentAccess = hasColumn("memberships", "content_access");
+  const hasMemEpoch = hasColumn("memberships", "revocation_epoch");
 
   await insertBatched(
     tx,
@@ -529,6 +546,10 @@ export async function restoreCoreAndXiInTx(
     memCols.push("content_access");
     memCasts.push("");
   }
+  if (hasMemEpoch) {
+    memCols.push("revocation_epoch");
+    memCasts.push("");
+  }
   memCols.push("created_at");
   memCasts.push("::timestamptz");
 
@@ -548,6 +569,9 @@ export async function restoreCoreAndXiInTx(
             ? Boolean(m.content_access)
             : m.role !== "billing_admin" && m.role !== "auditor",
         );
+      }
+      if (hasMemEpoch) {
+        vals.push(typeof m.revocation_epoch === "number" ? m.revocation_epoch : Number(m.revocation_epoch ?? 1));
       }
       vals.push(m.created_at);
       return vals;
@@ -886,10 +910,13 @@ export async function restoreCoreAndXiInTx(
 export async function restoreLogicalBackupSnapshot(
   targetDb: PgDatabaseAdapter,
   snapshot: LogicalBackupSnapshot,
-  options: { idempotent?: boolean } = {},
+  options: { idempotent?: boolean; allowLegacyUnsignedV1?: boolean } = {},
 ): Promise<void> {
-  verifyLogicalBackupSnapshot(snapshot);
+  verifyLogicalBackupSnapshot(snapshot, {
+    ...(options.allowLegacyUnsignedV1 ? { allowLegacyUnsignedV1: true } : {}),
+  });
   await targetDb.withTransaction(async (tx) => {
+    await assertBackupRoleCanBypassRls(tx);
     await restoreCoreAndXiInTx(tx, snapshot, options);
   });
 }

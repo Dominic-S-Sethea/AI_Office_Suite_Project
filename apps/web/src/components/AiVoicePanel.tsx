@@ -1,17 +1,22 @@
 import { memo, useEffect, useRef, useState } from "react";
-import type { DocumentOperationProposal, SpeechRecognitionResult } from "@ai-office-suite/shared-contracts";
+import type {
+  DocumentOperationProposal,
+  SpeechRecognitionResult,
+  StudioDocument,
+} from "@ai-office-suite/shared-contracts";
 import { formatApiErrorMessage, safeReadJson } from "../lib/apiClient.ts";
 
 interface AiVoicePanelProps {
   documentId: string;
   revision: number;
   readOnly: boolean;
+  hasUnsavedChanges?: boolean;
   selectionBlockId?: string;
   selectedText: string;
   selectionGraphemeCount?: number;
   selectionStartOffset?: number;
   selectionEndOffset?: number;
-  onDocumentUpdated: () => Promise<void>;
+  onDocumentUpdated: (updatedDoc?: StudioDocument) => Promise<void> | void;
   onRevisionConflict?: (message: string) => void;
   onUnauthorized?: () => void;
   apiHeaders: Record<string, string>;
@@ -23,6 +28,7 @@ function AiVoicePanelInner({
   documentId,
   revision,
   readOnly,
+  hasUnsavedChanges = false,
   selectionBlockId,
   selectedText,
   selectionGraphemeCount,
@@ -54,6 +60,9 @@ function AiVoicePanelInner({
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const requestAbortRef = useRef<AbortController | null>(null);
   const requestSeqRef = useRef(0);
+  const isMountedRef = useRef(true);
+  const isRequestingMicRef = useRef(false);
+  const micReqSeqRef = useRef(0);
 
   const busy = isTranscribing || isPlanning || isApplying;
 
@@ -69,11 +78,34 @@ function AiVoicePanelInner({
     setErrorMsg(null);
   }, [documentId, revision]);
 
+  // Stop active microphone capture and cancel pending mic requests when role becomes readOnly or document switches
+  useEffect(() => {
+    micReqSeqRef.current += 1;
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach((t) => t.stop());
+      streamRef.current = null;
+      setRecording(false);
+      setMicStatus(null);
+    }
+  }, [documentId]);
+
+  useEffect(() => {
+    if (!readOnly) return;
+    micReqSeqRef.current += 1;
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach((t) => t.stop());
+      streamRef.current = null;
+      setRecording(false);
+      setMicStatus(null);
+    }
+  }, [readOnly]);
+
   // Ctrl+K / Cmd+K focuses the integrated Workspace AI Dock
   useEffect(() => {
     if (variant !== "dock") return;
     function onGlobalKeyDown(e: KeyboardEvent) {
       if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
+        if (document.querySelector('[aria-modal="true"]')) return;
         e.preventDefault();
         setExpanded(true);
         textareaRef.current?.focus();
@@ -85,7 +117,10 @@ function AiVoicePanelInner({
 
   // Always stop active microphone stream and abort pending fetches on unmount
   useEffect(() => {
+    isMountedRef.current = true;
     return () => {
+      isMountedRef.current = false;
+      micReqSeqRef.current += 1;
       requestAbortRef.current?.abort();
       requestSeqRef.current += 1;
       if (streamRef.current) {
@@ -96,7 +131,9 @@ function AiVoicePanelInner({
   }, []);
 
   async function startPushToTalk() {
-    if (readOnly || busy) return;
+    if (readOnly || busy || isRequestingMicRef.current || recording) return;
+    isRequestingMicRef.current = true;
+    const micSeq = ++micReqSeqRef.current;
     setErrorMsg(null);
     setMicStatus("Requesting browser microphone permission (hardware check only — mock STT active)...");
     try {
@@ -105,13 +142,24 @@ function AiVoicePanelInner({
         return;
       }
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      if (!isMountedRef.current || micSeq !== micReqSeqRef.current) {
+        stream.getTracks().forEach((t) => t.stop());
+        return;
+      }
+      if (streamRef.current) {
+        streamRef.current.getTracks().forEach((t) => t.stop());
+      }
       streamRef.current = stream;
       setRecording(true);
       setMicStatus(
         `Mic active (${inputLanguage === "km" ? "ខ្មែរ km-KH" : "English en-US"}) — hardware capture check only. Click Stop to run deterministic MockSpeechAdapter (isMock: true).`,
       );
     } catch {
-      setMicStatus("Microphone permission denied or unavailable. Text controls remain active.");
+      if (isMountedRef.current && micSeq === micReqSeqRef.current) {
+        setMicStatus("Microphone permission denied or unavailable. Text controls remain active.");
+      }
+    } finally {
+      isRequestingMicRef.current = false;
     }
   }
 
@@ -195,8 +243,8 @@ function AiVoicePanelInner({
       // - command: send document-level command with blockId target (no accidental partial range overwrite)
       const normalizedCmd = command.normalize("NFC").trim();
       const effectiveCommand =
-        mode === "dictation" && !/^(insert|replace|make|bold|italic|heading|undo|translate|បញ្ចូល|ធ្វើឱ្យ|បកប្រែ|មិនធ្វើវិញ)/i.test(normalizedCmd)
-          ? `insert "${normalizedCmd.replace(/"/g, "'")}"`
+        mode === "dictation"
+          ? `insert "${normalizedCmd.replace(/"/g, "'").slice(0, 1990)}"`
           : normalizedCmd;
 
       const selectionPayload =
@@ -261,6 +309,15 @@ function AiVoicePanelInner({
 
   async function handleApply() {
     if (!proposal || readOnly || busy) return;
+    if (
+      hasUnsavedChanges &&
+      typeof window.confirm === "function" &&
+      !window.confirm(
+        "You have unsaved manual changes on this document. Applying the AI proposal will reload from the server and discard unsaved local edits. Continue?",
+      )
+    ) {
+      return;
+    }
     requestAbortRef.current?.abort();
     const controller = new AbortController();
     requestAbortRef.current = controller;
@@ -296,7 +353,7 @@ function AiVoicePanelInner({
         return;
       }
       setProposal(null);
-      await onDocumentUpdated();
+      await onDocumentUpdated(data.document as StudioDocument | undefined);
     } catch (err) {
       if (err instanceof DOMException && err.name === "AbortError") return;
       if (seq === requestSeqRef.current) {
@@ -554,7 +611,7 @@ function AiVoicePanelInner({
                 Mic Test (Mock STT)
               </button>
             ) : (
-              <button type="button" className="btn primary" disabled={busy} onClick={() => void stopPushToTalk()}>
+              <button type="button" className="btn primary" disabled={readOnly || busy} onClick={() => void stopPushToTalk()}>
                 Stop &amp; Run Mock STT
               </button>
             )}

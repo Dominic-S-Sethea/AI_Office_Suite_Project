@@ -69,7 +69,8 @@ export function normalizeDocxHexColor(raw?: string): string | undefined {
     const toHex = (s: string) => Number.parseInt(s, 10).toString(16).padStart(2, "0").toUpperCase();
     return `${toHex(rgbMatch[1]!)}${toHex(rgbMatch[2]!)}${toHex(rgbMatch[3]!)}`;
   }
-  return NAMED_DOCX_COLORS[trimmed.toLowerCase()];
+  const lower = trimmed.toLowerCase();
+  return Object.hasOwn(NAMED_DOCX_COLORS, lower) ? NAMED_DOCX_COLORS[lower] : undefined;
 }
 
 function buildDocxRuns(runs: TextRun[]): DocxTextRun[] {

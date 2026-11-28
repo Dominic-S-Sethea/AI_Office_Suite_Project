@@ -1,4 +1,5 @@
 import { Pool, type PoolClient, type PoolConfig } from "pg";
+import { redactAuditValue } from "@ai-office-suite/audit";
 
 interface PgliteLike {
   waitReady: Promise<unknown>;
@@ -55,7 +56,10 @@ export class PgliteDatabaseAdapter implements PgDatabaseAdapter {
         const instance = this.dataDir ? new mod.PGlite(this.dataDir) : new mod.PGlite();
         await instance.waitReady;
         return instance;
-      })();
+      })().catch((err) => {
+        this.dbPromise = null;
+        throw err;
+      });
     }
     return this.dbPromise;
   }
@@ -130,7 +134,7 @@ export class NodePgDatabaseAdapter implements PgDatabaseAdapter {
             level: "error",
             event: "db.pool_idle_client_error",
             errorName: err.name,
-            message: err.message,
+            message: redactAuditValue(err.message),
           }),
         );
       }

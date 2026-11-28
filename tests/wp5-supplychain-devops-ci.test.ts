@@ -1,6 +1,7 @@
-import { readFileSync } from "node:fs";
+import { readdirSync, readFileSync, statSync } from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
+import { PA_RLS_TABLES } from "@ai-office-suite/database";
 import { describe, expect, it } from "vitest";
 
 describe("WP-5 Supply Chain, DevOps, CI & Documentation Remediation", () => {
@@ -18,33 +19,46 @@ describe("WP-5 Supply Chain, DevOps, CI & Documentation Remediation", () => {
     expect(ms213?.scope).toBe("required");
 
     const lock = JSON.parse(readFileSync(path.resolve("package-lock.json"), "utf8")) as {
-      packages: Record<string, { dependencies?: Record<string, string> }>;
+      packages: Record<string, { version?: string; dependencies?: Record<string, string>; devDependencies?: Record<string, string> }>;
     };
 
-    const checks: Array<{ ws: string; expected: string[]; absent?: string[] }> = [
-      { ws: "platform/database", expected: ["@ai-office-suite/audit", "@ai-office-suite/authorization", "pg"] },
-      { ws: "apps/api", expected: ["pg", "express", "cors", "helmet", "zod"] },
-      {
-        ws: "engines/file-conversion",
-        expected: ["@fontsource/inter", "@fontsource/kantumruy-pro", "@fontsource/noto-sans-khmer", "docx", "mammoth"],
-      },
-      { ws: "engines/intelligence", expected: ["@duckdb/node-api", "echarts"] },
-      { ws: "apps/web", expected: ["@fontsource/kantumruy-pro", "@fontsource/noto-sans-khmer"], absent: ["@fontsource/inter"] },
-    ];
-
-    for (const { ws, expected, absent } of checks) {
-      const pkg = JSON.parse(readFileSync(path.resolve(ws, "package.json"), "utf8")) as {
-        dependencies?: Record<string, string>;
-      };
-      const deps = pkg.dependencies ?? {};
-      for (const name of expected) {
-        expect(deps[name], `${ws} missing ${name}`).toBeTruthy();
+    // Dynamically verify ALL 21 workspace package.json manifests match package-lock.json 1:1
+    const workspacePaths: string[] = [];
+    for (const group of ["packages", "platform", "engines", "modules", "apps"]) {
+      const groupDir = path.resolve(group);
+      for (const entry of readdirSync(groupDir)) {
+        const wsDir = path.join(groupDir, entry);
+        try {
+          if (statSync(path.join(wsDir, "package.json")).isFile()) {
+            workspacePaths.push(`${group}/${entry}`);
+          }
+        } catch {
+          // ignore non-package directories
+        }
       }
-      for (const name of absent ?? []) {
-        expect(deps[name], `${ws} should not declare ${name}`).toBeUndefined();
-      }
-      expect(lock.packages[ws]?.dependencies).toEqual(deps);
     }
+    expect(workspacePaths).toHaveLength(21);
+
+    for (const ws of workspacePaths) {
+      const pkg = JSON.parse(readFileSync(path.resolve(ws, "package.json"), "utf8")) as {
+        version?: string;
+        dependencies?: Record<string, string>;
+        devDependencies?: Record<string, string>;
+      };
+      const lockEntry = lock.packages[ws];
+      expect(lockEntry, `package-lock.json missing workspace entry '${ws}'`).toBeDefined();
+      expect(lockEntry?.version).toBe(pkg.version);
+      expect(lockEntry?.dependencies ?? {}).toEqual(pkg.dependencies ?? {});
+      if (pkg.devDependencies) {
+        expect(lockEntry?.devDependencies ?? {}).toEqual(pkg.devDependencies);
+      }
+    }
+
+    expect(lock.packages["engines/speech"]?.dependencies).toMatchObject({
+      "@ai-office-suite/authorization": "*",
+      "@ai-office-suite/shared-contracts": "*",
+      "@ai-office-suite/validation": "*",
+    });
 
     const ciYml = readFileSync(path.resolve(".github/workflows/ci.yml"), "utf8");
     expect(ciYml).toContain("npm run sbom");
@@ -91,12 +105,17 @@ describe("WP-5 Supply Chain, DevOps, CI & Documentation Remediation", () => {
     expect(runbook).toContain("npm run bench:check");
     expect(runbook).toContain("metrics:read");
 
-    expect(auditReport).toContain("22` tenant-scoped tables");
+    const dbCliSource = readFileSync(path.resolve("scripts/db-cli.mjs"), "utf8");
+    expect(PA_RLS_TABLES).toHaveLength(9);
+    expect(dbCliSource).toContain("PA_RLS_TABLES");
+    expect(auditReport).toContain("24` tenant-scoped tables");
+    expect(auditReport).toContain("POST /api/auth/token");
+    expect(runbook).toContain("24` tenant-scoped tables");
     expect(auditReport).toContain("/api/speech");
     expect(auditReport).toContain("paginationQuerySchema");
     expect(auditReport).toContain("expectedRevision");
 
-    expect(licensePolicy).toContain("20` monorepo workspaces");
+    expect(licensePolicy).toContain("21` monorepo workspaces");
     expect(licensePolicy).toContain("npm run lint:licenses");
     expect(licensePolicy).toContain("npm run sbom");
   });

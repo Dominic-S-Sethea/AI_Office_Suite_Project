@@ -207,8 +207,18 @@ export function App() {
   const [historySection, setHistorySection] = useState<HistorySectionTab>("all");
   const [versions, setVersions] = useState<DocumentVersion[]>([]);
   const [auditEvents, setAuditEvents] = useState<AuditEvent[]>([]);
+  const [versionsTotal, setVersionsTotal] = useState<number | undefined>(undefined);
+  const [versionsHasMore, setVersionsHasMore] = useState(false);
+  const [isLoadingMoreVersions, setIsLoadingMoreVersions] = useState(false);
+  const [auditTotal, setAuditTotal] = useState<number | undefined>(undefined);
+  const [auditHasMore, setAuditHasMore] = useState(false);
+  const [isLoadingMoreAudit, setIsLoadingMoreAudit] = useState(false);
+  const drawerTriggerElRef = useRef<HTMLElement | null>(null);
 
-  // Request abort / sequence guards (H23, F-17)
+  // Request abort / sequence / session epoch guards (H23, F-17, FE-04, FE-05)
+  const sessionEpochRef = useRef(0);
+  const editGenRef = useRef(0);
+  const activeRevisionRef = useRef<number | null>(null);
   const listAbortRef = useRef<AbortController | null>(null);
   const listSeqRef = useRef(0);
   const historyAbortRef = useRef<AbortController | null>(null);
@@ -216,6 +226,8 @@ export function App() {
   const diffAbortRef = useRef<AbortController | null>(null);
   const reloadAbortRef = useRef<AbortController | null>(null);
   const reloadSeqRef = useRef(0);
+  const mutationAbortRef = useRef<AbortController | null>(null);
+  const exportAbortRef = useRef<AbortController | null>(null);
 
   const [isLoadingDocs, setIsLoadingDocs] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
@@ -223,6 +235,8 @@ export function App() {
   const [isExporting, setIsExporting] = useState<"docx" | "pdf" | null>(null);
   const [isLoadingHistory, setIsLoadingHistory] = useState(false);
   const [restoringRevision, setRestoringRevision] = useState<number | null>(null);
+  const [isLoggingOut, setIsLoggingOut] = useState(false);
+  const [editorSyncVersion, setEditorSyncVersion] = useState(0);
 
   const [statusMessage, setStatusMessage] = useState("Connecting to workspace API...");
   const [errorBanner, setErrorBanner] = useState<string | null>(null);
@@ -274,6 +288,8 @@ export function App() {
       historyAbortRef.current?.abort();
       diffAbortRef.current?.abort();
       reloadAbortRef.current?.abort();
+      mutationAbortRef.current?.abort();
+      exportAbortRef.current?.abort();
     };
   }, []);
 
@@ -283,6 +299,72 @@ export function App() {
     setDraftLanguage(null);
     setDraftLayout(null);
   }, []);
+
+  const handleEditMutation = useCallback(() => {
+    editGenRef.current += 1;
+  }, []);
+
+  const handleTitleDraftChange = useCallback((value: string) => {
+    editGenRef.current += 1;
+    setDraftTitle(value);
+  }, []);
+
+  const handleLanguageDraftChange = useCallback((lang: StudioDocument["language"]) => {
+    editGenRef.current += 1;
+    setDraftLanguage(lang);
+  }, []);
+
+  const handleLayoutDraftChange = useCallback((layout: PageLayoutConfig) => {
+    editGenRef.current += 1;
+    setDraftLayout(layout);
+  }, []);
+
+  const resetSessionState = useCallback(() => {
+    sessionEpochRef.current += 1;
+    editGenRef.current += 1;
+    listSeqRef.current += 1;
+    historySeqRef.current += 1;
+    reloadSeqRef.current += 1;
+    listAbortRef.current?.abort();
+    historyAbortRef.current?.abort();
+    diffAbortRef.current?.abort();
+    reloadAbortRef.current?.abort();
+    mutationAbortRef.current?.abort();
+    exportAbortRef.current?.abort();
+    activeDocIdRef.current = null;
+    activeRevisionRef.current = null;
+    setSessionActor(null);
+    setDocs([]);
+    setTotalDocs(0);
+    setDocOffset(0);
+    setActiveDoc(null);
+    setVersions([]);
+    setAuditEvents([]);
+    setVersionsTotal(undefined);
+    setVersionsHasMore(false);
+    setIsLoadingMoreVersions(false);
+    setAuditTotal(undefined);
+    setAuditHasMore(false);
+    setIsLoadingMoreAudit(false);
+    setSelection({ selectedText: "" });
+    setHistoryOpen(false);
+    setNewDocModalOpen(false);
+    setNewDocTitle("");
+    setNewDocError(null);
+    setSearchQuery("");
+    setLanguageFilter("");
+    setActiveSubPanel(null);
+    setConflictMessage(null);
+    setIsLoadingHistory(false);
+    setIsSaving(false);
+    setIsSeeding(false);
+    setIsCreatingDoc(false);
+    setIsImportingDocx(false);
+    setIsExporting(null);
+    setRestoringRevision(null);
+    clearDrafts();
+    setEditorSyncVersion((v) => v + 1);
+  }, [clearDrafts]);
 
   const confirmDiscardUnsavedChanges = useCallback((actionDescription: string): boolean => {
     if (!hasUnsavedChangesRef.current) return true;
@@ -304,7 +386,13 @@ export function App() {
   }, [authMode, prototypeRole]);
 
   useEffect(() => {
-    activeDocIdRef.current = activeDoc?.documentId ?? null;
+    const prevId = activeDocIdRef.current;
+    const nextId = activeDoc?.documentId ?? null;
+    activeDocIdRef.current = nextId;
+    activeRevisionRef.current = activeDoc?.revision ?? null;
+    if (prevId !== nextId) {
+      setSelection({ selectedText: "" });
+    }
   }, [activeDoc]);
 
   // Detect backend auth mode & restore existing cookie session if running under jwt-pg (M14 offline retry)
@@ -357,16 +445,11 @@ export function App() {
 
   const handleUnauthorized = useCallback(() => {
     if (authMode === "jwt-pg") {
-      setSessionActor(null);
-      setDocs([]);
-      setTotalDocs(0);
-      setDocOffset(0);
-      setActiveDoc(null);
-      clearDrafts();
+      resetSessionState();
       setErrorBanner("Session expired or revoked. Please sign in again.");
       setStatusMessage("Authentication required");
     }
-  }, [authMode, clearDrafts]);
+  }, [authMode, resetSessionState]);
 
   const loadDocuments = useCallback(
     async (opts?: { forceSyncActive?: boolean }) => {
@@ -415,23 +498,23 @@ export function App() {
 
         const currentId = activeDocIdRef.current;
         if (!currentId && list[0]) {
+          activeDocIdRef.current = list[0].documentId;
           setActiveDoc(list[0]);
         } else if (currentId) {
           const refreshed = list.find((d) => d.documentId === currentId);
           if (refreshed) {
             if (opts?.forceSyncActive || !hasUnsavedChangesRef.current) {
               setActiveDoc(refreshed);
-            } else {
-              setActiveDoc((prev) => {
-                if (prev && refreshed.revision !== prev.revision) {
-                  setConflictMessage(
-                    `Server revision advanced to rev ${refreshed.revision} while you have unsaved edits on rev ${prev.revision}.`,
-                  );
-                }
-                return prev;
-              });
+            } else if (
+              activeRevisionRef.current !== null &&
+              refreshed.revision !== activeRevisionRef.current
+            ) {
+              setConflictMessage(
+                `Server revision advanced to rev ${refreshed.revision} while you have unsaved edits on rev ${activeRevisionRef.current}.`,
+              );
             }
           } else if (!searchQuery.trim() && !languageFilter && docOffset === 0 && !hasUnsavedChangesRef.current) {
+            activeDocIdRef.current = list[0]?.documentId ?? null;
             setActiveDoc(list[0] ?? null);
           }
         }
@@ -490,8 +573,11 @@ export function App() {
   }
 
   async function handleLogout(revokeAll = false) {
+    if (isLoggingOut) return;
     if (!confirmDiscardUnsavedChanges(revokeAll ? "revoke all active sessions" : "sign out")) return;
     setErrorBanner(null);
+    setIsLoggingOut(true);
+    const epoch = sessionEpochRef.current;
     try {
       const res = await fetch(revokeAll ? "/api/auth/revoke-sessions" : "/api/auth/logout", {
         method: "POST",
@@ -509,26 +595,25 @@ export function App() {
         );
         return;
       }
-      setSessionActor(null);
-      setDocs([]);
-      setTotalDocs(0);
-      setDocOffset(0);
-      setActiveDoc(null);
-      clearDrafts();
-      setConflictMessage(null);
-      setStatusMessage(revokeAll ? "All sessions revoked." : "Signed out.");
+      if (epoch === sessionEpochRef.current) {
+        resetSessionState();
+        setStatusMessage(revokeAll ? "All sessions revoked." : "Signed out.");
+      }
     } catch {
       setErrorBanner(
         revokeAll
           ? "Network error while revoking sessions — existing sessions may still be active."
           : "Network error during sign out. Please retry.",
       );
+    } finally {
+      setIsLoggingOut(false);
     }
   }
 
   async function reloadActiveDocument() {
     if (!activeDoc) return;
     const targetDocId = activeDoc.documentId;
+    const epoch = sessionEpochRef.current;
     reloadAbortRef.current?.abort();
     const controller = new AbortController();
     reloadAbortRef.current = controller;
@@ -540,13 +625,13 @@ export function App() {
         headers: apiHeaders,
         signal: controller.signal,
       });
-      if (seq !== reloadSeqRef.current || activeDocIdRef.current !== targetDocId) return;
+      if (epoch !== sessionEpochRef.current || seq !== reloadSeqRef.current || activeDocIdRef.current !== targetDocId) return;
       if (res.status === 401) {
         handleUnauthorized();
         return;
       }
       const data = await safeReadJson(res);
-      if (seq !== reloadSeqRef.current || activeDocIdRef.current !== targetDocId) return;
+      if (epoch !== sessionEpochRef.current || seq !== reloadSeqRef.current || activeDocIdRef.current !== targetDocId) return;
       if (!res.ok) {
         setErrorBanner(formatApiErrorMessage(res, data, "Failed to reload latest document."));
         return;
@@ -554,6 +639,7 @@ export function App() {
       const latest = data.document as StudioDocument;
       setActiveDoc(latest);
       clearDrafts();
+      setEditorSyncVersion((v) => v + 1);
       setConflictMessage(null);
       setDocs((prev) => prev.map((d) => (d.documentId === latest.documentId ? latest : d)));
       setStatusMessage(`Reloaded latest revision ${latest.revision}.`);
@@ -569,6 +655,9 @@ export function App() {
     e.preventDefault();
     if (readOnly || isCreatingDoc || !newDocTitle.trim()) return;
     if (!confirmDiscardUnsavedChanges("create a new document")) return;
+    const epoch = sessionEpochRef.current;
+    const controller = new AbortController();
+    mutationAbortRef.current = controller;
     setNewDocError(null);
     setErrorBanner(null);
     setIsCreatingDoc(true);
@@ -577,6 +666,7 @@ export function App() {
         method: "POST",
         credentials: "include",
         headers: { "Content-Type": "application/json", ...apiHeaders },
+        signal: controller.signal,
         body: JSON.stringify({
           title: newDocTitle.trim().normalize("NFC"),
           language: newDocLanguage,
@@ -587,30 +677,41 @@ export function App() {
           },
         }),
       });
+      if (epoch !== sessionEpochRef.current) return;
       if (res.status === 401) {
         setNewDocModalOpen(false);
         handleUnauthorized();
         return;
       }
       const data = await safeReadJson(res);
+      if (epoch !== sessionEpochRef.current) return;
       if (!res.ok) {
         setNewDocError(formatApiErrorMessage(res, data, "Failed to create document."));
         return;
       }
       const created = data.document as StudioDocument;
+      activeDocIdRef.current = created.documentId;
       setActiveDoc(created);
       clearDrafts();
+      setEditorSyncVersion((v) => v + 1);
+      setSelection({ selectedText: "" });
       setConflictMessage(null);
       setNewDocModalOpen(false);
       setNewDocTitle("");
       setNewDocError(null);
       setDocOffset(0);
       await loadDocuments();
+      if (epoch !== sessionEpochRef.current) return;
       setStatusMessage(`Created '${created.title}' (${created.layout.size} ${created.layout.orientation}).`);
-    } catch {
-      setNewDocError("Network error creating new document.");
+    } catch (err) {
+      if (err instanceof DOMException && err.name === "AbortError") return;
+      if (epoch === sessionEpochRef.current) {
+        setNewDocError("Network error creating new document.");
+      }
     } finally {
-      setIsCreatingDoc(false);
+      if (epoch === sessionEpochRef.current) {
+        setIsCreatingDoc(false);
+      }
     }
   }
 
@@ -627,23 +728,30 @@ export function App() {
       setErrorBanner("DOCX file exceeds 10 MB safety limit.");
       return;
     }
+    const epoch = sessionEpochRef.current;
+    const controller = new AbortController();
+    mutationAbortRef.current = controller;
     setErrorBanner(null);
     setConflictMessage(null);
     setIsImportingDocx(true);
     try {
       const buf = await file.arrayBuffer();
+      if (epoch !== sessionEpochRef.current) return;
       const contentBase64 = arrayBufferToBase64(buf);
       const res = await fetch("/api/documents/import/docx", {
         method: "POST",
         credentials: "include",
         headers: { "Content-Type": "application/json", ...apiHeaders },
+        signal: controller.signal,
         body: JSON.stringify({ filename: file.name, contentBase64 }),
       });
+      if (epoch !== sessionEpochRef.current) return;
       if (res.status === 401) {
         handleUnauthorized();
         return;
       }
       const data = await safeReadJson(res);
+      if (epoch !== sessionEpochRef.current) return;
       if (!res.ok) {
         setErrorBanner(formatApiErrorMessage(res, data, "DOCX import failed."));
         setStatusMessage("DOCX import rejected.");
@@ -651,25 +759,37 @@ export function App() {
       }
       const created = data.document as StudioDocument;
       const diagnostics = data.diagnostics as { originalSha256?: string; warnings?: string[] } | undefined;
+      activeDocIdRef.current = created.documentId;
       setActiveDoc(created);
       clearDrafts();
+      setEditorSyncVersion((v) => v + 1);
+      setSelection({ selectedText: "" });
       setDocOffset(0);
       await loadDocuments();
+      if (epoch !== sessionEpochRef.current) return;
       const shaPrefix = diagnostics?.originalSha256?.slice(0, 10) ?? "verified";
       const warnCount = diagnostics?.warnings?.length ?? 0;
       setStatusMessage(
         `Imported DOCX '${file.name}' (SHA-256 ${shaPrefix}${warnCount > 0 ? `, ${warnCount} warning(s)` : ""}).`,
       );
-    } catch {
-      setErrorBanner("Network or read error importing DOCX file.");
+    } catch (err) {
+      if (err instanceof DOMException && err.name === "AbortError") return;
+      if (epoch === sessionEpochRef.current) {
+        setErrorBanner("Network or read error importing DOCX file.");
+      }
     } finally {
-      setIsImportingDocx(false);
+      if (epoch === sessionEpochRef.current) {
+        setIsImportingDocx(false);
+      }
     }
   }
 
   const handleSeedBilingual = useCallback(async () => {
     if (readOnly || isSeeding) return;
     if (!confirmDiscardUnsavedChanges("load a new bilingual sample document")) return;
+    const epoch = sessionEpochRef.current;
+    const controller = new AbortController();
+    mutationAbortRef.current = controller;
     setErrorBanner(null);
     setConflictMessage(null);
     setIsSeeding(true);
@@ -678,33 +798,55 @@ export function App() {
         method: "POST",
         credentials: "include",
         headers: apiHeaders,
+        signal: controller.signal,
       });
+      if (epoch !== sessionEpochRef.current) return;
       if (res.status === 401) {
         handleUnauthorized();
         return;
       }
       const data = await safeReadJson(res);
+      if (epoch !== sessionEpochRef.current) return;
       if (res.ok) {
         const created = data.document as StudioDocument;
+        activeDocIdRef.current = created.documentId;
         setActiveDoc(created);
         clearDrafts();
+        setEditorSyncVersion((v) => v + 1);
+        setSelection({ selectedText: "" });
         setDocOffset(0);
         await loadDocuments();
+        if (epoch !== sessionEpochRef.current) return;
         setStatusMessage("Loaded bilingual English/Khmer management report fixture.");
       } else {
         const msg = formatApiErrorMessage(res, data, "Failed to create fixture");
         setErrorBanner(msg);
         setStatusMessage(msg);
       }
-    } catch {
-      setErrorBanner("Network error creating bilingual fixture.");
+    } catch (err) {
+      if (err instanceof DOMException && err.name === "AbortError") return;
+      if (epoch === sessionEpochRef.current) {
+        setErrorBanner("Network error creating bilingual fixture.");
+      }
     } finally {
-      setIsSeeding(false);
+      if (epoch === sessionEpochRef.current) {
+        setIsSeeding(false);
+      }
     }
   }, [readOnly, isSeeding, confirmDiscardUnsavedChanges, apiHeaders, handleUnauthorized, clearDrafts, loadDocuments]);
 
   const handleSave = useCallback(async () => {
     if (!activeDoc || !hasUnsavedChanges || readOnly || isSaving) return;
+    const trimmedTitle = (draftTitle ?? activeDoc.title).trim().normalize("NFC");
+    if (!trimmedTitle) {
+      setErrorBanner("Document title cannot be empty.");
+      return;
+    }
+    const targetDocId = activeDoc.documentId;
+    const epoch = sessionEpochRef.current;
+    const saveStartGen = editGenRef.current;
+    const controller = new AbortController();
+    mutationAbortRef.current = controller;
     setErrorBanner(null);
     setIsSaving(true);
     try {
@@ -714,24 +856,27 @@ export function App() {
         ? fromTiptapJson(currentJson as unknown as TiptapNode, activeDoc.blocks)
         : activeDoc.blocks;
 
-      const res = await fetch(`/api/documents/${encodeURIComponent(activeDoc.documentId)}`, {
+      const res = await fetch(`/api/documents/${encodeURIComponent(targetDocId)}`, {
         method: "PUT",
         credentials: "include",
         headers: { "Content-Type": "application/json", ...apiHeaders },
+        signal: controller.signal,
         body: JSON.stringify({
           expectedRevision: activeDoc.revision,
-          title: (draftTitle ?? activeDoc.title).trim().normalize("NFC"),
+          title: trimmedTitle,
           language: draftLanguage ?? activeDoc.language,
           layout: draftLayout ?? activeDoc.layout,
           blocks: blocksToSave,
           summary: "Manual editor save",
         }),
       });
+      if (epoch !== sessionEpochRef.current || activeDocIdRef.current !== targetDocId) return;
       if (res.status === 401) {
         handleUnauthorized();
         return;
       }
       const data = await safeReadJson(res);
+      if (epoch !== sessionEpochRef.current || activeDocIdRef.current !== targetDocId) return;
       if (res.status === 409) {
         const msg = String(
           data.error ??
@@ -744,19 +889,28 @@ export function App() {
       if (res.ok) {
         const saved = data.document as StudioDocument;
         setActiveDoc(saved);
-        clearDrafts();
+        if (editGenRef.current === saveStartGen) {
+          clearDrafts();
+          setEditorSyncVersion((v) => v + 1);
+        }
         setConflictMessage(null);
         await loadDocuments();
+        if (epoch !== sessionEpochRef.current) return;
         setStatusMessage(`Saved revision ${saved.revision}.`);
       } else {
         const msg = formatApiErrorMessage(res, data, "Save failed");
         setErrorBanner(msg);
         setStatusMessage(msg);
       }
-    } catch {
-      setErrorBanner("Network error saving document.");
+    } catch (err) {
+      if (err instanceof DOMException && err.name === "AbortError") return;
+      if (epoch === sessionEpochRef.current && activeDocIdRef.current === targetDocId) {
+        setErrorBanner("Network error saving document.");
+      }
     } finally {
-      setIsSaving(false);
+      if (epoch === sessionEpochRef.current) {
+        setIsSaving(false);
+      }
     }
   }, [
     activeDoc,
@@ -773,10 +927,11 @@ export function App() {
     loadDocuments,
   ]);
 
-  // Keyboard shortcut: Ctrl+S / Cmd+S to save current document
+  // Keyboard shortcut: Ctrl+S / Cmd+S to save current document (disabled when a modal dialog is active)
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
       if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "s") {
+        if (document.querySelector('[aria-modal="true"]')) return;
         e.preventDefault();
         void handleSave();
       }
@@ -788,39 +943,61 @@ export function App() {
   const handleExport = useCallback(
     async (kind: "docx" | "pdf") => {
       if (!activeDoc || !canExport || isExporting) return;
+      if (
+        hasUnsavedChangesRef.current &&
+        typeof window.confirm === "function" &&
+        !window.confirm(
+          "You have unsaved local changes. Export the last saved server revision without those unsaved changes?",
+        )
+      ) {
+        return;
+      }
+      const targetDoc = activeDoc;
+      const epoch = sessionEpochRef.current;
+      const controller = new AbortController();
+      exportAbortRef.current = controller;
       setErrorBanner(null);
       setIsExporting(kind);
       setStatusMessage(kind === "docx" ? "Exporting DOCX snapshot..." : "Rendering PDF snapshot (HarfBuzz)...");
       try {
-        const res = await fetch(`/api/documents/${encodeURIComponent(activeDoc.documentId)}/export/${kind}`, {
+        const res = await fetch(`/api/documents/${encodeURIComponent(targetDoc.documentId)}/export/${kind}`, {
           method: "POST",
           credentials: "include",
           headers: apiHeaders,
+          signal: controller.signal,
         });
+        if (epoch !== sessionEpochRef.current) return;
         if (res.status === 401) {
           handleUnauthorized();
           return;
         }
         if (!res.ok) {
           const data = await safeReadJson(res);
+          if (epoch !== sessionEpochRef.current) return;
           const msg = formatApiErrorMessage(res, data, `${kind.toUpperCase()} export failed`);
           setErrorBanner(msg);
           setStatusMessage(msg);
           return;
         }
         const blob = await res.blob();
+        if (epoch !== sessionEpochRef.current) return;
         const url = URL.createObjectURL(blob);
         const a = document.createElement("a");
         a.href = url;
-        a.download = `${activeDoc.documentId}-rev${activeDoc.revision}.${kind}`;
+        a.download = `${targetDoc.documentId}-rev${targetDoc.revision}.${kind}`;
         a.click();
         // Defer object URL revocation so Safari & slow download managers finish streaming cleanly (M14)
         window.setTimeout(() => URL.revokeObjectURL(url), 60_000);
-        setStatusMessage(`Exported ${kind.toUpperCase()} snapshot (rev ${activeDoc.revision}).`);
-      } catch {
-        setErrorBanner(`Network error during ${kind.toUpperCase()} export.`);
+        setStatusMessage(`Exported ${kind.toUpperCase()} snapshot (rev ${targetDoc.revision}).`);
+      } catch (err) {
+        if (err instanceof DOMException && err.name === "AbortError") return;
+        if (epoch === sessionEpochRef.current) {
+          setErrorBanner(`Network error during ${kind.toUpperCase()} export.`);
+        }
       } finally {
-        setIsExporting(null);
+        if (epoch === sessionEpochRef.current) {
+          setIsExporting(null);
+        }
       }
     },
     [activeDoc, canExport, isExporting, apiHeaders, handleUnauthorized],
@@ -829,6 +1006,9 @@ export function App() {
   const openHistory = useCallback(
     async (section: HistorySectionTab = "all") => {
       if (!activeDoc) return;
+      drawerTriggerElRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+      const targetDocId = activeDoc.documentId;
+      const epoch = sessionEpochRef.current;
       historyAbortRef.current?.abort();
       const controller = new AbortController();
       historyAbortRef.current = controller;
@@ -838,22 +1018,26 @@ export function App() {
       setHistorySection(section);
       setHistoryOpen(true);
       setIsLoadingHistory(true);
+      setVersionsTotal(undefined);
+      setVersionsHasMore(false);
+      setAuditTotal(undefined);
+      setAuditHasMore(false);
       try {
         const [vRes, aRes] = await Promise.all([
-          fetch(`/api/documents/${encodeURIComponent(activeDoc.documentId)}/versions`, {
+          fetch(`/api/documents/${encodeURIComponent(targetDocId)}/versions?limit=100&offset=0&order=desc`, {
             credentials: "include",
             headers: apiHeaders,
             signal: controller.signal,
           }),
           canReadAudit
-            ? fetch(`/api/documents/${encodeURIComponent(activeDoc.documentId)}/audit`, {
+            ? fetch(`/api/documents/${encodeURIComponent(targetDocId)}/audit?limit=100&offset=0`, {
                 credentials: "include",
                 headers: apiHeaders,
                 signal: controller.signal,
               })
             : Promise.resolve(null),
         ]);
-        if (seq !== historySeqRef.current) return;
+        if (epoch !== sessionEpochRef.current || seq !== historySeqRef.current) return;
         if (vRes.status === 401 || aRes?.status === 401) {
           setHistoryOpen(false);
           handleUnauthorized();
@@ -866,34 +1050,120 @@ export function App() {
           return;
         }
         const vData = await safeReadJson(vRes);
-        if (seq !== historySeqRef.current) return;
-        setVersions((vData.versions ?? []) as DocumentVersion[]);
+        if (epoch !== sessionEpochRef.current || seq !== historySeqRef.current) return;
+        const vList = (vData.versions ?? []) as DocumentVersion[];
+        const vTotal = typeof vData.total === "number" ? vData.total : vList.length;
+        const vMore = typeof vData.hasMore === "boolean" ? vData.hasMore : vList.length < vTotal;
+        setVersions(vList);
+        setVersionsTotal(vTotal);
+        setVersionsHasMore(vMore);
 
         if (aRes && aRes.ok) {
           const aData = await safeReadJson(aRes);
-          if (seq !== historySeqRef.current) return;
-          setAuditEvents((aData.events ?? []) as AuditEvent[]);
+          if (epoch !== sessionEpochRef.current || seq !== historySeqRef.current) return;
+          const aList = (aData.events ?? []) as AuditEvent[];
+          const aTotal = typeof aData.total === "number" ? aData.total : aList.length;
+          const aMore = typeof aData.hasMore === "boolean" ? aData.hasMore : aList.length < aTotal;
+          setAuditEvents(aList);
+          setAuditTotal(aTotal);
+          setAuditHasMore(aMore);
         } else {
           if (aRes && aRes.status !== 403) {
             const errData = await safeReadJson(aRes);
             setErrorBanner(formatApiErrorMessage(aRes, errData, "Failed to load audit log."));
           }
           setAuditEvents([]);
+          setAuditTotal(0);
+          setAuditHasMore(false);
         }
       } catch (err) {
         if (err instanceof DOMException && err.name === "AbortError") return;
-        if (seq === historySeqRef.current) {
+        if (epoch === sessionEpochRef.current && seq === historySeqRef.current) {
           setErrorBanner("Network error loading version & audit history.");
           setHistoryOpen(false);
         }
       } finally {
-        if (seq === historySeqRef.current) {
+        if (epoch === sessionEpochRef.current && seq === historySeqRef.current) {
           setIsLoadingHistory(false);
         }
       }
     },
     [activeDoc, apiHeaders, canReadAudit, handleUnauthorized],
   );
+
+  const handleLoadMoreVersions = useCallback(async () => {
+    if (!activeDoc || isLoadingMoreVersions || !versionsHasMore) return;
+    const epoch = sessionEpochRef.current;
+    const targetDocId = activeDoc.documentId;
+    setIsLoadingMoreVersions(true);
+    try {
+      const offset = versions.length;
+      const res = await fetch(
+        `/api/documents/${encodeURIComponent(targetDocId)}/versions?limit=100&offset=${offset}&order=desc`,
+        { credentials: "include", headers: apiHeaders },
+      );
+      if (epoch !== sessionEpochRef.current || activeDocIdRef.current !== targetDocId) return;
+      if (res.status === 401) {
+        handleUnauthorized();
+        return;
+      }
+      if (!res.ok) return;
+      const vData = await safeReadJson(res);
+      if (epoch !== sessionEpochRef.current || activeDocIdRef.current !== targetDocId) return;
+      const nextPage = (vData.versions ?? []) as DocumentVersion[];
+      const seen = new Set(versions.map((v) => v.versionId));
+      const merged = [...versions, ...nextPage.filter((v) => !seen.has(v.versionId))];
+      const total = typeof vData.total === "number" ? vData.total : versionsTotal ?? merged.length;
+      const hasMore =
+        typeof vData.hasMore === "boolean"
+          ? vData.hasMore
+          : nextPage.length > 0 && merged.length < total;
+      setVersions(merged);
+      setVersionsTotal(total);
+      setVersionsHasMore(hasMore);
+    } finally {
+      if (epoch === sessionEpochRef.current) {
+        setIsLoadingMoreVersions(false);
+      }
+    }
+  }, [activeDoc, apiHeaders, handleUnauthorized, isLoadingMoreVersions, versions, versionsHasMore, versionsTotal]);
+
+  const handleLoadMoreAudit = useCallback(async () => {
+    if (!activeDoc || !canReadAudit || isLoadingMoreAudit || !auditHasMore) return;
+    const epoch = sessionEpochRef.current;
+    const targetDocId = activeDoc.documentId;
+    setIsLoadingMoreAudit(true);
+    try {
+      const offset = auditEvents.length;
+      const res = await fetch(
+        `/api/documents/${encodeURIComponent(targetDocId)}/audit?limit=100&offset=${offset}`,
+        { credentials: "include", headers: apiHeaders },
+      );
+      if (epoch !== sessionEpochRef.current || activeDocIdRef.current !== targetDocId) return;
+      if (res.status === 401) {
+        handleUnauthorized();
+        return;
+      }
+      if (!res.ok) return;
+      const aData = await safeReadJson(res);
+      if (epoch !== sessionEpochRef.current || activeDocIdRef.current !== targetDocId) return;
+      const nextPage = (aData.events ?? []) as AuditEvent[];
+      const seen = new Set(auditEvents.map((e) => e.auditId));
+      const merged = [...auditEvents, ...nextPage.filter((e) => !seen.has(e.auditId))];
+      const total = typeof aData.total === "number" ? aData.total : auditTotal ?? merged.length;
+      const hasMore =
+        typeof aData.hasMore === "boolean"
+          ? aData.hasMore
+          : nextPage.length > 0 && merged.length < total;
+      setAuditEvents(merged);
+      setAuditTotal(total);
+      setAuditHasMore(hasMore);
+    } finally {
+      if (epoch === sessionEpochRef.current) {
+        setIsLoadingMoreAudit(false);
+      }
+    }
+  }, [activeDoc, apiHeaders, auditEvents, auditHasMore, auditTotal, canReadAudit, handleUnauthorized, isLoadingMoreAudit]);
 
   const handleCompareRevision = useCallback(
     async (fromRev: number, toRev: number): Promise<RevisionDiffPayload | null> => {
@@ -929,24 +1199,31 @@ export function App() {
   const handleRestore = useCallback(
     async (revision: number) => {
       if (!activeDoc || readOnly || restoringRevision !== null) return;
+      const targetDocId = activeDoc.documentId;
+      const epoch = sessionEpochRef.current;
+      const controller = new AbortController();
+      mutationAbortRef.current = controller;
       setErrorBanner(null);
       setRestoringRevision(revision);
       try {
         const res = await fetch(
-          `/api/documents/${encodeURIComponent(activeDoc.documentId)}/versions/${revision}/restore`,
+          `/api/documents/${encodeURIComponent(targetDocId)}/versions/${revision}/restore`,
           {
             method: "POST",
             credentials: "include",
             headers: { "Content-Type": "application/json", ...apiHeaders },
+            signal: controller.signal,
             body: JSON.stringify({ expectedRevision: activeDoc.revision }),
           },
         );
+        if (epoch !== sessionEpochRef.current || activeDocIdRef.current !== targetDocId) return;
         if (res.status === 401) {
           setHistoryOpen(false);
           handleUnauthorized();
           return;
         }
         const data = await safeReadJson(res);
+        if (epoch !== sessionEpochRef.current || activeDocIdRef.current !== targetDocId) return;
         if (res.status === 409) {
           const msg = String(
             data.error ??
@@ -961,19 +1238,26 @@ export function App() {
           const restored = data.document as StudioDocument;
           setActiveDoc(restored);
           clearDrafts();
+          setEditorSyncVersion((v) => v + 1);
           setConflictMessage(null);
           setHistoryOpen(false);
           await loadDocuments();
+          if (epoch !== sessionEpochRef.current) return;
           setStatusMessage(`Restored revision ${revision} as new revision ${restored.revision}.`);
         } else {
           const msg = formatApiErrorMessage(res, data, "Restore failed");
           setErrorBanner(msg);
           setStatusMessage(msg);
         }
-      } catch {
-        setErrorBanner("Network error restoring document revision.");
+      } catch (err) {
+        if (err instanceof DOMException && err.name === "AbortError") return;
+        if (epoch === sessionEpochRef.current && activeDocIdRef.current === targetDocId) {
+          setErrorBanner("Network error restoring document revision.");
+        }
       } finally {
-        setRestoringRevision(null);
+        if (epoch === sessionEpochRef.current) {
+          setRestoringRevision(null);
+        }
       }
     },
     [activeDoc, readOnly, restoringRevision, apiHeaders, handleUnauthorized, clearDrafts, loadDocuments],
@@ -984,20 +1268,35 @@ export function App() {
     if (!confirmDiscardUnsavedChanges("switch documents")) return;
     reloadAbortRef.current?.abort();
     reloadSeqRef.current += 1;
+    activeDocIdRef.current = nextDoc.documentId;
     setActiveDoc(nextDoc);
+    setSelection({ selectedText: "" });
     clearDrafts();
     setConflictMessage(null);
   }
 
   function handlePrototypeRoleChange(nextRole: WorkspaceRole) {
     if (!confirmDiscardUnsavedChanges(`switch role to ${nextRole}`)) return;
+    clearDrafts();
+    setEditorSyncVersion((v) => v + 1);
+    setConflictMessage(null);
     setPrototypeRole(nextRole);
   }
 
-  const handleAiDocumentUpdated = useCallback(async () => {
-    clearDrafts();
-    await loadDocuments({ forceSyncActive: true });
-  }, [clearDrafts, loadDocuments]);
+  const handleAiDocumentUpdated = useCallback(
+    async (updatedDoc?: StudioDocument) => {
+      clearDrafts();
+      setEditorSyncVersion((v) => v + 1);
+      setConflictMessage(null);
+      if (updatedDoc) {
+        activeDocIdRef.current = updatedDoc.documentId;
+        setActiveDoc(updatedDoc);
+        setDocs((prev) => prev.map((d) => (d.documentId === updatedDoc.documentId ? updatedDoc : d)));
+      }
+      await loadDocuments({ forceSyncActive: !updatedDoc });
+    },
+    [clearDrafts, loadDocuments],
+  );
 
   const handleCloseHistory = useCallback(() => {
     historyAbortRef.current?.abort();
@@ -1116,8 +1415,8 @@ export function App() {
           {
             id: "save_doc",
             label: isSaving ? "Saving..." : `Save${hasUnsavedChanges ? " *" : ""}`,
-            disabled: readOnly || !hasUnsavedChanges || isSaving,
-            title: saveTooltip,
+            disabled: readOnly || !hasUnsavedChanges || isSaving || !(draftTitle ?? activeDoc?.title ?? "").trim(),
+            title: !(draftTitle ?? activeDoc?.title ?? "").trim() && activeDoc ? "Document title cannot be empty." : saveTooltip,
             onSelect: () => {
               setMobileNavOpen(false);
               void handleSave();
@@ -1174,7 +1473,7 @@ export function App() {
             onSelect: () => {
               if (!effectiveActiveDoc) return;
               setActiveStudio("documents");
-              setDraftLayout({
+              handleLayoutDraftChange({
                 ...effectiveActiveDoc.layout,
                 orientation: effectiveActiveDoc.layout.orientation === "portrait" ? "landscape" : "portrait",
               });
@@ -1634,6 +1933,7 @@ export function App() {
               <div className="sidebar-filters">
                 <input
                   type="search"
+                  maxLength={120}
                   className="input-field input-compact"
                   placeholder="Search title..."
                   aria-label="Search documents by title"
@@ -1729,8 +2029,9 @@ export function App() {
                 apiHeaders={apiHeaders}
                 onRoleChange={handlePrototypeRoleChange}
                 onLogout={handleLogout}
-                onLayoutChange={setDraftLayout}
-                onLanguageChange={setDraftLanguage}
+                onLayoutChange={handleLayoutDraftChange}
+                onLanguageChange={handleLanguageDraftChange}
+                onUnauthorized={handleUnauthorized}
               />
 
               {activeStudio === "documents" ? (
@@ -1745,7 +2046,7 @@ export function App() {
                         aria-label="Document title"
                         title={readOnly ? titleReadOnlyTooltip : "Edit document title"}
                         value={effectiveActiveDoc.title}
-                        onChange={(e) => setDraftTitle(e.target.value)}
+                        onChange={(e) => handleTitleDraftChange(e.target.value)}
                       />
                       <span className="meta-caption">
                         Rev {effectiveActiveDoc.revision} · {effectiveActiveDoc.language} ·{" "}
@@ -1760,15 +2061,17 @@ export function App() {
                       <button
                         type="button"
                         className="btn primary btn-compact"
-                        disabled={readOnly || !hasUnsavedChanges || isSaving}
+                        disabled={readOnly || !hasUnsavedChanges || isSaving || !effectiveActiveDoc.title.trim()}
                         title={
                           readOnly
                             ? titleReadOnlyTooltip
-                            : !hasUnsavedChanges
-                              ? "No unsaved changes to save."
-                              : isSaving
-                                ? "Saving changes..."
-                                : "Save current changes (Ctrl+S / Cmd+S)"
+                            : !effectiveActiveDoc.title.trim()
+                              ? "Document title cannot be empty."
+                              : !hasUnsavedChanges
+                                ? "No unsaved changes to save."
+                                : isSaving
+                                  ? "Saving changes..."
+                                  : "Save current changes (Ctrl+S / Cmd+S)"
                         }
                         onClick={() => void handleSave()}
                       >
@@ -1777,12 +2080,15 @@ export function App() {
                     </div>
                     <ErrorBoundary scopeLabel="Document Editor">
                       <DocumentEditor
+                        key={activeDoc.documentId}
                         ref={editorRef}
                         document={effectiveActiveDoc}
                         tiptapContent={tiptapContent}
                         readOnly={readOnly}
                         effectiveRole={effectiveRole}
+                        syncVersion={editorSyncVersion}
                         onDirtyChange={setEditorDirty}
+                        onEditMutation={handleEditMutation}
                         onSelectionChange={handleSelectionChange}
                       />
                     </ErrorBoundary>
@@ -1842,6 +2148,7 @@ export function App() {
                 documentId={activeDoc.documentId}
                 revision={activeDoc.revision}
                 readOnly={readOnly}
+                hasUnsavedChanges={hasUnsavedChanges}
                 selectionBlockId={selection.blockId}
                 selectedText={selection.selectedText}
                 selectionGraphemeCount={selection.graphemeCount}
@@ -1896,6 +2203,15 @@ export function App() {
             effectiveRole={effectiveRole}
             isLoading={isLoadingHistory}
             restoringRevision={restoringRevision}
+            versionsTotal={versionsTotal}
+            versionsHasMore={versionsHasMore}
+            isLoadingMoreVersions={isLoadingMoreVersions}
+            onLoadMoreVersions={() => void handleLoadMoreVersions()}
+            auditTotal={auditTotal}
+            auditHasMore={auditHasMore}
+            isLoadingMoreAudit={isLoadingMoreAudit}
+            onLoadMoreAudit={() => void handleLoadMoreAudit()}
+            restoreFocusElRef={drawerTriggerElRef}
             onRestore={handleRestore}
             onCompareRevision={handleCompareRevision}
             onClose={handleCloseHistory}
