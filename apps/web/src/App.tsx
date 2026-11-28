@@ -63,14 +63,16 @@ function DrawerLoadingFallback({ onClose }: { onClose: () => void }) {
       className="drawer-backdrop"
       role="dialog"
       aria-modal="true"
-      aria-label="Loading history drawer"
+      aria-labelledby="history-loading-title"
       onClick={(e) => {
         if (e.target === e.currentTarget) onClose();
       }}
     >
       <div ref={panelRef} className="drawer-panel">
         <div className="panel-header-row">
-          <strong className="modal-title">Version &amp; Audit History</strong>
+          <strong id="history-loading-title" className="modal-title">
+            Version &amp; Audit History
+          </strong>
           <button ref={closeBtnRef} type="button" className="btn" onClick={onClose}>
             Close
           </button>

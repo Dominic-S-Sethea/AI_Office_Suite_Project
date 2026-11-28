@@ -776,11 +776,20 @@ describe("Wave 1 Frontend & Tiptap Codec Verification (C8 & C9)", () => {
     // 4. Versions & Audit -> Audit Trail opens cleanly, Escape closes drawer first without sticking or collapsing sidebar
     const versionsHeader = screen.getByRole("menuitem", { name: /Versions & Audit/ });
     fireEvent.click(versionsHeader);
-    const auditBtn = screen.getByRole("menuitem", { name: /Audit Trail/ });
+    const auditBtn = screen.getByRole("menuitem", { name: /Audit Trail/ }) as HTMLButtonElement;
+    await waitFor(
+      () => {
+        expect(auditBtn.disabled).toBe(false);
+      },
+      { timeout: 5000 },
+    );
     fireEvent.click(auditBtn);
-    await waitFor(() => {
-      expect(screen.getByRole("dialog", { name: "Version & Audit History" })).toBeTruthy();
-    });
+    await waitFor(
+      () => {
+        expect(screen.getByRole("dialog", { name: "Version & Audit History" })).toBeTruthy();
+      },
+      { timeout: 5000 },
+    );
     fireEvent.keyDown(window, { key: "Escape" });
     await waitFor(() => {
       expect(screen.queryByRole("dialog", { name: "Version & Audit History" })).toBeNull();

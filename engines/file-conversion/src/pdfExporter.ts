@@ -404,6 +404,15 @@ export function countPdfPages(pdfBuffer: Buffer): number {
   return matches ? matches.length : 1;
 }
 
+function formatChromiumSpawnFailure(err: unknown, fallback: string): string {
+  if (!err || typeof err !== "object") return fallback;
+  const e = err as { code?: unknown; stderr?: unknown; message?: unknown };
+  const stderr = typeof e.stderr === "string" ? e.stderr : Buffer.isBuffer(e.stderr) ? e.stderr.toString("utf8") : "";
+  const raw = (stderr || (typeof e.message === "string" ? e.message : "")).replace(/\s+/g, " ").trim();
+  const codePrefix = e.code !== undefined ? `[${String(e.code)}] ` : "";
+  return raw ? `${fallback} ${codePrefix}${raw.slice(0, 240)}` : `${fallback}${codePrefix ? ` ${codePrefix.trim()}` : ""}`;
+}
+
 export async function exportToPdfBuffer(doc: StudioDocument): Promise<PdfExportResult> {
   const browserPath = detectChromiumBinary();
   if (!browserPath) {
@@ -423,17 +432,25 @@ export async function exportToPdfBuffer(doc: StudioDocument): Promise<PdfExportR
     writeFileSync(htmlPath, buildPrintableHtml(doc), "utf8");
     const fileUrl = pathToFileURL(htmlPath).href;
 
-    await execFileAsync(
-      browserPath,
-      [
-        ...buildHardenedChromiumArgs(),
-        `--user-data-dir=${userDataDir}`,
-        "--no-pdf-header-footer",
-        `--print-to-pdf=${pdfPath}`,
-        fileUrl,
-      ],
-      { timeout: 25_000, windowsHide: true, env: buildSanitizedSubprocessEnv(tmpDir) },
-    );
+    try {
+      await execFileAsync(
+        browserPath,
+        [
+          ...buildHardenedChromiumArgs(),
+          `--user-data-dir=${userDataDir}`,
+          "--no-pdf-header-footer",
+          `--print-to-pdf=${pdfPath}`,
+          fileUrl,
+        ],
+        { timeout: 25_000, windowsHide: true, env: buildSanitizedSubprocessEnv(tmpDir) },
+      );
+    } catch (err) {
+      throw new PdfExportError(
+        500,
+        "PDF_RENDER_PROCESS_FAILED",
+        formatChromiumSpawnFailure(err, "Headless Chromium PDF export failed."),
+      );
+    }
 
     if (!existsSync(pdfPath)) {
       throw new PdfExportError(500, "PDF_GENERATION_FAILED", "Headless browser exited without creating PDF output.");
@@ -476,17 +493,25 @@ export async function renderDocumentScreenshot(
   try {
     writeFileSync(htmlPath, buildPrintableHtml(doc), "utf8");
     const fileUrl = pathToFileURL(htmlPath).href;
-    await execFileAsync(
-      browserPath,
-      [
-        ...buildHardenedChromiumArgs(),
-        `--user-data-dir=${userDataDir}`,
-        "--window-size=960,1360",
-        `--screenshot=${path.resolve(outputPngPath)}`,
-        fileUrl,
-      ],
-      { timeout: 25_000, windowsHide: true, env: buildSanitizedSubprocessEnv(tmpDir) },
-    );
+    try {
+      await execFileAsync(
+        browserPath,
+        [
+          ...buildHardenedChromiumArgs(),
+          `--user-data-dir=${userDataDir}`,
+          "--window-size=960,1360",
+          `--screenshot=${path.resolve(outputPngPath)}`,
+          fileUrl,
+        ],
+        { timeout: 25_000, windowsHide: true, env: buildSanitizedSubprocessEnv(tmpDir) },
+      );
+    } catch (err) {
+      throw new PdfExportError(
+        500,
+        "SCREENSHOT_PROCESS_FAILED",
+        formatChromiumSpawnFailure(err, "Headless Chromium screenshot failed."),
+      );
+    }
 
     if (!existsSync(outputPngPath)) {
       throw new PdfExportError(500, "SCREENSHOT_FAILED", "Headless browser did not generate screenshot PNG.");

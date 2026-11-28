@@ -45,6 +45,10 @@ jobs:
         run: npm run build
 
       - name: Run full self-contained test suite
+        env:
+          # Ubuntu 24.04 hosted runners enforce AppArmor unprivileged userns restrictions;
+          # opt into --no-sandbox only for CI tests while keeping production defaults sandboxed (F-14).
+          CHROMIUM_NO_SANDBOX: "true"
         run: npm test
 
       - name: Verify performance regression budgets
