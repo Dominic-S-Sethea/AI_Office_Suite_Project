@@ -47,7 +47,18 @@ export function registerAuthAndMetricsRoutes(app: Express, deps: AuthRoutesDeps)
   } = deps;
 
   if (useJwtPg && db) {
-    const jwtMiddleware = createJwtAuthMiddleware(db, allowedOrigins);
+    const jwtMiddleware = createJwtAuthMiddleware(db, allowedOrigins, {
+      onError: (err, ctx) => {
+        observability.logEvent("error", "auth_jwt_backend_error", {
+          requestId: ctx.requestId,
+          method: ctx.method,
+          path: ctx.path,
+          errorName: err instanceof Error ? err.name : "Error",
+          message: err instanceof Error ? err.message : String(err),
+        });
+      },
+    });
+    const apiRateLimiters: RequestHandler[] = rateLimitEnabled ? [apiLimiter.middleware] : [];
 
     if (rateLimitEnabled) {
       app.use("/api/auth/login", loginLimiter.middleware);
@@ -56,7 +67,7 @@ export function registerAuthAndMetricsRoutes(app: Express, deps: AuthRoutesDeps)
 
     const metricsMiddleware: RequestHandler[] = [
       jwtMiddleware as unknown as RequestHandler,
-      ...(rateLimitEnabled ? [apiLimiter.middleware] : []),
+      ...apiRateLimiters,
     ];
 
     app.get("/api/metrics", ...metricsMiddleware, (req, res, next) => {
@@ -146,7 +157,7 @@ export function registerAuthAndMetricsRoutes(app: Express, deps: AuthRoutesDeps)
       }
     });
 
-    app.post("/api/auth/logout", (req, res) => {
+    app.post("/api/auth/logout", ...apiRateLimiters, (req, res) => {
       const hasBearer = Boolean(req.headers.authorization?.startsWith("Bearer "));
       const hasCookie = Boolean(parseCookie(req.headers.cookie, SESSION_COOKIE_NAME));
       if (!hasBearer && hasCookie) {
@@ -156,12 +167,12 @@ export function registerAuthAndMetricsRoutes(app: Express, deps: AuthRoutesDeps)
       res.json({ ok: true });
     });
 
-    app.get("/api/auth/me", jwtMiddleware, (req, res) => {
+    app.get("/api/auth/me", jwtMiddleware, ...apiRateLimiters, (req, res) => {
       const authReq = req as AuthenticatedRequest;
       res.json({ actor: authReq.actor, authSource: authReq.authSource });
     });
 
-    app.post("/api/auth/revoke-sessions", jwtMiddleware, async (req, res, next) => {
+    app.post("/api/auth/revoke-sessions", jwtMiddleware, ...apiRateLimiters, async (req, res, next) => {
       try {
         const authReq = req as AuthenticatedRequest;
         const nextVersion = await revokeUserSessions(db, authReq.actor!.userId);

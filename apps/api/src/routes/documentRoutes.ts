@@ -5,6 +5,8 @@ import {
   createDocumentSchema,
   importDocxRequestSchema,
   listDocumentsQuerySchema,
+  paginationQuerySchema,
+  restoreVersionRequestSchema,
   updateDocumentSchema,
 } from "@ai-office-suite/validation";
 import type { DocumentGateway } from "../documentGateway.ts";
@@ -121,7 +123,15 @@ export function registerDocumentRoutes(app: Express, deps: DocumentRoutesDeps): 
   app.get("/api/documents/:id/versions", async (req, res, next) => {
     try {
       const actor = getActor(req);
-      const versions = await gateway.listVersions(actor, req.params.id);
+      const parsed = paginationQuerySchema.safeParse(req.query);
+      if (!parsed.success) {
+        res.status(400).json({ error: "Invalid pagination query", code: "VALIDATION_ERROR", details: parsed.error.flatten() });
+        return;
+      }
+      const versions = await gateway.listVersions(actor, req.params.id, {
+        ...(typeof parsed.data.limit === "number" ? { limit: parsed.data.limit } : {}),
+        ...(typeof parsed.data.offset === "number" ? { offset: parsed.data.offset } : {}),
+      });
       res.json({ versions });
     } catch (err) {
       next(err);
@@ -157,7 +167,19 @@ export function registerDocumentRoutes(app: Express, deps: DocumentRoutesDeps): 
         res.status(400).json({ error: "Invalid revision number (must be integer 1..2147483647)", code: "VALIDATION_ERROR" });
         return;
       }
-      const restored = await gateway.restoreVersion(actor, req.params.id, rev);
+      const bodyParsed = restoreVersionRequestSchema.safeParse(req.body ?? {});
+      if (!bodyParsed.success) {
+        res.status(400).json({ error: "Invalid restore request body", code: "VALIDATION_ERROR", details: bodyParsed.error.flatten() });
+        return;
+      }
+      const restored = await gateway.restoreVersion(
+        actor,
+        req.params.id,
+        rev,
+        typeof bodyParsed.data.expectedRevision === "number"
+          ? { expectedRevision: bodyParsed.data.expectedRevision }
+          : undefined,
+      );
       res.json({ document: restored });
     } catch (err) {
       next(err);
@@ -207,7 +229,15 @@ export function registerDocumentRoutes(app: Express, deps: DocumentRoutesDeps): 
   app.get("/api/documents/:id/audit", async (req, res, next) => {
     try {
       const actor = getActor(req);
-      const events = await gateway.listAuditEvents(actor, req.params.id);
+      const parsed = paginationQuerySchema.safeParse(req.query);
+      if (!parsed.success) {
+        res.status(400).json({ error: "Invalid pagination query", code: "VALIDATION_ERROR", details: parsed.error.flatten() });
+        return;
+      }
+      const events = await gateway.listAuditEvents(actor, req.params.id, {
+        ...(typeof parsed.data.limit === "number" ? { limit: parsed.data.limit } : {}),
+        ...(typeof parsed.data.offset === "number" ? { offset: parsed.data.offset } : {}),
+      });
       res.json({ events });
     } catch (err) {
       next(err);

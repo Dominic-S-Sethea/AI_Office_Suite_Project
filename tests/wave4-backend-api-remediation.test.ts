@@ -3,8 +3,10 @@ import type { Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import os from "node:os";
 import path from "node:path";
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it, vi } from "vitest";
+import { detectChromiumBinary } from "@ai-office-suite/file-conversion";
 import { createApiApp } from "../apps/api/src/app.ts";
+import { LocalDocumentGateway } from "../apps/api/src/documentGateway.ts";
 import { createSlidingWindowRateLimiter } from "../apps/api/src/rateLimit.ts";
 import {
   PgliteDatabaseAdapter,
@@ -371,6 +373,17 @@ describe("Wave 4 — Backend & API Remediation (H13-H18, M8-M10)", () => {
       expect(createRes.status).toBe(201);
       const { document: created } = (await createRes.json()) as { document: StudioDocument };
 
+      const pdfSpy = detectChromiumBinary()
+        ? null
+        : vi.spyOn(LocalDocumentGateway.prototype, "exportPdf").mockImplementation(async () => {
+            await new Promise((r) => setTimeout(r, 150));
+            return {
+              pdfBuffer: Buffer.from("%PDF-1.4\n"),
+              filename: "concurrency-test.pdf",
+              engine: "test-concurrency-stub",
+            };
+          });
+
       const responses = await Promise.all(
         Array.from({ length: 6 }, () =>
           fetch(`${baseUrl}/api/documents/${created.documentId}/export/pdf`, {
@@ -379,6 +392,7 @@ describe("Wave 4 — Backend & API Remediation (H13-H18, M8-M10)", () => {
           }),
         ),
       );
+      pdfSpy?.mockRestore();
       const statuses = responses.map((r) => r.status);
       expect(statuses).toContain(200);
       expect(statuses).toContain(503);

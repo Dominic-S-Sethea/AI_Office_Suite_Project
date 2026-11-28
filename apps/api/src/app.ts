@@ -252,6 +252,7 @@ export function createApiApp(options: CreateApiAppOptions = {}): Express {
     if (
       req.path.startsWith("/api/auth") ||
       req.path.startsWith("/api/documents") ||
+      req.path.startsWith("/api/speech") ||
       req.path.startsWith("/api/data-prep") ||
       req.path.startsWith("/api/metrics")
     ) {

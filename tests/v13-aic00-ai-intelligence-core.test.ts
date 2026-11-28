@@ -1084,9 +1084,10 @@ describe("V1.4 Aligned AIC-00 — AI Intelligence Core Feasibility (AI-T01..AI-T
     expect(executions).toBe(2);
   });
 
-  it("AI-T19: cancel active workflow — halts remaining steps safely, preserves committed state & releases unspent quota", async () => {
+  it("AI-T19: cancel active workflow — halts remaining steps safely, preserves committed state & settles spent inference tokens", async () => {
     const audit = new InMemoryAuditStore();
     let released = false;
+    let settledTokens = 0;
     let executedSteps = 0;
     const registry = new ToolDefinitionRegistry();
     registry.register({
@@ -1111,7 +1112,9 @@ describe("V1.4 Aligned AIC-00 — AI Intelligence Core Feasibility (AI-T01..AI-T
       audit,
       quota: {
         reserveTokens: async () => ({ reservationId: "res-cancel-1" }),
-        settleTokens: async () => {},
+        settleTokens: async (p) => {
+          settledTokens = p.actualTokens;
+        },
         releaseTokens: async () => {
           released = true;
         },
@@ -1138,7 +1141,9 @@ describe("V1.4 Aligned AIC-00 — AI Intelligence Core Feasibility (AI-T01..AI-T
 
     expect(res.run.state).toBe("canceled");
     expect(executedSteps).toBe(0);
-    expect(released).toBe(true);
+    expect(released).toBe(false);
+    expect(settledTokens).toBe(res.run.tokensUsed);
+    expect(settledTokens).toBeGreaterThan(0);
     expect(res.run.steps.every((s) => s.status === "skipped_canceled")).toBe(true);
   });
 

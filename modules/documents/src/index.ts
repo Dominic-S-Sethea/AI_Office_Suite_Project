@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type {
   ActorContext,
   AuditEvent,
@@ -304,9 +304,21 @@ export class DocumentService {
     return updated;
   }
 
-  async listVersions(actor: ActorContext, documentId: string): Promise<DocumentVersion[]> {
+  async listVersions(
+    actor: ActorContext,
+    documentId: string,
+    options?: { limit?: number; offset?: number },
+  ): Promise<DocumentVersion[]> {
     await this.getDocument(actor, documentId);
-    return this.storage.listVersions(documentId);
+    const allVersions = await this.storage.listVersions(documentId);
+    if (!options?.limit && !options?.offset) {
+      return allVersions;
+    }
+    const rawLimit = options?.limit ?? 200;
+    const limit = Number.isFinite(rawLimit) ? Math.min(200, Math.max(1, Math.trunc(rawLimit))) : 200;
+    const rawOffset = options?.offset ?? 0;
+    const offset = Number.isFinite(rawOffset) ? Math.min(100_000, Math.max(0, Math.trunc(rawOffset))) : 0;
+    return allVersions.slice(offset, offset + limit);
   }
 
   async getVersion(actor: ActorContext, documentId: string, revision: number): Promise<DocumentVersion | null> {
@@ -318,9 +330,20 @@ export class DocumentService {
     actor: ActorContext,
     documentId: string,
     targetRevision: number,
+    options?: { expectedRevision?: number },
   ): Promise<StudioDocument> {
     assertCanPerform(actor, "document", "restore");
     const current = await this.getDocument(actor, documentId);
+    if (
+      typeof options?.expectedRevision === "number" &&
+      current.revision !== options.expectedRevision
+    ) {
+      throw new DocumentEngineError(
+        409,
+        "REVISION_CONFLICT",
+        `Expected revision ${options.expectedRevision}, but current revision is ${current.revision}.`,
+      );
+    }
     const target = await this.storage.getVersion(documentId, targetRevision);
     if (!target) {
       throw new DocumentEngineError(
@@ -392,9 +415,10 @@ export class DocumentService {
     buffer: Uint8Array,
   ): Promise<{ document: StudioDocument; diagnostics: ImportDiagnostics }> {
     assertCanPerform(actor, "document", "create");
-    const storedOriginal = await this.storage.saveOriginalBinary(buffer, "docx");
+    const rawSha256 = createHash("sha256").update(buffer).digest("hex");
 
     try {
+      // Validate & parse DOCX before persisting binary bytes to object storage (F-03)
       const { document, diagnostics } = await importFromDocxBuffer({
         buffer,
         filename,
@@ -402,6 +426,8 @@ export class DocumentService {
         workspaceId: actor.workspaceId,
         actorId: actor.userId,
       });
+
+      const storedOriginal = await this.storage.saveOriginalBinary(buffer, "docx");
 
       const version: DocumentVersion = {
         versionId: `ver_${randomUUID()}`,
@@ -442,7 +468,7 @@ export class DocumentService {
         action: "document.import_rejected",
         outcome: "denied",
         summary: `Rejected DOCX import '${filename}': ${error instanceof Error ? error.message : "unknown error"}`,
-        metadata: { originalSha256: storedOriginal.sha256 },
+        metadata: { originalSha256: rawSha256 },
       });
       throw error;
     }
@@ -468,9 +494,21 @@ export class DocumentService {
     return { ...result, filename: `${doc.documentId}-rev${doc.revision}.pdf` };
   }
 
-  async listAuditEvents(actor: ActorContext, documentId: string): Promise<AuditEvent[]> {
+  async listAuditEvents(
+    actor: ActorContext,
+    documentId: string,
+    options?: { limit?: number; offset?: number },
+  ): Promise<AuditEvent[]> {
     await this.getDocument(actor, documentId);
     assertCanPerform(actor, "audit", "read");
-    return this.audit.listForDocument(actor.tenantId, actor.workspaceId, documentId);
+    const events = this.audit.listForDocument(actor.tenantId, actor.workspaceId, documentId);
+    if (!options?.limit && !options?.offset) {
+      return events;
+    }
+    const rawLimit = options?.limit ?? 200;
+    const limit = Number.isFinite(rawLimit) ? Math.min(200, Math.max(1, Math.trunc(rawLimit))) : 200;
+    const rawOffset = options?.offset ?? 0;
+    const offset = Number.isFinite(rawOffset) ? Math.min(100_000, Math.max(0, Math.trunc(rawOffset))) : 0;
+    return events.slice(offset, offset + limit);
   }
 }

@@ -30,6 +30,7 @@ import { computeDescriptiveStatistics } from "@ai-office-suite/analytics-engine"
 import {
   buildPresentationHtml,
   CORPORATE_THEME_V1,
+  createPresentationDeliverySession,
   exportPresentationToPptxBuffer,
 } from "@ai-office-suite/presentation-engine";
 import {
@@ -53,7 +54,11 @@ import {
   VoiceGovernancePipeline,
   type P1VoiceFeatureId,
 } from "@ai-office-suite/speech-engine";
-import { inspectAndExtractOoxmlZip } from "@ai-office-suite/validation";
+import {
+  evaluateReleaseEvidenceGate,
+  inspectAndExtractOoxmlZip,
+  type ReleaseEvidenceGateInput,
+} from "@ai-office-suite/validation";
 
 const TENANT_A = "11110000-0000-4000-8000-000000000014";
 const WS_A = "aaaa0000-0000-4000-8000-000000000014";
@@ -405,30 +410,19 @@ describe("V1.4 TF-01 — RC-T01..RC-T08 Consolidation, RC-P1-01..05 Gates & Miss
       updatedAt: NOW_ISO,
     };
 
-    // Deterministic keyboard delivery controller filtering hidden slides and enforcing bounds
-    const visibleSlides = [...deck.slides].filter((s) => !s.hidden).sort((a, b) => a.order - b.order);
-    let activeIndex = 0;
-    let presenting = true;
-    const handleKey = (key: "ArrowRight" | "ArrowLeft" | "Home" | "End" | "Escape") => {
-      if (!presenting) return;
-      if (key === "ArrowRight") activeIndex = Math.min(visibleSlides.length - 1, activeIndex + 1);
-      else if (key === "ArrowLeft") activeIndex = Math.max(0, activeIndex - 1);
-      else if (key === "Home") activeIndex = 0;
-      else if (key === "End") activeIndex = visibleSlides.length - 1;
-      else if (key === "Escape") presenting = false;
-    };
-
-    expect(visibleSlides.map((s) => s.slideId)).toEqual(["s-cover", "s-kpi", "s-close"]);
-    handleKey("ArrowRight");
-    expect(visibleSlides[activeIndex]?.slideId).toBe("s-kpi");
-    handleKey("ArrowRight");
-    expect(visibleSlides[activeIndex]?.slideId).toBe("s-close");
-    handleKey("ArrowRight"); // Clamps at final slide without corruption
-    expect(visibleSlides[activeIndex]?.slideId).toBe("s-close");
-    handleKey("ArrowLeft");
-    expect(visibleSlides[activeIndex]?.slideId).toBe("s-kpi");
-    handleKey("Escape");
-    expect(presenting).toBe(false);
+    // Deterministic production delivery controller filtering hidden slides and enforcing bounds (F-24)
+    const delivery = createPresentationDeliverySession(deck);
+    expect(delivery.visibleSlides.map((s) => s.slideId)).toEqual(["s-cover", "s-kpi", "s-close"]);
+    delivery.handleKey("ArrowRight");
+    expect(delivery.getActiveSlide()?.slideId).toBe("s-kpi");
+    delivery.handleKey("ArrowRight");
+    expect(delivery.getActiveSlide()?.slideId).toBe("s-close");
+    delivery.handleKey("ArrowRight"); // Clamps at final slide without corruption
+    expect(delivery.getActiveSlide()?.slideId).toBe("s-close");
+    delivery.handleKey("ArrowLeft");
+    expect(delivery.getActiveSlide()?.slideId).toBe("s-kpi");
+    delivery.handleKey("Escape");
+    expect(delivery.isPresenting()).toBe(false);
 
     const html = buildPresentationHtml(deck);
     expect(html).toContain("Slide 1: Cover");
@@ -703,37 +697,20 @@ describe("V1.4 TF-01 — RC-T01..RC-T08 Consolidation, RC-P1-01..05 Gates & Miss
   });
 
   it("RC-T08 (FR-12/FR-13): release evidence gate blocks release on missing fixture, stale approval, or mock-only evidence for real gate", () => {
-    interface ReleaseEvidenceInput {
-      requiredFixturesPresent: boolean;
-      approvalValidAndFresh: boolean;
-      authorizationChecksPassed: boolean;
-      requiresRealEnvironment: boolean;
-      submittedEvidenceIsMock: boolean;
-    }
-
-    function evaluateReleaseGate(input: ReleaseEvidenceInput): { allowed: boolean; reasons: string[] } {
-      const reasons: string[] = [];
-      if (!input.requiredFixturesPresent) reasons.push("MISSING_MANDATORY_FIXTURE");
-      if (!input.approvalValidAndFresh) reasons.push("STALE_OR_MISSING_APPROVAL");
-      if (!input.authorizationChecksPassed) reasons.push("AUTHORIZATION_CHECK_FAILED");
-      if (input.requiresRealEnvironment && input.submittedEvidenceIsMock) {
-        reasons.push("MOCK_ONLY_EVIDENCE_CANNOT_PASS_REAL_ENV_GATE");
-      }
-      return { allowed: reasons.length === 0, reasons };
-    }
+    const sampleMissing: ReleaseEvidenceGateInput = {
+      requiredFixturesPresent: false,
+      approvalValidAndFresh: true,
+      authorizationChecksPassed: true,
+      requiresRealEnvironment: false,
+      submittedEvidenceIsMock: false,
+    };
+    expect(evaluateReleaseEvidenceGate(sampleMissing)).toEqual({
+      allowed: false,
+      reasons: ["MISSING_MANDATORY_FIXTURE"],
+    });
 
     expect(
-      evaluateReleaseGate({
-        requiredFixturesPresent: false,
-        approvalValidAndFresh: true,
-        authorizationChecksPassed: true,
-        requiresRealEnvironment: false,
-        submittedEvidenceIsMock: false,
-      }),
-    ).toEqual({ allowed: false, reasons: ["MISSING_MANDATORY_FIXTURE"] });
-
-    expect(
-      evaluateReleaseGate({
+      evaluateReleaseEvidenceGate({
         requiredFixturesPresent: true,
         approvalValidAndFresh: false,
         authorizationChecksPassed: false,
@@ -750,7 +727,7 @@ describe("V1.4 TF-01 — RC-T01..RC-T08 Consolidation, RC-P1-01..05 Gates & Miss
     });
 
     expect(
-      evaluateReleaseGate({
+      evaluateReleaseEvidenceGate({
         requiredFixturesPresent: true,
         approvalValidAndFresh: true,
         authorizationChecksPassed: true,
@@ -828,6 +805,7 @@ describe("V1.4 TF-01 — RC-T01..RC-T08 Consolidation, RC-P1-01..05 Gates & Miss
     });
     expect(misheard.outcome).toBe("awaiting_review_clarify");
     const corrected = voice.confirmReviewedTranscript({
+      actor: EDITOR_A,
       sessionId: misheard.session.sessionId,
       editedTranscript: 'replace with "Dear Mr. Sokha Chann at Phnom Penh Holdings"',
       eventId: "doc-t03-confirm",

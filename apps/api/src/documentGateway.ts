@@ -26,6 +26,7 @@ import { buildBilingualSampleDocument, DocumentService } from "@ai-office-suite/
 import {
   AiDocumentExecutor,
   AiPlanningError,
+  isUndoCommandIntent,
   planDocumentOperation,
   verifyDocumentProposalSignature,
   type ApplyProposalResult,
@@ -75,14 +76,19 @@ export interface DocumentGateway {
   seedBilingualFixture(actor: ActorContext): Promise<StudioDocument>;
   getDocument(actor: ActorContext, documentId: string): Promise<StudioDocument>;
   updateDocument(actor: ActorContext, documentId: string, input: UpdateDocumentGatewayInput): Promise<StudioDocument>;
-  listVersions(actor: ActorContext, documentId: string): Promise<DocumentVersion[]>;
+  listVersions(actor: ActorContext, documentId: string, options?: { limit?: number; offset?: number }): Promise<DocumentVersion[]>;
   getVersionsForDiff(
     actor: ActorContext,
     documentId: string,
     fromRev: number,
     toRev: number,
   ): Promise<{ fromDoc: StudioDocument | null; toDoc: StudioDocument | null }>;
-  restoreVersion(actor: ActorContext, documentId: string, revision: number): Promise<StudioDocument>;
+  restoreVersion(
+    actor: ActorContext,
+    documentId: string,
+    revision: number,
+    options?: { expectedRevision?: number },
+  ): Promise<StudioDocument>;
   planAiOperation(actor: ActorContext, documentId: string, input: PlanCommandInput): Promise<DocumentOperationProposal>;
   applyAiOperation(
     actor: ActorContext,
@@ -97,7 +103,7 @@ export interface DocumentGateway {
   ): Promise<{ document: StudioDocument; diagnostics: ImportDiagnostics }>;
   exportDocx(actor: ActorContext, documentId: string): Promise<{ buffer: Buffer; filename: string }>;
   exportPdf(actor: ActorContext, documentId: string): Promise<{ pdfBuffer: Buffer; filename: string; engine: string }>;
-  listAuditEvents(actor: ActorContext, documentId: string): Promise<AuditEvent[]>;
+  listAuditEvents(actor: ActorContext, documentId: string, options?: { limit?: number; offset?: number }): Promise<AuditEvent[]>;
   recordAudit(actor: ActorContext, entry: DocumentGatewayAuditInput): Promise<void>;
 }
 
@@ -164,8 +170,8 @@ export class PgDocumentGateway implements DocumentGateway {
     );
   }
 
-  listVersions(actor: ActorContext, documentId: string): Promise<DocumentVersion[]> {
-    return this.pgRepo.listVersions(actor, documentId);
+  listVersions(actor: ActorContext, documentId: string, options?: { limit?: number; offset?: number }): Promise<DocumentVersion[]> {
+    return this.pgRepo.listVersions(actor, documentId, options);
   }
 
   getVersionsForDiff(
@@ -177,8 +183,13 @@ export class PgDocumentGateway implements DocumentGateway {
     return this.pgRepo.getVersionsForDiff(actor, documentId, fromRev, toRev);
   }
 
-  restoreVersion(actor: ActorContext, documentId: string, revision: number): Promise<StudioDocument> {
-    return this.pgRepo.restoreVersion(actor, documentId, revision);
+  restoreVersion(
+    actor: ActorContext,
+    documentId: string,
+    revision: number,
+    options?: { expectedRevision?: number },
+  ): Promise<StudioDocument> {
+    return this.pgRepo.restoreVersion(actor, documentId, revision, options);
   }
 
   async planAiOperation(
@@ -186,14 +197,11 @@ export class PgDocumentGateway implements DocumentGateway {
     documentId: string,
     input: PlanCommandInput,
   ): Promise<DocumentOperationProposal> {
+    assertCanPerform(actor, "document", "write");
     const doc = await this.pgRepo.getDocument(actor, documentId);
     let priorSnapshot: StudioDocument | null = null;
-    if (doc.revision > 1) {
-      const versions = await this.pgRepo.listVersions(actor, doc.documentId);
-      const undoTarget = resolveUndoTargetRevision(versions);
-      if (undoTarget !== null) {
-        priorSnapshot = versions.find((v) => v.revision === undoTarget)?.snapshot ?? null;
-      }
+    if (doc.revision > 1 && isUndoCommandIntent(input.command)) {
+      priorSnapshot = await this.pgRepo.getUndoTargetSnapshot(actor, doc.documentId);
     }
 
     // Capture planner audit events so jwt-pg mode persists EVERY plan & prompt-injection denial to PostgreSQL (H13)
@@ -391,8 +399,8 @@ export class PgDocumentGateway implements DocumentGateway {
     };
   }
 
-  listAuditEvents(actor: ActorContext, documentId: string): Promise<AuditEvent[]> {
-    return this.pgRepo.listAuditEvents(actor, documentId);
+  listAuditEvents(actor: ActorContext, documentId: string, options?: { limit?: number; offset?: number }): Promise<AuditEvent[]> {
+    return this.pgRepo.listAuditEvents(actor, documentId, options);
   }
 
   async recordAudit(actor: ActorContext, entry: DocumentGatewayAuditInput): Promise<void> {
@@ -446,8 +454,8 @@ export class LocalDocumentGateway implements DocumentGateway {
     return this.documents.updateDocument(actor, documentId, input);
   }
 
-  listVersions(actor: ActorContext, documentId: string): Promise<DocumentVersion[]> {
-    return this.documents.listVersions(actor, documentId);
+  listVersions(actor: ActorContext, documentId: string, options?: { limit?: number; offset?: number }): Promise<DocumentVersion[]> {
+    return this.documents.listVersions(actor, documentId, options);
   }
 
   async getVersionsForDiff(
@@ -464,8 +472,13 @@ export class LocalDocumentGateway implements DocumentGateway {
     };
   }
 
-  restoreVersion(actor: ActorContext, documentId: string, revision: number): Promise<StudioDocument> {
-    return this.documents.restoreVersion(actor, documentId, revision);
+  restoreVersion(
+    actor: ActorContext,
+    documentId: string,
+    revision: number,
+    options?: { expectedRevision?: number },
+  ): Promise<StudioDocument> {
+    return this.documents.restoreVersion(actor, documentId, revision, options);
   }
 
   async planAiOperation(
@@ -473,9 +486,10 @@ export class LocalDocumentGateway implements DocumentGateway {
     documentId: string,
     input: PlanCommandInput,
   ): Promise<DocumentOperationProposal> {
+    assertCanPerform(actor, "document", "write");
     const doc = await this.documents.getDocument(actor, documentId);
     let priorSnapshot: StudioDocument | null = null;
-    if (doc.revision > 1) {
+    if (doc.revision > 1 && isUndoCommandIntent(input.command)) {
       const versions = await this.documents.listVersions(actor, doc.documentId);
       const undoTarget = resolveUndoTargetRevision(versions);
       if (undoTarget !== null) {
@@ -519,8 +533,8 @@ export class LocalDocumentGateway implements DocumentGateway {
     return this.documents.exportPdf(actor, documentId);
   }
 
-  listAuditEvents(actor: ActorContext, documentId: string): Promise<AuditEvent[]> {
-    return this.documents.listAuditEvents(actor, documentId);
+  listAuditEvents(actor: ActorContext, documentId: string, options?: { limit?: number; offset?: number }): Promise<AuditEvent[]> {
+    return this.documents.listAuditEvents(actor, documentId, options);
   }
 
   async recordAudit(_actor: ActorContext, entry: DocumentGatewayAuditInput): Promise<void> {

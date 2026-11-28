@@ -22,11 +22,30 @@ import {
 } from "@ai-office-suite/document-engine";
 
 const EPHEMERAL_PROPOSAL_HMAC_KEY = randomBytes(32).toString("hex");
+const PLACEHOLDER_SECRET_RE = /(changeme|placeholder|super_secret|dev_key|example_secret|default_secret|replace-with)/i;
+export const DEFAULT_PROPOSAL_TTL_MS = 15 * 60 * 1000;
+const MAX_PROPOSAL_CLOCK_SKEW_MS = 60_000;
 
 function resolveProposalHmacKey(): string {
-  const configured = process.env.PROPOSAL_SIGNING_KEY?.trim() || process.env.JWT_SECRET?.trim();
+  const configured =
+    process.env.AI_PROPOSAL_SIGNING_SECRET?.trim() || process.env.PROPOSAL_SIGNING_KEY?.trim();
+  const jwtSecret = process.env.JWT_SECRET?.trim();
+  if (process.env.NODE_ENV === "production") {
+    if (!configured || configured.length < 32 || PLACEHOLDER_SECRET_RE.test(configured)) {
+      throw new Error(
+        "AI_PROPOSAL_SIGNING_SECRET must be set to a strong non-placeholder secret (>= 32 chars) in production.",
+      );
+    }
+    if (jwtSecret && configured === jwtSecret) {
+      throw new Error("AI_PROPOSAL_SIGNING_SECRET must be distinct from JWT_SECRET in production.");
+    }
+    return configured;
+  }
   if (configured && configured.length >= 32) {
     return configured;
+  }
+  if (jwtSecret && jwtSecret.length >= 32) {
+    return jwtSecret;
   }
   return EPHEMERAL_PROPOSAL_HMAC_KEY;
 }
@@ -57,7 +76,25 @@ export function signDocumentProposal(actor: ActorContext, proposal: DocumentOper
     .digest("hex");
 }
 
-export function verifyDocumentProposalSignature(actor: ActorContext, proposal: DocumentOperationProposal): boolean {
+export function verifyDocumentProposalSignature(
+  actor: ActorContext,
+  proposal: DocumentOperationProposal,
+  options: { maxAgeMs?: number; nowMs?: number } = {},
+): boolean {
+  const maxAgeMs = options.maxAgeMs ?? DEFAULT_PROPOSAL_TTL_MS;
+  const nowMs = options.nowMs ?? Date.now();
+  const createdMs = Date.parse(proposal.createdAt);
+  if (
+    !Number.isFinite(nowMs) ||
+    !Number.isFinite(createdMs) ||
+    !Number.isFinite(maxAgeMs) ||
+    maxAgeMs <= 0
+  ) {
+    return false;
+  }
+  if (nowMs - createdMs > maxAgeMs || createdMs > nowMs + MAX_PROPOSAL_CLOCK_SKEW_MS) {
+    return false;
+  }
   const provided = proposal.proposalSignature;
   if (!provided || !/^[0-9a-f]{64}$/i.test(provided)) {
     return false;
@@ -109,6 +146,15 @@ function extractQuotedText(command: string): string | null {
   return match?.[1]?.trim() || null;
 }
 
+export function isUndoCommandIntent(command: string): boolean {
+  const normalized = khmerNumeralsToArabic(normalizeDocumentText(command).trim());
+  const lower = normalized.toLowerCase();
+  return (
+    /^(undo|revert)\b/i.test(lower) ||
+    /(មិនធ្វើវិញ|ត្រឡប់ក្រោយ|មិនយកការកែប្រែ)/.test(normalized)
+  );
+}
+
 function parseBilingualCommand(
   command: string,
   selectedText: string,
@@ -123,10 +169,7 @@ function parseBilingualCommand(
   const lower = normalized.toLowerCase();
 
   // 1. Undo last change (EN / KM)
-  if (
-    /^(undo|revert)\b/i.test(lower) ||
-    /(មិនធ្វើវិញ|ត្រឡប់ក្រោយ|មិនយកការកែប្រែ)/.test(normalized)
-  ) {
+  if (isUndoCommandIntent(command)) {
     return {
       action: "undo_last",
       params: {},
@@ -323,7 +366,15 @@ export function planDocumentOperation(params: {
   const selectedText = input.selection?.selectedText ?? blockPlainText;
 
   // Untrusted-content & prompt-injection defense (D4.05 / AI-05)
-  const safetyScan = scanForPromptInjection(input.command, blockPlainText);
+  const blockScan = scanForPromptInjection(input.command, blockPlainText);
+  const selectionScan =
+    input.selection?.selectedText && input.selection.selectedText !== blockPlainText
+      ? scanForPromptInjection("", input.selection.selectedText)
+      : { safe: true, reasons: [] };
+  const safetyScan = {
+    safe: blockScan.safe && selectionScan.safe,
+    reasons: Array.from(new Set([...blockScan.reasons, ...selectionScan.reasons])),
+  };
   if (!safetyScan.safe) {
     audit.append({
       auditId: `aud_${randomUUID()}`,
