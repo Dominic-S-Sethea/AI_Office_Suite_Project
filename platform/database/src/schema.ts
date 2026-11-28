@@ -1,6 +1,6 @@
 import type { PgDatabaseAdapter, PgQueryExecutor } from "./adapter.ts";
 
-export const CORE_SCHEMA_VERSION = "2026.11.v2-core";
+export const CORE_SCHEMA_VERSION = "2026.11.v2.2-core";
 const CORE_SCHEMA_LOCK_KEY = 84102001;
 
 export const D2_POSTGRESQL_SCHEMA_SQL = `
@@ -42,14 +42,64 @@ CREATE TABLE IF NOT EXISTS workspaces (
 );
 
 CREATE TABLE IF NOT EXISTS memberships (
-  tenant_id    UUID NOT NULL REFERENCES organizations(tenant_id),
-  workspace_id UUID NOT NULL,
-  user_id      UUID NOT NULL REFERENCES users(user_id),
-  role         TEXT NOT NULL CHECK (role IN ('owner', 'administrator', 'editor', 'reviewer', 'viewer')),
-  created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+  tenant_id      UUID NOT NULL REFERENCES organizations(tenant_id),
+  workspace_id   UUID NOT NULL,
+  user_id        UUID NOT NULL REFERENCES users(user_id),
+  role           TEXT NOT NULL CHECK (role IN (
+    'owner',
+    'administrator',
+    'workspace_manager',
+    'billing_admin',
+    'auditor',
+    'editor',
+    'reviewer',
+    'viewer'
+  )),
+  status         TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'suspended', 'revoked')),
+  content_access BOOLEAN NOT NULL DEFAULT true,
+  created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
   PRIMARY KEY (tenant_id, workspace_id, user_id),
   FOREIGN KEY (tenant_id, workspace_id) REFERENCES workspaces(tenant_id, workspace_id)
 );
+
+ALTER TABLE memberships ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'active';
+ALTER TABLE memberships ADD COLUMN IF NOT EXISTS content_access BOOLEAN NOT NULL DEFAULT true;
+DO $$
+DECLARE
+  c_name TEXT;
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint WHERE conname = 'memberships_status_check'
+  ) THEN
+    ALTER TABLE memberships
+      ADD CONSTRAINT memberships_status_check CHECK (status IN ('active', 'suspended', 'revoked'));
+  END IF;
+
+  FOR c_name IN
+    SELECT con.conname
+    FROM pg_constraint con
+    JOIN pg_class rel ON rel.oid = con.conrelid
+    WHERE rel.relname = 'memberships'
+      AND con.contype = 'c'
+      AND pg_get_constraintdef(con.oid) LIKE '%role%'
+  LOOP
+    EXECUTE format('ALTER TABLE memberships DROP CONSTRAINT IF EXISTS %I', c_name);
+  END LOOP;
+
+  ALTER TABLE memberships
+    ADD CONSTRAINT memberships_role_check
+    CHECK (role IN (
+      'owner',
+      'administrator',
+      'workspace_manager',
+      'billing_admin',
+      'auditor',
+      'editor',
+      'reviewer',
+      'viewer'
+    ));
+END
+$$;
 
 CREATE TABLE IF NOT EXISTS documents (
   tenant_id             UUID NOT NULL,
@@ -152,12 +202,77 @@ CREATE INDEX IF NOT EXISTS ai_applied_ops_doc_idx ON ai_applied_operations (tena
 CREATE INDEX IF NOT EXISTS idempotency_keys_expires_idx ON idempotency_keys (expires_at);
 
 GRANT USAGE ON SCHEMA public TO app_runtime;
-GRANT SELECT, INSERT, UPDATE ON organizations, users, memberships, workspaces, documents, idempotency_keys TO app_runtime;
+GRANT SELECT, INSERT, UPDATE ON organizations, memberships, workspaces, documents, idempotency_keys TO app_runtime;
+REVOKE ALL ON TABLE users FROM app_runtime;
+GRANT SELECT (user_id, email, token_version, status, created_at) ON users TO app_runtime;
 GRANT DELETE ON idempotency_keys TO app_runtime;
 GRANT SELECT, INSERT ON document_versions, audit_logs, ai_applied_operations TO app_runtime;
 REVOKE UPDATE, DELETE ON audit_logs FROM app_runtime;
 REVOKE UPDATE, DELETE ON document_versions FROM app_runtime;
 REVOKE UPDATE, DELETE ON ai_applied_operations FROM app_runtime;
+
+-- Narrow SECURITY DEFINER identity routines so app_runtime never reads users.password_hash directly (F-04)
+CREATE OR REPLACE FUNCTION auth_lookup_user_for_login(p_email TEXT)
+RETURNS TABLE (
+  user_id UUID,
+  email TEXT,
+  password_hash TEXT,
+  token_version INTEGER,
+  status TEXT
+)
+LANGUAGE sql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $$
+  SELECT u.user_id, u.email, u.password_hash, u.token_version, u.status
+  FROM public.users u
+  WHERE lower(u.email) = lower(trim(p_email))
+  LIMIT 1;
+$$;
+
+REVOKE ALL ON FUNCTION auth_lookup_user_for_login(TEXT) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION auth_lookup_user_for_login(TEXT) TO app_runtime;
+
+CREATE OR REPLACE FUNCTION auth_bump_user_token_version(p_user_id UUID)
+RETURNS INTEGER
+LANGUAGE sql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $$
+  UPDATE public.users
+  SET token_version = token_version + 1
+  WHERE user_id = p_user_id
+  RETURNING token_version;
+$$;
+
+REVOKE ALL ON FUNCTION auth_bump_user_token_version(UUID) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION auth_bump_user_token_version(UUID) TO app_runtime;
+
+ALTER TABLE organizations ENABLE ROW LEVEL SECURITY;
+ALTER TABLE organizations FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS tenant_isolation_organizations ON organizations;
+CREATE POLICY tenant_isolation_organizations ON organizations
+  USING (tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')::uuid)
+  WITH CHECK (tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')::uuid);
+
+ALTER TABLE memberships ENABLE ROW LEVEL SECURITY;
+ALTER TABLE memberships FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS tenant_isolation_memberships ON memberships;
+CREATE POLICY tenant_isolation_memberships ON memberships
+  USING (
+    tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')::uuid
+    AND (
+      NULLIF(current_setting('app.current_workspace_id', true), '') IS NULL
+      OR workspace_id = NULLIF(current_setting('app.current_workspace_id', true), '')::uuid
+    )
+  )
+  WITH CHECK (
+    tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')::uuid
+    AND (
+      NULLIF(current_setting('app.current_workspace_id', true), '') IS NULL
+      OR workspace_id = NULLIF(current_setting('app.current_workspace_id', true), '')::uuid
+    )
+  );
 
 ALTER TABLE workspaces ENABLE ROW LEVEL SECURITY;
 ALTER TABLE workspaces FORCE ROW LEVEL SECURITY;
@@ -263,11 +378,38 @@ export async function initializePostgreSqlSchema(
       );
     `);
     if (!options.force) {
-      const existing = await tx.query<{ version: string; core_present: boolean }>(
-        "SELECT version, (to_regclass('public.organizations') IS NOT NULL) AS core_present FROM schema_migrations WHERE version = $1",
+      const existing = await tx.query<{
+        version: string;
+        core_present: boolean;
+        membership_cols_present: boolean;
+        auth_fn_present: boolean;
+      }>(
+        `SELECT version,
+                (to_regclass('public.organizations') IS NOT NULL) AS core_present,
+                (
+                  EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_schema = 'public' AND table_name = 'memberships' AND column_name = 'status'
+                  )
+                  AND EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_schema = 'public' AND table_name = 'memberships' AND column_name = 'content_access'
+                  )
+                ) AS membership_cols_present,
+                EXISTS (
+                  SELECT 1 FROM pg_proc
+                  WHERE proname = 'auth_lookup_user_for_login'
+                ) AS auth_fn_present
+         FROM schema_migrations
+         WHERE version = $1`,
         [CORE_SCHEMA_VERSION],
       );
-      if (existing.rows.length > 0 && existing.rows[0]?.core_present) {
+      if (
+        existing.rows.length > 0 &&
+        existing.rows[0]?.core_present &&
+        existing.rows[0]?.membership_cols_present &&
+        existing.rows[0]?.auth_fn_present
+      ) {
         return { applied: false, version: CORE_SCHEMA_VERSION };
       }
     }
@@ -343,12 +485,15 @@ export interface DatabaseReadinessReport {
     connectivity: boolean;
     appRuntimeLeastPrivilege: boolean;
     currentConnectionLeastPrivilege: boolean;
+    usersPasswordHashIsolated: boolean;
     coreForceRlsEnabled: boolean;
     missingForceRlsTables: string[];
   };
 }
 
 const CORE_RLS_TABLES = [
+  "organizations",
+  "memberships",
   "workspaces",
   "documents",
   "document_versions",
@@ -364,6 +509,7 @@ export async function verifyDatabaseRlsReadiness(
   let connectivity = false;
   let appRuntimeLeastPrivilege = false;
   let currentConnectionLeastPrivilege = false;
+  let usersPasswordHashIsolated = false;
   let coreForceRlsEnabled = false;
   let missingForceRlsTables: string[] = [...CORE_RLS_TABLES];
 
@@ -382,6 +528,14 @@ export async function verifyDatabaseRlsReadiness(
     currentConnectionLeastPrivilege = Boolean(
       curRoleRow && curRoleRow.rolsuper === false && curRoleRow.rolbypassrls === false,
     );
+
+    const privRes = await db.query<{ can_read_pw_hash: boolean; can_update_users: boolean }>(
+      `SELECT
+         has_column_privilege('app_runtime', 'public.users', 'password_hash', 'SELECT') AS can_read_pw_hash,
+         has_table_privilege('app_runtime', 'public.users', 'UPDATE') AS can_update_users`,
+    );
+    const privRow = privRes.rows[0];
+    usersPasswordHashIsolated = Boolean(privRow && !privRow.can_read_pw_hash && !privRow.can_update_users);
 
     const rlsRes = await db.query<{ relname: string; relrowsecurity: boolean; relforcerowsecurity: boolean }>(
       `SELECT c.relname, c.relrowsecurity, c.relforcerowsecurity
@@ -404,12 +558,18 @@ export async function verifyDatabaseRlsReadiness(
   const connectionPrivilegeOk = options.requireNonSuperuserConnection ? currentConnectionLeastPrivilege : true;
 
   return {
-    ready: connectivity && appRuntimeLeastPrivilege && connectionPrivilegeOk && coreForceRlsEnabled,
+    ready:
+      connectivity &&
+      appRuntimeLeastPrivilege &&
+      connectionPrivilegeOk &&
+      usersPasswordHashIsolated &&
+      coreForceRlsEnabled,
     engine: db.engine,
     checks: {
       connectivity,
       appRuntimeLeastPrivilege,
       currentConnectionLeastPrivilege,
+      usersPasswordHashIsolated,
       coreForceRlsEnabled,
       missingForceRlsTables,
     },

@@ -4,16 +4,23 @@ import path from "node:path";
 import {
   createPgPoolConfigFromEnv,
   exportLogicalBackupSnapshot,
+  exportPaExtendedLogicalBackup,
+  initializePaGovernanceSchema,
   initializePostgreSqlSchema,
   NodePgDatabaseAdapter,
+  PA_RLS_TABLES,
   provisionAppRuntimeLoginRole,
   restoreLogicalBackupSnapshot,
+  restorePaExtendedLogicalBackup,
   verifyDatabaseRlsReadiness,
+  verifyPaRlsReadiness,
 } from "../platform/database/src/index.ts";
 import { initializeIntegrationSchema } from "../engines/integration/src/pgPersistence.ts";
 import { hashPassword } from "../platform/identity/src/authService.ts";
 
 const ALL_TENANT_RLS_TABLES = [
+  "organizations",
+  "memberships",
   "workspaces",
   "documents",
   "document_versions",
@@ -27,6 +34,7 @@ const ALL_TENANT_RLS_TABLES = [
   "xi_reporting_packages",
   "xi_package_approvals",
   "xi_outbox_events",
+  ...PA_RLS_TABLES,
 ];
 
 const NO_UPDATE_OR_DELETE_TABLES = [
@@ -34,6 +42,7 @@ const NO_UPDATE_OR_DELETE_TABLES = [
   "document_versions",
   "ai_applied_operations",
   "xi_artifact_revisions",
+  "pa_usage_ledger",
 ];
 
 const NO_DELETE_TABLES = ["xi_outbox_events", "xi_package_approvals"];
@@ -50,6 +59,7 @@ function requireDatabaseUrl() {
 async function cmdMigrate(db) {
   await initializePostgreSqlSchema(db);
   await initializeIntegrationSchema(db);
+  await initializePaGovernanceSchema(db);
   let provisionedRole = null;
   const appRole = process.env.POSTGRES_APP_USER?.trim();
   const appPw = process.env.POSTGRES_APP_PASSWORD?.trim();
@@ -61,7 +71,7 @@ async function cmdMigrate(db) {
     JSON.stringify({
       ok: true,
       command: "migrate",
-      schemas: ["core-d2", "integration-xi00"],
+      schemas: ["core-d2", "integration-xi00", "platform-admin-pa00"],
       ...(provisionedRole ? { provisionedAppRole: provisionedRole } : {}),
       timestamp: new Date().toISOString(),
     }),
@@ -88,11 +98,18 @@ async function cmdProvisionAppRole(db) {
 
 async function cmdVerifyRls(db) {
   const readiness = await verifyDatabaseRlsReadiness(db);
+  const paReadiness = await verifyPaRlsReadiness(db);
   const failures = [];
 
   if (!readiness.checks.connectivity) failures.push("Database connectivity check failed.");
   if (!readiness.checks.appRuntimeLeastPrivilege) {
     failures.push("Role 'app_runtime' missing or has superuser/bypassrls privilege.");
+  }
+  if (!readiness.checks.usersPasswordHashIsolated) {
+    failures.push("Role 'app_runtime' must not have SELECT(password_hash) or UPDATE privileges on public.users.");
+  }
+  if (!paReadiness.paForceRlsEnabled) {
+    failures.push(`Missing FORCE RLS on PA-00 tables: ${paReadiness.missingTables.join(", ")}`);
   }
 
   const rlsRes = await db.query(
@@ -133,6 +150,7 @@ async function cmdVerifyRls(db) {
     ok: failures.length === 0,
     command: "verify-rls",
     verifiedTables: ALL_TENANT_RLS_TABLES.length,
+    usersPasswordHashIsolated: readiness.checks.usersPasswordHashIsolated,
     failures,
   };
   console.log(JSON.stringify(summary, null, 2));
@@ -144,7 +162,10 @@ async function cmdBackup(db, outPath) {
     console.error("Usage: node scripts/db-cli.mjs backup <output.json>");
     process.exit(1);
   }
-  const snapshot = await exportLogicalBackupSnapshot(db);
+  const hasPaRes = await db.query("SELECT to_regclass('public.pa_plan_versions')::text AS reg");
+  const hasPa = Boolean(hasPaRes.rows[0]?.reg);
+  const snapshot = hasPa ? await exportPaExtendedLogicalBackup(db) : await exportLogicalBackupSnapshot(db);
+  const coreSnap = "coreAndXi" in snapshot ? snapshot.coreAndXi : snapshot;
   const serialized = JSON.stringify(snapshot, null, 2);
   const resolved = path.resolve(outPath);
   writeFileSync(resolved, serialized, "utf8");
@@ -153,15 +174,17 @@ async function cmdBackup(db, outPath) {
     JSON.stringify({
       ok: true,
       command: "backup",
+      format: hasPa ? "pa-extended-v3" : "core-xi-v2",
       outputPath: resolved,
       sha256,
       counts: {
-        organizations: snapshot.organizations.length,
-        users: snapshot.users.length,
-        workspaces: snapshot.workspaces.length,
-        documents: snapshot.documents.length,
-        documentVersions: snapshot.documentVersions.length,
-        auditLogs: snapshot.auditLogs.length,
+        organizations: coreSnap.organizations.length,
+        users: coreSnap.users.length,
+        workspaces: coreSnap.workspaces.length,
+        documents: coreSnap.documents.length,
+        documentVersions: coreSnap.documentVersions.length,
+        auditLogs: coreSnap.auditLogs.length,
+        ...("paTables" in snapshot ? { paFileObjects: snapshot.paTables.paFileObjects.length, paJobs: snapshot.paTables.paJobs.length } : {}),
       },
     }),
   );
@@ -175,11 +198,17 @@ async function cmdRestore(db, inPath) {
   const resolved = path.resolve(inPath);
   const raw = readFileSync(resolved, "utf8");
   const snapshot = JSON.parse(raw);
-  await restoreLogicalBackupSnapshot(db, snapshot);
+  const isExtended = Boolean(snapshot && typeof snapshot === "object" && snapshot.coreAndXi && snapshot.paTables);
+  if (isExtended) {
+    await restorePaExtendedLogicalBackup(db, snapshot);
+  } else {
+    await restoreLogicalBackupSnapshot(db, snapshot);
+  }
   console.log(
     JSON.stringify({
       ok: true,
       command: "restore",
+      format: isExtended ? "pa-extended-v3" : "core-xi-v2",
       inputPath: resolved,
       sha256: createHash("sha256").update(raw, "utf8").digest("hex"),
     }),

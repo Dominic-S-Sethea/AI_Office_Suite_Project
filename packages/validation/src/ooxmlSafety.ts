@@ -137,11 +137,11 @@ function concatChunks(chunks: Uint8Array[], totalLength: number): Uint8Array {
  * 4. Re-packs verified entries into a clean canonical ZIP so downstream parsers (`mammoth`,
  *    `ExcelJS`) never re-parse untrusted raw ZIP structures.
  */
-export function inspectAndExtractOoxmlZip(
-  buffer: Uint8Array,
+export function validateOoxmlUploadHeader(
   filename: string,
+  buffer: Uint8Array,
   format: OoxmlFormatKind,
-): OoxmlInspectResult {
+): { ok: true } | { ok: false; code: string; message: string } {
   const policy = OOXML_POLICIES[format];
   const label = format.toUpperCase();
 
@@ -212,6 +212,21 @@ export function inspectAndExtractOoxmlZip(
     };
   }
 
+  return { ok: true };
+}
+
+export function inspectAndExtractOoxmlZip(
+  buffer: Uint8Array,
+  filename: string,
+  format: OoxmlFormatKind,
+): OoxmlInspectResult {
+  const headerCheck = validateOoxmlUploadHeader(filename, buffer, format);
+  if (!headerCheck.ok) {
+    return headerCheck;
+  }
+
+  const policy = OOXML_POLICIES[format];
+  const label = format.toUpperCase();
   const originalSha256 = createHash("sha256").update(buffer).digest("hex");
 
   // Stage 1: Zero-decompression Central Directory metadata & duplicate-entry scan

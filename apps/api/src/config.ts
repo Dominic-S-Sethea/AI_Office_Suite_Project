@@ -3,6 +3,12 @@ import { createPgPoolConfigFromEnv } from "@ai-office-suite/database";
 import type { PoolConfig } from "pg";
 
 const ALLOWED_LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "::1"]);
+const PLACEHOLDER_SECRET_RE = /(changeme|placeholder|super_secret|dev_key|example_secret|default_secret|replace-with)/i;
+
+function isStrongProductionSecret(value: string | undefined): value is string {
+  const trimmed = value?.trim();
+  return Boolean(trimmed && trimmed.length >= 32 && !PLACEHOLDER_SECRET_RE.test(trimmed));
+}
 
 const optionalIntString = (name: string, min: number, max: number, fallback: number) =>
   z
@@ -65,6 +71,10 @@ const apiEnvSchema = z.object({
   HOST: z.string().optional(),
   TRUST_PROXY: trustProxySchema,
   DATABASE_URL: z.string().optional(),
+  JWT_SECRET: z.string().optional(),
+  AI_PROPOSAL_SIGNING_SECRET: z.string().optional(),
+  PROPOSAL_SIGNING_KEY: z.string().optional(),
+  PII_PSEUDONYMIZATION_KEY: z.string().optional(),
   REQUIRE_NON_SUPERUSER_DB: z.string().optional(),
   ALLOW_SUPERUSER_DB_RUNTIME: z.string().optional(),
   AUTO_MIGRATE_ON_START: z.string().optional(),
@@ -129,6 +139,36 @@ export function loadApiServerConfig(
     }
   } else if (!databaseUrl) {
     throw new Error("DATABASE_URL is required when AUTH_MODE=jwt-pg.");
+  }
+
+  if (nodeEnv === "production") {
+    const jwtSecret = v.JWT_SECRET?.trim();
+    if (!isStrongProductionSecret(jwtSecret)) {
+      throw new Error(
+        "PRODUCTION_SECRET_MISSING_OR_WEAK: JWT_SECRET must be set to a strong non-placeholder secret (>= 32 chars) in production.",
+      );
+    }
+    const aiProposalSecret = v.AI_PROPOSAL_SIGNING_SECRET?.trim();
+    const legacyProposalSecret = v.PROPOSAL_SIGNING_KEY?.trim();
+    const proposalSecret = aiProposalSecret || legacyProposalSecret;
+    if (!aiProposalSecret && legacyProposalSecret) {
+      opts?.onWarn?.("PROPOSAL_SIGNING_KEY is deprecated; migrate to AI_PROPOSAL_SIGNING_SECRET.");
+    }
+    if (!isStrongProductionSecret(proposalSecret)) {
+      throw new Error(
+        "PRODUCTION_SECRET_MISSING_OR_WEAK: AI_PROPOSAL_SIGNING_SECRET must be set to a strong non-placeholder secret (>= 32 chars) in production.",
+      );
+    }
+    if (proposalSecret === jwtSecret) {
+      throw new Error(
+        "PRODUCTION_SECRET_REUSE_FORBIDDEN: AI_PROPOSAL_SIGNING_SECRET must be distinct from JWT_SECRET in production.",
+      );
+    }
+    if (!isStrongProductionSecret(v.PII_PSEUDONYMIZATION_KEY)) {
+      throw new Error(
+        "PRODUCTION_SECRET_MISSING_OR_WEAK: PII_PSEUDONYMIZATION_KEY must be set to a strong non-placeholder secret (>= 32 chars) in production.",
+      );
+    }
   }
 
   const pgPoolConfig = authMode === "jwt-pg" ? createPgPoolConfigFromEnv(env, opts) : undefined;

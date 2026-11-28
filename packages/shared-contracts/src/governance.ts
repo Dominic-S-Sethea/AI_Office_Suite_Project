@@ -562,6 +562,7 @@ export interface VoiceSessionRecord {
   audioRetained: boolean;
   criticalFieldValidation?: CriticalFieldValidationResult;
   reservationId?: string;
+  quotaSettled?: boolean;
   errorCode?: string;
   errorMessage?: string;
   expiresAt: string;

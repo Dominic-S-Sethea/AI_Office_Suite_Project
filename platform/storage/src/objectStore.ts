@@ -59,6 +59,8 @@ export class PrivateObjectStorageError extends Error {
   }
 }
 
+export const DEFAULT_ORPHAN_SWEEP_MIN_AGE_MS = 15 * 60 * 1000;
+
 export interface PrivateObjectStoreAdapter {
   putObject(params: PrivateObjectPutParams): Promise<PrivateObjectPutResult>;
   getObjectBytes(params: {
@@ -68,6 +70,18 @@ export interface PrivateObjectStoreAdapter {
     quarantineState?: FileQuarantineState;
     allowQuarantinedAdmin?: boolean;
   }): Promise<{ bytes: Uint8Array; sha256: string }>;
+  getAuthorizedObjectBytes(params: {
+    token: string;
+    expectedTenantId: string;
+    expectedWorkspaceId: string;
+    expectedObjectId?: string;
+    quarantineState: FileQuarantineState;
+    deletedAt?: string | null;
+    membershipActive?: boolean;
+    allowQuarantinedAdmin?: boolean;
+    consumeOnce?: boolean;
+    nowMs?: number;
+  }): Promise<{ bytes: Uint8Array; sha256: string; payload: SignedObjectTokenPayload }>;
   deleteBlob(storageKey: string): Promise<boolean>;
   issueSignedDownloadToken(params: {
     tenantId: string;
@@ -83,9 +97,13 @@ export interface PrivateObjectStoreAdapter {
     expectedTenantId: string;
     expectedWorkspaceId: string;
     expectedObjectId?: string;
+    consumeOnce?: boolean;
     nowMs?: number;
   }): SignedObjectTokenPayload;
-  sweepOrphanedBlobs(referencedStorageKeys: ReadonlySet<string>): Promise<{ removedKeys: string[]; retainedCount: number }>;
+  sweepOrphanedBlobs(
+    referencedStorageKeys: ReadonlySet<string>,
+    options?: { minAgeMs?: number; nowMs?: number },
+  ): Promise<{ removedKeys: string[]; retainedCount: number; skippedRecentKeys: string[] }>;
   exportSnapshot(): Promise<ObjectStoreSnapshot>;
   restoreSnapshot(snapshot: ObjectStoreSnapshot): Promise<{ restoredCount: number; verifiedSha256Count: number }>;
 }
@@ -112,6 +130,7 @@ function assertSafeSegment(value: string, label: string): string {
 export class LocalPrivateObjectStore implements PrivateObjectStoreAdapter {
   private readonly rootDir: string;
   private readonly signingSecret: string;
+  private readonly consumedNonces = new Map<string, number>();
 
   constructor(rootDir: string, signingSecret?: string) {
     this.rootDir = path.resolve(rootDir);
@@ -266,6 +285,7 @@ export class LocalPrivateObjectStore implements PrivateObjectStoreAdapter {
     expectedTenantId: string;
     expectedWorkspaceId: string;
     expectedObjectId?: string;
+    consumeOnce?: boolean;
     nowMs?: number;
   }): SignedObjectTokenPayload {
     const parts = params.token.split(".");
@@ -288,7 +308,7 @@ export class LocalPrivateObjectStore implements PrivateObjectStoreAdapter {
     }
 
     const now = params.nowMs ?? Date.now();
-    if (typeof payload.exp !== "number" || now > payload.exp) {
+    if (typeof payload.exp !== "number" || !Number.isFinite(payload.exp) || now > payload.exp) {
       throw new PrivateObjectStorageError(401, "SIGNED_TOKEN_EXPIRED", "Signed object download token has expired.");
     }
     if (
@@ -304,7 +324,72 @@ export class LocalPrivateObjectStore implements PrivateObjectStoreAdapter {
     }
 
     this.assertTenantKeyPrefix(payload.storageKey, payload.tenantId, payload.workspaceId);
+
+    if (params.consumeOnce) {
+      for (const [nonce, exp] of this.consumedNonces.entries()) {
+        if (exp <= now) this.consumedNonces.delete(nonce);
+      }
+      if (!payload.nonce || this.consumedNonces.has(payload.nonce)) {
+        throw new PrivateObjectStorageError(
+          401,
+          "SIGNED_TOKEN_REPLAYED",
+          "Signed object download token has already been used.",
+        );
+      }
+      this.consumedNonces.set(payload.nonce, payload.exp);
+    }
+
     return payload;
+  }
+
+  /**
+   * Authorizes a signed download request against live membership, deletion tombstone,
+   * and quarantine state so revocations and quarantines take effect immediately even mid-TTL (F-21).
+   */
+  async getAuthorizedObjectBytes(params: {
+    token: string;
+    expectedTenantId: string;
+    expectedWorkspaceId: string;
+    expectedObjectId?: string;
+    quarantineState: FileQuarantineState;
+    deletedAt?: string | null;
+    membershipActive?: boolean;
+    allowQuarantinedAdmin?: boolean;
+    consumeOnce?: boolean;
+    nowMs?: number;
+  }): Promise<{ bytes: Uint8Array; sha256: string; payload: SignedObjectTokenPayload }> {
+    const payload = this.verifySignedDownloadToken({
+      token: params.token,
+      expectedTenantId: params.expectedTenantId,
+      expectedWorkspaceId: params.expectedWorkspaceId,
+      ...(params.expectedObjectId !== undefined ? { expectedObjectId: params.expectedObjectId } : {}),
+      ...(params.consumeOnce !== undefined ? { consumeOnce: params.consumeOnce } : {}),
+      ...(params.nowMs !== undefined ? { nowMs: params.nowMs } : {}),
+    });
+    if (params.membershipActive === false) {
+      throw new PrivateObjectStorageError(
+        403,
+        "MEMBERSHIP_REVOKED",
+        "Download denied because caller membership is no longer active.",
+      );
+    }
+    if (params.deletedAt) {
+      throw new PrivateObjectStorageError(
+        404,
+        "OBJECT_DELETED",
+        "Download denied because the target file version has been deleted.",
+      );
+    }
+    const data = await this.getObjectBytes({
+      tenantId: payload.tenantId,
+      workspaceId: payload.workspaceId,
+      storageKey: payload.storageKey,
+      quarantineState: params.quarantineState,
+      ...(params.allowQuarantinedAdmin !== undefined
+        ? { allowQuarantinedAdmin: params.allowQuarantinedAdmin }
+        : {}),
+    });
+    return { ...data, payload };
   }
 
   private walkFiles(dir: string, relBase = ""): string[] {
@@ -325,19 +410,30 @@ export class LocalPrivateObjectStore implements PrivateObjectStoreAdapter {
 
   async sweepOrphanedBlobs(
     referencedStorageKeys: ReadonlySet<string>,
-  ): Promise<{ removedKeys: string[]; retainedCount: number }> {
+    options: { minAgeMs?: number; nowMs?: number } = {},
+  ): Promise<{ removedKeys: string[]; retainedCount: number; skippedRecentKeys: string[] }> {
+    const minAgeMs = Math.max(0, options.minAgeMs ?? DEFAULT_ORPHAN_SWEEP_MIN_AGE_MS);
+    const nowMs = options.nowMs ?? Date.now();
     const allKeys = this.walkFiles(this.rootDir);
     const removedKeys: string[] = [];
+    const skippedRecentKeys: string[] = [];
     let retainedCount = 0;
     for (const key of allKeys) {
       if (!referencedStorageKeys.has(key)) {
+        const full = this.assertContained(path.join(this.rootDir, key));
+        const ageMs = nowMs - statSync(full).mtimeMs;
+        if (ageMs < minAgeMs) {
+          skippedRecentKeys.push(key);
+          retainedCount += 1;
+          continue;
+        }
         await this.deleteBlob(key);
         removedKeys.push(key);
       } else {
         retainedCount += 1;
       }
     }
-    return { removedKeys, retainedCount };
+    return { removedKeys, retainedCount, skippedRecentKeys };
   }
 
   async exportSnapshot(): Promise<ObjectStoreSnapshot> {

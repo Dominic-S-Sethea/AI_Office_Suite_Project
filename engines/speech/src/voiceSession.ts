@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type {
+  ActorContext,
   SpeechLanguageCode,
   SpeechProviderId,
   VoiceInputMode,
@@ -115,6 +116,25 @@ export class VoiceSessionManager {
   getSession(sessionId: string): VoiceSessionRecord | null {
     const s = this.sessions.get(sessionId);
     return s ? structuredClone(s) : null;
+  }
+
+  assertSessionActorAccess(sessionId: string, actor: ActorContext): VoiceSessionRecord {
+    const s = this.getMutable(sessionId);
+    if (s.tenantId !== actor.tenantId || s.workspaceId !== actor.workspaceId || s.actorId !== actor.userId) {
+      throw new SpeechProviderError(
+        403,
+        "VOICE_SESSION_FORBIDDEN",
+        "Actor is not authorized to access or modify this voice session.",
+      );
+    }
+    return structuredClone(s);
+  }
+
+  markQuotaSettled(sessionId: string): VoiceSessionRecord {
+    const s = this.getMutable(sessionId);
+    s.quotaSettled = true;
+    s.updatedAt = new Date().toISOString();
+    return structuredClone(s);
   }
 
   private getMutable(sessionId: string): VoiceSessionRecord {

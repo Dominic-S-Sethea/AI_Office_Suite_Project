@@ -18,6 +18,9 @@ const execFileAsync = promisify(execFile);
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(__dirname, "..", "..", "..");
 
+export const ALLOWED_WHISPER_MODELS = new Set(["tiny", "base", "small", "medium"]);
+export const MAX_AUDIO_BYTES = 16 * 1024 * 1024;
+
 export function resolveLocalSpeechPython(): string | null {
   const configured = process.env.FASTER_WHISPER_PYTHON?.trim();
   if (configured && existsSync(configured)) return configured;
@@ -73,6 +76,39 @@ export class FasterWhisperLocalAdapter implements SpeechRecognitionAdapter {
       );
     }
 
+    const modelSize = process.env.FASTER_WHISPER_MODEL?.trim() || "tiny";
+    if (!ALLOWED_WHISPER_MODELS.has(modelSize)) {
+      throw new SpeechProviderError(
+        400,
+        "INVALID_WHISPER_MODEL",
+        `Unsupported Faster-Whisper model '${modelSize}'. Allowed: tiny, base, small, medium.`,
+      );
+    }
+
+    const maxBase64Chars = Math.ceil((MAX_AUDIO_BYTES * 4) / 3) + 16;
+    if (request.audioBase64.length > maxBase64Chars) {
+      throw new SpeechProviderError(
+        413,
+        "AUDIO_PAYLOAD_TOO_LARGE",
+        `Audio payload exceeds maximum allowed size (${MAX_AUDIO_BYTES} bytes).`,
+      );
+    }
+    const audioBytes = Buffer.from(request.audioBase64, "base64");
+    if (audioBytes.byteLength === 0) {
+      throw new SpeechProviderError(
+        400,
+        "MISSING_AUDIO_PAYLOAD",
+        "Faster-Whisper requires non-empty base64-encoded WAV/PCM audio input.",
+      );
+    }
+    if (audioBytes.byteLength > MAX_AUDIO_BYTES) {
+      throw new SpeechProviderError(
+        413,
+        "AUDIO_PAYLOAD_TOO_LARGE",
+        `Audio payload (${audioBytes.byteLength} bytes) exceeds maximum allowed size (${MAX_AUDIO_BYTES} bytes).`,
+      );
+    }
+
     const pythonPath = resolveLocalSpeechPython();
     if (!pythonPath) {
       throw new SpeechProviderError(
@@ -90,16 +126,24 @@ export class FasterWhisperLocalAdapter implements SpeechRecognitionAdapter {
     const scratchDir = path.join(tmpdir(), `aios-speech-${randomUUID()}`);
     mkdirSync(scratchDir, { recursive: true });
     const wavPath = path.join(scratchDir, "input.wav");
-    writeFileSync(wavPath, Buffer.from(request.audioBase64, "base64"));
+    writeFileSync(wavPath, audioBytes);
 
     try {
-      const modelSize = process.env.FASTER_WHISPER_MODEL?.trim() || "tiny";
       const langCode = request.language === "km-KH" ? "km" : "en";
       const safeEnv: NodeJS.ProcessEnv = {
         PATH: process.env.PATH ?? "/usr/local/bin:/usr/bin:/bin",
         HOME: scratchDir,
         TMPDIR: scratchDir,
         LANG: process.env.LANG ?? "C.UTF-8",
+        ...(process.platform === "win32"
+          ? {
+              ...(process.env.SystemRoot ? { SystemRoot: process.env.SystemRoot } : {}),
+              ...(process.env.WINDIR ? { WINDIR: process.env.WINDIR } : {}),
+              TEMP: scratchDir,
+              TMP: scratchDir,
+              LOCALAPPDATA: scratchDir,
+            }
+          : {}),
         ...(process.env.HF_HOME ? { HF_HOME: process.env.HF_HOME } : {}),
         ...(process.env.XDG_CACHE_HOME ? { XDG_CACHE_HOME: process.env.XDG_CACHE_HOME } : {}),
       };
@@ -128,7 +172,10 @@ export class FasterWhisperLocalAdapter implements SpeechRecognitionAdapter {
           `Local Faster-Whisper (${parsed.model}) CPU execution — zero audio sent to external cloud APIs.`,
         ],
       };
-    } catch {
+    } catch (err) {
+      if (err instanceof SpeechProviderError) {
+        throw err;
+      }
       throw new SpeechProviderError(
         503,
         "FASTER_WHISPER_EXECUTION_FAILED",

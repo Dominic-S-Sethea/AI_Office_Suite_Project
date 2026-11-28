@@ -398,6 +398,7 @@ describe("V1.4 Aligned Integrated Golden Vertical Slice — Cross-Cutting Govern
     });
     expect(voiceRes.outcome).toBe("awaiting_review_clarify");
     const confirmed = voicePipeline.confirmReviewedTranscript({
+      actor: EDITOR_A,
       sessionId: voiceRes.session.sessionId,
       eventId: "gov-t02-confirm",
       eventSeq: 6,

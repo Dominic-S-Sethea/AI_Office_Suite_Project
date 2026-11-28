@@ -1,7 +1,7 @@
 import type { NextFunction, Request, Response } from "express";
 import type { ActorContext } from "@ai-office-suite/shared-contracts";
 import { isWorkspaceRole } from "@ai-office-suite/authorization";
-import type { PgDatabaseAdapter } from "@ai-office-suite/database";
+import { withTenantTransaction, type PgDatabaseAdapter } from "@ai-office-suite/database";
 import {
   parseCookie,
   SESSION_COOKIE_NAME,
@@ -15,6 +15,14 @@ const LOOPBACK_HOST_PATTERN = /^(?:127\.0\.0\.1|localhost)(?::\d{1,5})?$/i;
 export interface AuthenticatedRequest extends Request {
   actor?: ActorContext;
   authSource?: "bearer" | "cookie";
+  requestId?: string;
+}
+
+export interface JwtAuthMiddlewareOptions {
+  onError?: (
+    err: unknown,
+    context: { requestId?: string; method: string; path: string },
+  ) => void;
 }
 
 export function setSessionCookie(req: Request, res: Response, token: string): void {
@@ -106,6 +114,7 @@ export function verifyCookieCsrf(
 export function createJwtAuthMiddleware(
   db: PgDatabaseAdapter,
   allowedOrigins: readonly string[],
+  options?: JwtAuthMiddlewareOptions,
 ) {
   return async (req: AuthenticatedRequest, res: Response, next: NextFunction): Promise<void> => {
     const authHeader = req.headers.authorization;
@@ -150,22 +159,31 @@ export function createJwtAuthMiddleware(
       return;
     }
 
-    // Live PostgreSQL re-verification of user status, org status, epoch `token_version`, and live RBAC role
+    // Live PostgreSQL re-verification of user status, org status, epoch `token_version`, live RBAC role & grants
     try {
-      const liveRes = await db.query<{
-        status: string;
-        token_version: number;
-        role: string;
-        org_status: string;
-      }>(
-        `SELECT u.status, u.token_version, m.role, o.status AS org_status
-         FROM users u
-         JOIN memberships m ON m.user_id = u.user_id
-         JOIN organizations o ON o.tenant_id = m.tenant_id
-         WHERE u.user_id = $1::uuid AND m.tenant_id = $2::uuid AND m.workspace_id = $3::uuid`,
-        [claims.userId, claims.tenantId, claims.workspaceId],
+      const live = await withTenantTransaction(
+        db,
+        claims.tenantId,
+        async (tx) => {
+          const liveRes = await tx.query<{
+            status: string;
+            token_version: number;
+            role: string;
+            membership_status: string;
+            content_access: boolean;
+            org_status: string;
+          }>(
+            `SELECT u.status, u.token_version, m.role, m.status AS membership_status, m.content_access, o.status AS org_status
+             FROM users u
+             JOIN memberships m ON m.user_id = u.user_id
+             JOIN organizations o ON o.tenant_id = m.tenant_id
+             WHERE u.user_id = $1::uuid AND m.tenant_id = $2::uuid AND m.workspace_id = $3::uuid`,
+            [claims.userId, claims.tenantId, claims.workspaceId],
+          );
+          return liveRes.rows[0] ?? null;
+        },
+        claims.workspaceId,
       );
-      const live = liveRes.rows[0];
       if (!live) {
         res.status(403).json({ error: "Account or workspace membership revoked", code: "ACCOUNT_REVOKED" });
         return;
@@ -176,6 +194,10 @@ export function createJwtAuthMiddleware(
       }
       if (live.status !== "active") {
         res.status(403).json({ error: "Account is inactive or deleted", code: "ACCOUNT_INACTIVE" });
+        return;
+      }
+      if (live.membership_status !== "active") {
+        res.status(403).json({ error: "Account or workspace membership revoked", code: "ACCOUNT_REVOKED" });
         return;
       }
       if (claims.tv !== live.token_version) {
@@ -192,11 +214,23 @@ export function createJwtAuthMiddleware(
         workspaceId: claims.workspaceId,
         userId: claims.userId,
         role: live.role,
+        workspaceContentGrant: Boolean(live.content_access),
+        ...(claims.mfaVerifiedAt ? { mfaVerifiedAt: claims.mfaVerifiedAt } : {}),
       };
       req.authSource = authSource;
       next();
-    } catch {
-      res.status(500).json({ error: "Authentication check failed", code: "AUTH_BACKEND_ERROR" });
+    } catch (err) {
+      const requestId = req.requestId;
+      options?.onError?.(err, {
+        ...(requestId ? { requestId } : {}),
+        method: req.method,
+        path: req.path,
+      });
+      res.status(500).json({
+        error: "Authentication check failed",
+        code: "AUTH_BACKEND_ERROR",
+        ...(requestId ? { requestId } : {}),
+      });
     }
   };
 }

@@ -2,6 +2,12 @@ import type { RoundingMode } from "@ai-office-suite/shared-contracts";
 
 export const DEFAULT_MAX_ABS_MINOR_UNITS = 999_999_999_999_999_999n;
 
+export const ZERO_DECIMAL_CURRENCIES: ReadonlySet<string> = new Set(["KHR", "JPY", "KRW", "VND"]);
+
+export function currencyScaleFor(currency: string): number {
+  return ZERO_DECIMAL_CURRENCIES.has(currency.trim().toUpperCase()) ? 0 : 2;
+}
+
 export class ExactDecimalError extends Error {
   readonly code: "INVALID_NUMERIC_VALUE" | "INVALID_DECIMAL_FORMAT" | "NUMERIC_OVERFLOW" | "ZERO_DENOMINATOR";
 

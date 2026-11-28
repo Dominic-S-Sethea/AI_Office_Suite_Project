@@ -240,6 +240,7 @@ export class VoiceGovernancePipeline {
         }).session;
         if (this.quota && reservationId) {
           await this.quota.releaseVoiceSeconds(input.actor.tenantId, reservationId);
+          reservationId = undefined;
         }
         return {
           session: canceled,
@@ -289,7 +290,7 @@ export class VoiceGovernancePipeline {
           eventSeq: 7,
           targetState: "execute_verify",
         });
-        const done = this.sessions.transition(created.sessionId, {
+        let done = this.sessions.transition(created.sessionId, {
           eventId: `${created.sessionId}:done`,
           eventSeq: 8,
           targetState: "completed",
@@ -304,6 +305,8 @@ export class VoiceGovernancePipeline {
             providerId: asr.provider,
             isMock: asr.isMock,
           });
+          done = this.sessions.markQuotaSettled(created.sessionId);
+          reservationId = undefined;
         }
 
         return {
@@ -333,6 +336,7 @@ export class VoiceGovernancePipeline {
         });
         if (this.quota && reservationId) {
           await this.quota.releaseVoiceSeconds(input.actor.tenantId, reservationId);
+          reservationId = undefined;
         }
         throw new SpeechProviderError(400, "PROMPT_INJECTION_DETECTED", injectionReason);
       }
@@ -373,6 +377,8 @@ export class VoiceGovernancePipeline {
           providerId: asr.provider,
           isMock: asr.isMock,
         });
+        this.sessions.markQuotaSettled(created.sessionId);
+        reservationId = undefined;
       }
 
       if (needsReview) {
@@ -428,11 +434,13 @@ export class VoiceGovernancePipeline {
    * and CriticalField validation before releasing the command for proposal (VOC-T16).
    */
   confirmReviewedTranscript(params: {
+    actor: ActorContext;
     sessionId: string;
     editedTranscript?: string;
     eventId: string;
     eventSeq: number;
   }): { session: VoiceSessionRecord; effectiveCommand: string } {
+    this.sessions.assertSessionActorAccess(params.sessionId, params.actor);
     if (params.editedTranscript !== undefined) {
       this.sessions.editTranscriptDuringReview(params.sessionId, params.editedTranscript);
     }
@@ -472,18 +480,19 @@ export class VoiceGovernancePipeline {
   }
 
   async cancelSessionWithQuotaRelease(params: {
+    actor: ActorContext;
     sessionId: string;
     eventId: string;
     eventSeq: number;
   }): Promise<{ session: VoiceSessionRecord; quotaReleased: boolean }> {
-    const before = this.sessions.getSession(params.sessionId);
+    const before = this.sessions.assertSessionActorAccess(params.sessionId, params.actor);
     const canceled = this.sessions.transition(params.sessionId, {
       eventId: params.eventId,
       eventSeq: params.eventSeq,
       targetState: "canceled",
     }).session;
     let quotaReleased = false;
-    if (this.quota && before?.reservationId) {
+    if (this.quota && before.reservationId && !before.quotaSettled) {
       await this.quota.releaseVoiceSeconds(before.tenantId, before.reservationId);
       quotaReleased = true;
     }
@@ -503,9 +512,13 @@ export class VoiceGovernancePipeline {
     let releasedReservations = 0;
     if (this.quota) {
       for (const sess of terminatedSessions) {
-        if (sess.reservationId) {
-          await this.quota.releaseVoiceSeconds(sess.tenantId, sess.reservationId);
-          releasedReservations += 1;
+        if (sess.reservationId && !sess.quotaSettled) {
+          try {
+            await this.quota.releaseVoiceSeconds(sess.tenantId, sess.reservationId);
+            releasedReservations += 1;
+          } catch {
+            // best-effort release per session
+          }
         }
       }
     }
@@ -517,12 +530,13 @@ export class VoiceGovernancePipeline {
    * transitioning the session safely to error with audio wiped and releasing reserved quota.
    */
   async handleInterruption(params: {
+    actor: ActorContext;
     sessionId: string;
     kind: "microphone_disconnected" | "network_failure";
     eventId: string;
     eventSeq: number;
   }): Promise<{ session: VoiceSessionRecord; quotaReleased: boolean }> {
-    const before = this.sessions.getSession(params.sessionId);
+    const before = this.sessions.assertSessionActorAccess(params.sessionId, params.actor);
     const outcome = this.sessions.handleHardwareOrNetworkInterruption(
       params.sessionId,
       params.kind,
@@ -530,7 +544,7 @@ export class VoiceGovernancePipeline {
       params.eventSeq,
     );
     let quotaReleased = false;
-    if (this.quota && before?.reservationId) {
+    if (this.quota && before.reservationId && !before.quotaSettled) {
       await this.quota.releaseVoiceSeconds(before.tenantId, before.reservationId);
       quotaReleased = true;
     }

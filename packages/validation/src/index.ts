@@ -335,69 +335,13 @@ export function scanForPromptInjection(
   };
 }
 
+import { validateOoxmlUploadHeader } from "./ooxmlSafety.ts";
+
 export function validateDocxUploadBytes(
   filename: string,
   bytes: Uint8Array,
 ): { ok: true } | { ok: false; code: string; message: string } {
-  const maxBytes = 10 * 1024 * 1024;
-  if (bytes.byteLength === 0) {
-    return { ok: false, code: "EMPTY_UPLOAD", message: "Uploaded file is empty." };
-  }
-  if (bytes.byteLength > maxBytes) {
-    return {
-      ok: false,
-      code: "FILE_TOO_LARGE",
-      message: `Uploaded DOCX exceeds maximum Phase D1 limit (${maxBytes} bytes).`,
-    };
-  }
-  const lower = filename.toLowerCase();
-  if (lower.endsWith(".docm") || lower.endsWith(".dotm")) {
-    return {
-      ok: false,
-      code: "MACRO_FILE_BLOCKED",
-      message: "Macro-enabled Word formats (.docm/.dotm) are blocked for security.",
-    };
-  }
-  if (!lower.endsWith(".docx")) {
-    return {
-      ok: false,
-      code: "UNSUPPORTED_EXTENSION",
-      message: "Only .docx files are accepted by the DOCX importer.",
-    };
-  }
-  // Check OLE2 Compound File Binary magic bytes (D0 CF 11 E0 A1 B1 1A E1) — encrypted or legacy binary Office docs
-  if (
-    bytes.byteLength >= 8 &&
-    bytes[0] === 0xd0 &&
-    bytes[1] === 0xcf &&
-    bytes[2] === 0x11 &&
-    bytes[3] === 0xe0 &&
-    bytes[4] === 0xa1 &&
-    bytes[5] === 0xb1 &&
-    bytes[6] === 0x1a &&
-    bytes[7] === 0xe1
-  ) {
-    return {
-      ok: false,
-      code: "ENCRYPTED_FILE_UNSUPPORTED",
-      message: "Encrypted or legacy OLE2 binary Word files are not supported in Phase D1.",
-    };
-  }
-  // Check ZIP local file header magic bytes PK\x03\x04
-  if (
-    bytes.byteLength < 4 ||
-    bytes[0] !== 0x50 ||
-    bytes[1] !== 0x4b ||
-    bytes[2] !== 0x03 ||
-    bytes[3] !== 0x04
-  ) {
-    return {
-      ok: false,
-      code: "INVALID_ZIP_MAGIC",
-      message: "File header is not a valid OOXML ZIP container.",
-    };
-  }
-  return { ok: true };
+  return validateOoxmlUploadHeader(filename, bytes, "docx");
 }
 
 export const loginRequestSchema = z.object({
@@ -445,47 +389,25 @@ export function scanForUnsafeAnalyticalInput(input: string): PromptSafetyScanRes
   };
 }
 
-export function validatePptxUploadBytes(
-  filename: string,
-  bytes: Uint8Array,
-): { ok: true } | { ok: false; code: string; message: string } {
-  const maxBytes = 15 * 1024 * 1024;
-  if (bytes.byteLength === 0) {
-    return { ok: false, code: "EMPTY_UPLOAD", message: "Uploaded presentation file is empty." };
+export type ReleaseEvidenceGateInput = {
+  requiredFixturesPresent: boolean;
+  approvalValidAndFresh: boolean;
+  authorizationChecksPassed: boolean;
+  requiresRealEnvironment: boolean;
+  submittedEvidenceIsMock: boolean;
+};
+
+export function evaluateReleaseEvidenceGate(
+  input: ReleaseEvidenceGateInput,
+): { allowed: boolean; reasons: string[] } {
+  const reasons: string[] = [];
+  if (!input.requiredFixturesPresent) reasons.push("MISSING_MANDATORY_FIXTURE");
+  if (!input.approvalValidAndFresh) reasons.push("STALE_OR_MISSING_APPROVAL");
+  if (!input.authorizationChecksPassed) reasons.push("AUTHORIZATION_CHECK_FAILED");
+  if (input.requiresRealEnvironment && input.submittedEvidenceIsMock) {
+    reasons.push("MOCK_ONLY_EVIDENCE_CANNOT_PASS_REAL_ENV_GATE");
   }
-  if (bytes.byteLength > maxBytes) {
-    return { ok: false, code: "FILE_TOO_LARGE", message: "Uploaded PPTX exceeds PS-00 15 MB limit." };
-  }
-  const lower = filename.toLowerCase();
-  if (lower.endsWith(".pptm") || lower.endsWith(".potm") || lower.endsWith(".ppsm")) {
-    return { ok: false, code: "MACRO_PRESENTATION_BLOCKED", message: "Macro-enabled PowerPoint files (.pptm/.potm/.ppsm) are blocked." };
-  }
-  if (!lower.endsWith(".pptx")) {
-    return { ok: false, code: "UNSUPPORTED_EXTENSION", message: "Only .pptx files are accepted by the PPTX importer." };
-  }
-  if (
-    bytes.byteLength >= 8 &&
-    bytes[0] === 0xd0 &&
-    bytes[1] === 0xcf &&
-    bytes[2] === 0x11 &&
-    bytes[3] === 0xe0 &&
-    bytes[4] === 0xa1 &&
-    bytes[5] === 0xb1 &&
-    bytes[6] === 0x1a &&
-    bytes[7] === 0xe1
-  ) {
-    return { ok: false, code: "ENCRYPTED_FILE_UNSUPPORTED", message: "Encrypted or legacy OLE2 PowerPoint files are rejected in PS-00." };
-  }
-  if (
-    bytes.byteLength < 4 ||
-    bytes[0] !== 0x50 ||
-    bytes[1] !== 0x4b ||
-    bytes[2] !== 0x03 ||
-    bytes[3] !== 0x04
-  ) {
-    return { ok: false, code: "INVALID_ZIP_MAGIC", message: "File header is not a valid OOXML ZIP container." };
-  }
-  return { ok: true };
+  return { allowed: reasons.length === 0, reasons };
 }
 
 const UNSAFE_CHART_SPEC_PATTERNS: ReadonlyArray<{ id: string; pattern: RegExp; reason: string }> = [
@@ -575,6 +497,15 @@ export const listDocumentsQuerySchema = z.object({
   language: z.enum(["en", "km", "bilingual"]).optional(),
   limit: z.coerce.number().int().min(1).max(100).optional(),
   offset: z.coerce.number().int().min(0).max(100_000).optional(),
+});
+
+export const paginationQuerySchema = z.object({
+  limit: z.coerce.number().int().min(1).max(200).optional(),
+  offset: z.coerce.number().int().min(0).max(100_000).optional(),
+});
+
+export const restoreVersionRequestSchema = z.object({
+  expectedRevision: z.number().int().min(1).max(2_147_483_647).optional(),
 });
 
 export const dataPrepStageProfileSchema = z.object({

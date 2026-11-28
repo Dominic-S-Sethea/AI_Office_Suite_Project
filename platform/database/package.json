@@ -7,6 +7,7 @@
     ".": "./src/index.ts"
   },
   "dependencies": {
+    "@ai-office-suite/audit": "*",
     "@ai-office-suite/authorization": "*",
     "@ai-office-suite/shared-contracts": "*",
     "pg": "^8.23.1"

@@ -212,6 +212,7 @@ describe("V1.4 Aligned VI-00 — Advanced Voice Intelligence Feasibility (VOC-T0
     });
 
     const canceled = await pipeline.cancelSessionWithQuotaRelease({
+      actor: EDITOR_A,
       sessionId: s.sessionId,
       eventId: "e3",
       eventSeq: 3,
@@ -438,6 +439,7 @@ describe("V1.4 Aligned VI-00 — Advanced Voice Intelligence Feasibility (VOC-T0
     expect(paused.outcome).toBe("awaiting_review_clarify");
 
     const confirmed = pipeline.confirmReviewedTranscript({
+      actor: EDITOR_A,
       sessionId: paused.session.sessionId,
       editedTranscript: "Update Net Sales to USD 150,000 for 2026-11",
       eventId: "confirm-1",
@@ -684,6 +686,7 @@ describe("V1.4 Aligned VI-00 — Advanced Voice Intelligence Feasibility (VOC-T0
     });
 
     const interrupted = await pipeline.handleInterruption({
+      actor: EDITOR_A,
       sessionId: s.sessionId,
       kind: "microphone_disconnected",
       eventId: "e3-mic-drop",
@@ -731,6 +734,7 @@ describe("V1.4 Aligned VI-00 — Advanced Voice Intelligence Feasibility (VOC-T0
     });
 
     const failed = await pipeline.handleInterruption({
+      actor: EDITOR_A,
       sessionId: s.sessionId,
       kind: "network_failure",
       eventId: "e3-net-fail",
@@ -1008,6 +1012,7 @@ describe("V1.4 Aligned VI-00 — Advanced Voice Intelligence Feasibility (VOC-T0
     expect(paused.effectiveTranscript).toContain("Net Sales USD 150,000");
 
     const confirmed = pipeline.confirmReviewedTranscript({
+      actor: EDITOR_A,
       sessionId: paused.session.sessionId,
       eventId: "voc-t25-confirm",
       eventSeq: 6,

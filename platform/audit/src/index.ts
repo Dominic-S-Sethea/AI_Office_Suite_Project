@@ -8,10 +8,15 @@ const SECRET_PATTERNS: readonly RegExp[] = [
   /\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9._-]{10,}/g,
   /\bBearer\s+[A-Za-z0-9._~+/-]{12,}/gi,
   /\baios_session=[^;\s]+/gi,
+  /\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/g,
+  /\bAIza[0-9A-Za-z\-_]{35}\b/g,
+  /\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{30,}\b/g,
+  /\bxox[baprs]-[A-Za-z0-9-]{10,}\b/g,
   /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g,
 ];
 
-const SENSITIVE_KEY_PATTERN = /(password|secret|token|api[_-]?key|authorization|cookie|private[_-]?key)/i;
+const SENSITIVE_KEY_PATTERN =
+  /(password|secret|token|api[_-]?key|authorization|cookie|private[_-]?key|credential|raw[_-]?invite|access[_-]?key|signing[_-]?key)/i;
 
 export function redactAuditValue(value: unknown, key = ""): unknown {
   if (key && SENSITIVE_KEY_PATTERN.test(key)) {
@@ -35,6 +40,14 @@ export function redactAuditValue(value: unknown, key = ""): unknown {
     return out;
   }
   return value;
+}
+
+export function redactAuditString(value: string): string {
+  return redactAuditValue(value) as string;
+}
+
+export function redactAuditEvent<T>(event: T): T {
+  return redactAuditValue(event) as T;
 }
 
 export interface AuditStore {

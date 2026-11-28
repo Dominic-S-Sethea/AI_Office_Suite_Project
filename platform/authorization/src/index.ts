@@ -194,7 +194,6 @@ const ROLE_PERMISSIONS: Record<WorkspaceRole, ReadonlySet<`${ResourceType}:${Per
     "knowledge:read",
     "knowledge:write",
     "audit:read",
-    "metrics:read",
     "speech:transcribe",
     "workspace:read",
     "workspace:manage",
@@ -222,14 +221,12 @@ const ROLE_PERMISSIONS: Record<WorkspaceRole, ReadonlySet<`${ResourceType}:${Per
     "usage:read",
     "entitlement:read",
     "audit:read",
-    "metrics:read",
   ]),
   auditor: new Set([
     "organization:read",
     "workspace:read",
     "membership:read",
     "audit:read",
-    "metrics:read",
     "usage:read",
     "entitlement:read",
     "policy:read",
@@ -318,6 +315,57 @@ export function isWorkspaceRole(value: string): value is WorkspaceRole {
     value === "reviewer" ||
     value === "viewer"
   );
+}
+
+const MANAGEABLE_TARGET_ROLES: Record<WorkspaceRole, ReadonlySet<WorkspaceRole>> = {
+  owner: new Set([
+    "owner",
+    "administrator",
+    "workspace_manager",
+    "billing_admin",
+    "auditor",
+    "editor",
+    "reviewer",
+    "viewer",
+  ]),
+  administrator: new Set([
+    "administrator",
+    "workspace_manager",
+    "billing_admin",
+    "auditor",
+    "editor",
+    "reviewer",
+    "viewer",
+  ]),
+  workspace_manager: new Set(["editor", "reviewer", "viewer"]),
+  billing_admin: new Set([]),
+  auditor: new Set([]),
+  editor: new Set([]),
+  reviewer: new Set([]),
+  viewer: new Set([]),
+};
+
+/**
+ * Enforces strict role-management hierarchy so lower-privileged admins/managers
+ * cannot invite, promote, or offboard roles at or above restricted privilege tiers (F-09).
+ */
+export function canManageTargetRole(actorRole: WorkspaceRole, targetRole: WorkspaceRole): boolean {
+  const manageable = MANAGEABLE_TARGET_ROLES[actorRole];
+  return manageable ? manageable.has(targetRole) : false;
+}
+
+export function assertCanManageTargetRole(
+  actor: ActorContext,
+  targetRole: WorkspaceRole,
+  operation = "manage",
+): void {
+  if (!canManageTargetRole(actor.role, targetRole)) {
+    throw new AuthorizationError(
+      403,
+      "ROLE_HIERARCHY_DENIED",
+      `Role '${actor.role}' is not authorized to ${operation} role '${targetRole}'.`,
+    );
+  }
 }
 
 export function canPerform(
@@ -459,7 +507,12 @@ export function evaluatePolicyDecision(request: PolicyDecisionRequest): PolicyDe
     const maxAgeSec = request.mfaMaxAgeSeconds ?? 900;
     const nowMs = Date.parse(evaluatedAt);
     const verifiedMs = request.actor.mfaVerifiedAt ? Date.parse(request.actor.mfaVerifiedAt) : Number.NaN;
-    if (!Number.isFinite(verifiedMs) || nowMs - verifiedMs > maxAgeSec * 1000 || verifiedMs > nowMs + 60_000) {
+    if (
+      !Number.isFinite(nowMs) ||
+      !Number.isFinite(verifiedMs) ||
+      nowMs - verifiedMs > maxAgeSec * 1000 ||
+      verifiedMs > nowMs + 60_000
+    ) {
       return {
         allowed: false,
         denialCategory: "mfa_step_up_required",

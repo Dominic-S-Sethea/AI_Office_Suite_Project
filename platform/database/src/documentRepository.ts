@@ -6,11 +6,20 @@ import type {
   StudioDocument,
   WorkspaceRole,
 } from "@ai-office-suite/shared-contracts";
+import { redactAuditEvent, redactAuditString } from "@ai-office-suite/audit";
 import { assertCanPerform, assertTenantWorkspaceAccess, isWorkspaceRole } from "@ai-office-suite/authorization";
 import type { PgDatabaseAdapter, PgQueryExecutor } from "./adapter.ts";
 import { withTenantTransaction } from "./schema.ts";
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+function clampListPagination(options?: { limit?: number; offset?: number }): { limit: number; offset: number } {
+  const rawLimit = options?.limit ?? 100;
+  const limit = Number.isFinite(rawLimit) ? Math.min(200, Math.max(1, Math.trunc(rawLimit))) : 100;
+  const rawOffset = options?.offset ?? 0;
+  const offset = Number.isFinite(rawOffset) ? Math.min(100_000, Math.max(0, Math.trunc(rawOffset))) : 0;
+  return { limit, offset };
+}
 
 export class DatabaseConflictError extends Error {
   readonly statusCode: number;
@@ -45,6 +54,8 @@ export class PostgreSqlDocumentRepository {
     tx: PgQueryExecutor,
     event: Omit<AuditEvent, "auditId" | "createdAt"> & { targetType?: string },
   ): Promise<void> {
+    const safeSummary = redactAuditString(event.summary);
+    const safeMeta = event.metadata ? redactAuditEvent(event.metadata) : undefined;
     await tx.query(
       `INSERT INTO audit_logs (
          audit_id, tenant_id, workspace_id, actor_id, actor_role, source, action, outcome,
@@ -63,8 +74,8 @@ export class PostgreSqlDocumentRepository {
         event.documentId ?? "none",
         event.revisionBefore ?? null,
         event.revisionAfter ?? null,
-        event.summary,
-        event.metadata ? JSON.stringify(event.metadata) : null,
+        safeSummary,
+        safeMeta ? JSON.stringify(safeMeta) : null,
       ],
     );
   }
@@ -246,14 +257,19 @@ export class PostgreSqlDocumentRepository {
     );
   }
 
-  async listVersions(actor: ActorContext, documentId: string): Promise<DocumentVersion[]> {
+  async listVersions(
+    actor: ActorContext,
+    documentId: string,
+    options?: { limit?: number; offset?: number },
+  ): Promise<DocumentVersion[]> {
     assertCanPerform(actor, "document", "read");
     assertValidDocumentUuid(documentId);
+    const { limit, offset } = clampListPagination(options);
     return withTenantTransaction(
       this.db,
       actor.tenantId,
       async (tx) => {
-        // Single-JOIN query verifying workspace ownership and reading persisted provenance (H8, M6)
+        // Bounded pagination with workspace verification (H8, M6, F-06)
         const verRes = await tx.query<{
           revision: number;
           restored_from_revision: number | null;
@@ -268,11 +284,21 @@ export class PostgreSqlDocumentRepository {
            JOIN document_versions v
              ON v.tenant_id = d.tenant_id AND v.document_id = d.document_id
            WHERE d.document_id = $1::uuid AND d.workspace_id = $2::uuid
-           ORDER BY v.revision ASC`,
-          [documentId, actor.workspaceId],
+           ORDER BY v.revision ASC
+           LIMIT $3 OFFSET $4`,
+          [documentId, actor.workspaceId, limit, offset],
         );
         if (verRes.rows.length === 0) {
-          throw new DatabaseConflictError(404, "DOCUMENT_NOT_FOUND", `Document '${documentId}' not found.`);
+          const existsRes = await tx.query<{ document_id: string }>(
+            `SELECT document_id::text
+             FROM documents
+             WHERE document_id = $1::uuid AND workspace_id = $2::uuid`,
+            [documentId, actor.workspaceId],
+          );
+          if (existsRes.rows.length === 0) {
+            throw new DatabaseConflictError(404, "DOCUMENT_NOT_FOUND", `Document '${documentId}' not found.`);
+          }
+          return [];
         }
         return verRes.rows.map((r) => {
           const fallbackSummary =
@@ -294,6 +320,118 @@ export class PostgreSqlDocumentRepository {
             createdAt: r.created_at instanceof Date ? r.created_at.toISOString() : String(r.created_at),
           };
         });
+      },
+      actor.workspaceId,
+    );
+  }
+
+  async listVersionMetadata(
+    actor: ActorContext,
+    documentId: string,
+    options?: { limit?: number; offset?: number },
+  ): Promise<Array<Omit<DocumentVersion, "snapshot">>> {
+    assertCanPerform(actor, "document", "read");
+    assertValidDocumentUuid(documentId);
+    const { limit, offset } = clampListPagination(options);
+    return withTenantTransaction(
+      this.db,
+      actor.tenantId,
+      async (tx) => {
+        const verRes = await tx.query<{
+          revision: number;
+          restored_from_revision: number | null;
+          source: string | null;
+          summary: string | null;
+          created_by: string;
+          created_at: Date | string;
+        }>(
+          `SELECT v.revision, v.restored_from_revision, v.source, v.summary, v.created_by::text, v.created_at
+           FROM documents d
+           JOIN document_versions v
+             ON v.tenant_id = d.tenant_id AND v.document_id = d.document_id
+           WHERE d.document_id = $1::uuid AND d.workspace_id = $2::uuid
+           ORDER BY v.revision ASC
+           LIMIT $3 OFFSET $4`,
+          [documentId, actor.workspaceId, limit, offset],
+        );
+        if (verRes.rows.length === 0) {
+          const existsRes = await tx.query<{ document_id: string }>(
+            `SELECT document_id::text
+             FROM documents
+             WHERE document_id = $1::uuid AND workspace_id = $2::uuid`,
+            [documentId, actor.workspaceId],
+          );
+          if (existsRes.rows.length === 0) {
+            throw new DatabaseConflictError(404, "DOCUMENT_NOT_FOUND", `Document '${documentId}' not found.`);
+          }
+          return [];
+        }
+        return verRes.rows.map((r) => {
+          const fallbackSummary =
+            r.restored_from_revision !== null
+              ? `Restored revision ${r.restored_from_revision} as revision ${r.revision}`
+              : r.revision === 1
+                ? "Initial document created"
+                : `Saved revision ${r.revision}`;
+          const fallbackSource: DocumentVersion["source"] = r.restored_from_revision !== null ? "restore" : "manual";
+          return {
+            versionId: `${documentId}:rev-${r.revision}`,
+            documentId,
+            revision: r.revision,
+            summary: r.summary && r.summary.length > 0 ? r.summary : fallbackSummary,
+            source: (r.source || fallbackSource) as DocumentVersion["source"],
+            actorId: r.created_by,
+            ...(r.restored_from_revision !== null ? { restoredFromRevision: r.restored_from_revision } : {}),
+            createdAt: r.created_at instanceof Date ? r.created_at.toISOString() : String(r.created_at),
+          };
+        });
+      },
+      actor.workspaceId,
+    );
+  }
+
+  async getUndoTargetSnapshot(actor: ActorContext, documentId: string): Promise<StudioDocument | null> {
+    assertCanPerform(actor, "document", "read");
+    assertValidDocumentUuid(documentId);
+    return withTenantTransaction(
+      this.db,
+      actor.tenantId,
+      async (tx) => {
+        const curRes = await tx.query<{
+          current_revision: number;
+          restored_from_revision: number | null;
+        }>(
+          `SELECT d.current_revision, v.restored_from_revision
+           FROM documents d
+           LEFT JOIN document_versions v
+             ON v.tenant_id = d.tenant_id AND v.document_id = d.document_id AND v.revision = d.current_revision
+           WHERE d.document_id = $1::uuid AND d.workspace_id = $2::uuid`,
+          [documentId, actor.workspaceId],
+        );
+        const curRow = curRes.rows[0];
+        if (!curRow) {
+          throw new DatabaseConflictError(404, "DOCUMENT_NOT_FOUND", `Document '${documentId}' not found.`);
+        }
+        if (curRow.current_revision <= 1) {
+          return null;
+        }
+        const targetUpper =
+          curRow.restored_from_revision !== null
+            ? curRow.restored_from_revision - 1
+            : curRow.current_revision - 1;
+        if (targetUpper < 1) {
+          return null;
+        }
+        const prevRes = await tx.query<{ snapshot_json: StudioDocument | string }>(
+          `SELECT snapshot_json
+           FROM document_versions
+           WHERE document_id = $1::uuid AND revision <= $2
+           ORDER BY revision DESC
+           LIMIT 1`,
+          [documentId, targetUpper],
+        );
+        const prevRow = prevRes.rows[0];
+        return prevRow?.snapshot_json ? parseSnapshot(prevRow.snapshot_json) : null;
       },
       actor.workspaceId,
     );
@@ -396,7 +534,12 @@ export class PostgreSqlDocumentRepository {
     );
   }
 
-  async restoreVersion(actor: ActorContext, documentId: string, targetRevision: number): Promise<StudioDocument> {
+  async restoreVersion(
+    actor: ActorContext,
+    documentId: string,
+    targetRevision: number,
+    options?: { expectedRevision?: number },
+  ): Promise<StudioDocument> {
     assertCanPerform(actor, "document", "restore");
     assertValidDocumentUuid(documentId);
     return withTenantTransaction(
@@ -413,6 +556,16 @@ export class PostgreSqlDocumentRepository {
         const curRow = curRes.rows[0];
         if (!curRow) {
           throw new DatabaseConflictError(404, "DOCUMENT_NOT_FOUND", `Document '${documentId}' not found.`);
+        }
+        if (
+          typeof options?.expectedRevision === "number" &&
+          curRow.current_revision !== options.expectedRevision
+        ) {
+          throw new DatabaseConflictError(
+            409,
+            "REVISION_CONFLICT",
+            `Expected revision ${options.expectedRevision}, but current PostgreSQL revision is ${curRow.current_revision}.`,
+          );
         }
 
         const targetRes = await tx.query<{ snapshot_json: StudioDocument | string }>(
@@ -498,14 +651,19 @@ export class PostgreSqlDocumentRepository {
     );
   }
 
-  async listAuditEvents(actor: ActorContext, documentId: string): Promise<AuditEvent[]> {
+  async listAuditEvents(
+    actor: ActorContext,
+    documentId: string,
+    options?: { limit?: number; offset?: number },
+  ): Promise<AuditEvent[]> {
     assertCanPerform(actor, "audit", "read");
     assertValidDocumentUuid(documentId);
+    const { limit, offset } = clampListPagination(options);
     return withTenantTransaction(
       this.db,
       actor.tenantId,
       async (tx) => {
-        // Single LEFT JOIN query verifies document existence and loads audit rows (M6)
+        // Bounded query verifying document existence and loading audit rows (M6, F-06)
         const res = await tx.query<{
           audit_id: string | null;
           tenant_id: string | null;
@@ -529,11 +687,21 @@ export class PostgreSqlDocumentRepository {
            LEFT JOIN audit_logs a
              ON a.tenant_id = d.tenant_id AND a.workspace_id = d.workspace_id AND a.target_id = d.document_id::text
            WHERE d.document_id = $1::uuid AND d.workspace_id = $2::uuid
-           ORDER BY a.created_at DESC NULLS LAST`,
-          [documentId, actor.workspaceId],
+           ORDER BY a.created_at DESC NULLS LAST
+           LIMIT $3 OFFSET $4`,
+          [documentId, actor.workspaceId, limit, offset],
         );
         if (res.rows.length === 0) {
-          throw new DatabaseConflictError(404, "DOCUMENT_NOT_FOUND", `Document '${documentId}' not found.`);
+          const existsRes = await tx.query<{ document_id: string }>(
+            `SELECT document_id::text
+             FROM documents
+             WHERE document_id = $1::uuid AND workspace_id = $2::uuid`,
+            [documentId, actor.workspaceId],
+          );
+          if (existsRes.rows.length === 0) {
+            throw new DatabaseConflictError(404, "DOCUMENT_NOT_FOUND", `Document '${documentId}' not found.`);
+          }
+          return [];
         }
         return res.rows
           .filter((r): r is typeof r & { audit_id: string; tenant_id: string; actor_id: string; action: string; outcome: "success" | "denied" | "failed"; summary: string } => r.audit_id !== null)

@@ -3,7 +3,7 @@ import bcrypt from "bcryptjs";
 import jwt, { type JwtPayload, type SignOptions } from "jsonwebtoken";
 import type { ActorContext, WorkspaceRole } from "@ai-office-suite/shared-contracts";
 import { isWorkspaceRole } from "@ai-office-suite/authorization";
-import type { PgDatabaseAdapter } from "@ai-office-suite/database";
+import { withTenantTransaction, type PgDatabaseAdapter } from "@ai-office-suite/database";
 
 export const SESSION_COOKIE_NAME = "aios_session";
 export const SESSION_COOKIE_MAX_AGE_SECONDS = 43_200; // 12 hours
@@ -82,6 +82,7 @@ export interface SessionTokenClaims {
   workspaceId: string;
   role: WorkspaceRole;
   tv: number;
+  mfaVerifiedAt?: string;
   jti?: string;
 }
 
@@ -97,6 +98,7 @@ export function signSessionToken(
       workspace_id: claims.workspaceId,
       role: claims.role,
       tv: claims.tv,
+      ...(claims.mfaVerifiedAt ? { mfa_verified_at: claims.mfaVerifiedAt } : {}),
     },
     getJwtSecret(),
     {
@@ -137,6 +139,13 @@ export function verifySessionToken(token: string): SessionTokenClaims | null {
     ) {
       return null;
     }
+    let mfaVerifiedAt: string | undefined;
+    if (typeof p.mfa_verified_at === "string" && p.mfa_verified_at.trim().length > 0) {
+      if (!Number.isFinite(Date.parse(p.mfa_verified_at))) {
+        return null;
+      }
+      mfaVerifiedAt = p.mfa_verified_at;
+    }
     return {
       userId: p.sub,
       email: p.email,
@@ -144,6 +153,7 @@ export function verifySessionToken(token: string): SessionTokenClaims | null {
       workspaceId: p.workspace_id,
       role: p.role,
       tv: p.tv,
+      ...(mfaVerifiedAt ? { mfaVerifiedAt } : {}),
       jti: p.jti,
     };
   } catch {
@@ -160,6 +170,7 @@ export async function authenticateUserWithPassword(params: {
   password: string;
   tenantId: string;
   workspaceId: string;
+  mfaVerifiedAt?: string;
   tokenExpiresIn?: SignOptions["expiresIn"];
 }): Promise<{ token: string; actor: ActorContext }> {
   const userRes = await params.db.query<{
@@ -169,24 +180,41 @@ export async function authenticateUserWithPassword(params: {
     token_version: number;
     status: string;
   }>(
-    "SELECT user_id, email, password_hash, token_version, status FROM users WHERE lower(email) = lower($1)",
+    "SELECT user_id, email, password_hash, token_version, status FROM auth_lookup_user_for_login($1)",
     [params.email.trim()],
   );
   const user = userRes.rows[0];
   const passwordOk = await verifyPassword(params.password, user ? user.password_hash : DUMMY_BCRYPT_HASH);
-  if (!user || !passwordOk || user.status !== "active") {
+  if (
+    !user ||
+    !passwordOk ||
+    user.status !== "active" ||
+    !UUID_PATTERN.test(params.tenantId) ||
+    !UUID_PATTERN.test(params.workspaceId)
+  ) {
     // Uniform 401 prevents account status & credential enumeration (H4)
     throw new AuthenticationError(401, "INVALID_CREDENTIALS", "Invalid email or password.");
   }
 
-  const memRes = await params.db.query<{ role: string }>(
-    `SELECT m.role
-     FROM memberships m
-     JOIN organizations o ON o.tenant_id = m.tenant_id
-     WHERE m.tenant_id = $1::uuid AND m.workspace_id = $2::uuid AND m.user_id = $3::uuid AND o.status = 'active'`,
-    [params.tenantId, params.workspaceId, user.user_id],
+  const membership = await withTenantTransaction(
+    params.db,
+    params.tenantId,
+    async (tx) => {
+      const memRes = await tx.query<{ role: string; content_access: boolean }>(
+        `SELECT m.role, m.content_access
+         FROM memberships m
+         JOIN organizations o ON o.tenant_id = m.tenant_id
+         WHERE m.tenant_id = $1::uuid
+           AND m.workspace_id = $2::uuid
+           AND m.user_id = $3::uuid
+           AND m.status = 'active'
+           AND o.status = 'active'`,
+        [params.tenantId, params.workspaceId, user.user_id],
+      );
+      return memRes.rows[0] ?? null;
+    },
+    params.workspaceId,
   );
-  const membership = memRes.rows[0];
   if (!membership || !isWorkspaceRole(membership.role)) {
     // Uniform 401 prevents workspace/tenant membership enumeration (H4)
     throw new AuthenticationError(401, "INVALID_CREDENTIALS", "Invalid email or password.");
@@ -197,12 +225,15 @@ export async function authenticateUserWithPassword(params: {
     workspaceId: params.workspaceId,
     userId: user.user_id,
     role: membership.role,
+    workspaceContentGrant: Boolean(membership.content_access),
+    ...(params.mfaVerifiedAt ? { mfaVerifiedAt: params.mfaVerifiedAt } : {}),
   };
   const token = signSessionToken(
     {
       ...actor,
       email: user.email,
       tv: user.token_version,
+      ...(params.mfaVerifiedAt ? { mfaVerifiedAt: params.mfaVerifiedAt } : {}),
     },
     params.tokenExpiresIn ? { expiresIn: params.tokenExpiresIn } : undefined,
   );
@@ -210,14 +241,17 @@ export async function authenticateUserWithPassword(params: {
 }
 
 export async function revokeUserSessions(db: PgDatabaseAdapter, userId: string): Promise<number> {
-  const res = await db.query<{ token_version: number }>(
-    "UPDATE users SET token_version = token_version + 1 WHERE user_id = $1::uuid RETURNING token_version",
-    [userId],
-  );
-  const row = res.rows[0];
-  if (!row) {
+  if (!UUID_PATTERN.test(userId)) {
     throw new AuthenticationError(404, "USER_NOT_FOUND", "User not found.");
   }
-  return row.token_version;
+  const res = await db.query<{ token_version: number | null }>(
+    "SELECT auth_bump_user_token_version($1::uuid) AS token_version",
+    [userId],
+  );
+  const nextTv = res.rows[0]?.token_version;
+  if (nextTv == null) {
+    throw new AuthenticationError(404, "USER_NOT_FOUND", "User not found.");
+  }
+  return nextTv;
 }
 

@@ -234,6 +234,7 @@ export interface DataScopePolicy {
   principalRole: WorkspaceRole;
   allowedDepartments: string[] | "ALL";
   allowedColumns: string[];
+  maxClassification?: "public" | "internal" | "confidential" | "restricted";
   canExportUnderlyingDetail: boolean;
   canPublish: boolean;
 }

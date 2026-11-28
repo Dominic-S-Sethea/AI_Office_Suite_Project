@@ -32,6 +32,7 @@ import {
   hashPassword,
   verifySessionToken,
 } from "@ai-office-suite/identity";
+import { createJwtAuthMiddleware } from "@ai-office-suite/identity/express";
 import {
   InMemoryStorageAdapter,
   LocalPrivateObjectStore,
@@ -489,6 +490,46 @@ describe("V1.4 Aligned PA-00 — Shared Platform Administration Feasibility (PLT
         targetWorkspaceId: WS_A_REPORTING,
       }),
     ).rejects.toMatchObject({ code: "TENANT_SWITCH_DENIED" });
+
+    // Verify offboarded user cannot log in (uniform H4 INVALID_CREDENTIALS) or reuse pre-revocation JWT via middleware (F-24)
+    await expect(
+      authenticateUserWithPassword({
+        db,
+        email: "offboard@tenanta.example",
+        password: "StrongPass123!",
+        tenantId: TENANT_A,
+        workspaceId: WS_A_REPORTING,
+      }),
+    ).rejects.toMatchObject({ code: "INVALID_CREDENTIALS" });
+
+    const middleware = createJwtAuthMiddleware(db, []);
+    let mwStatus = 0;
+    let mwJson: unknown;
+    let nextCalled = false;
+    await middleware(
+      {
+        headers: { authorization: `Bearer ${authBefore.token}` },
+        method: "GET",
+        path: "/api/documents",
+        header: () => undefined,
+      } as unknown as Parameters<typeof middleware>[0],
+      {
+        status(code: number) {
+          mwStatus = code;
+          return this;
+        },
+        json(payload: unknown) {
+          mwJson = payload;
+          return this;
+        },
+      } as unknown as Parameters<typeof middleware>[1],
+      () => {
+        nextCalled = true;
+      },
+    );
+    expect(nextCalled).toBe(false);
+    expect([401, 403]).toContain(mwStatus);
+    expect(mwJson).toMatchObject({ code: expect.stringMatching(/ACCOUNT_REVOKED|TOKEN_REVOKED|ACCOUNT_INACTIVE/) });
   });
 
   it("PLT-T07: swap another tenant's object ID in API — denied across DB workspace, object storage & audit without existence leak", async () => {
@@ -1067,7 +1108,7 @@ describe("V1.4 Aligned PA-00 — Shared Platform Administration Feasibility (PLT
     );
     const committed = await gov.listFileObjects(ACTOR_A_WSMGR, { includeDeleted: true });
     const referenced = new Set(committed.map((c) => c.storageKey));
-    const swept = await store.sweepOrphanedBlobs(referenced);
+    const swept = await store.sweepOrphanedBlobs(referenced, { minAgeMs: 0 });
     expect(swept.removedKeys).toContain(orphanKey);
     expect(swept.retainedCount).toBeGreaterThanOrEqual(1);
   });
